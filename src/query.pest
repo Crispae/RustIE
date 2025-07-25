@@ -1,0 +1,36 @@
+WHITESPACE = _{ " " | "\t" | "\n" }
+
+query = { traversal_seq }
+
+traversal_seq = { pattern ~ (traversal)* }
+traversal = { traversal_op ~ pattern }
+traversal_op = { outgoing_wildcard | incoming_wildcard | outgoing | incoming }
+outgoing_wildcard = { ">>" }
+incoming_wildcard = { "<<" }
+outgoing = { ">" ~ traversal_label ~ quantifier? }
+incoming = { "<" ~ traversal_label ~ quantifier? }
+traversal_label = { traversal_regex | label }
+traversal_regex = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
+label = @{ ASCII_ALPHANUMERIC+ }
+quantifier = { "?" }
+wildcard_label = { "*" }
+
+sequence = { named_capture | pattern ~ (WHITESPACE+ ~ pattern)+ | pattern }
+pattern = _{ constraint | group }
+group = { "(" ~ sequence ~ ")" }
+
+constraint = { "[" ~ constraint_body? ~ "]" }
+constraint_body = { constraint_expr }
+constraint_expr = _{ disjunction }
+disjunction = { conjunction ~ ( "|" ~ conjunction )* }
+conjunction = { atom ~ ( "&" ~ atom )* }
+atom = _{ field_constraint | wildcard }
+
+field_constraint = { field_name ~ "=" ~ (regex_value | value) }
+field_name = @{ ASCII_ALPHANUMERIC+ }
+value =     @{ ASCII_ALPHANUMERIC+ }
+regex_value = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
+wildcard = { "*" }
+
+named_capture = { "(?<" ~ capture_name ~ ">" ~ sequence ~ ")" }
+capture_name = @{ ASCII_ALPHANUMERIC+ }

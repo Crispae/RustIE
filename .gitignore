@@ -1,0 +1,33 @@
+# === Rust/Cargo Defaults ===
+/target
+**/target/
+**/*.rs.bk
+
+# === Dependency Files ===
+/Cargo.lock
+
+# === IDEs and Editors ===
+/.idea/
+/.vscode/
+/*.swp
+*.sublime-workspace
+*.sublime-project
+
+# === Build and Intermediate Files ===
+/index
+/manual_index
+/traversal_debug_index
+/pubindex
+/complex_logic_index
+/processed_docs_pubmed
+/large_dir
+/sample_documents
+/biomed
+
+# === OS Files ===
+.DS_Store
+Thumbs.db
+
+# === Logs and Debug ===
+*.log
+debug.log
