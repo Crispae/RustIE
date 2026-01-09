@@ -13,6 +13,7 @@ use tantivy::{
     DocAddress, Score, collector::TopDocs, directory::MmapDirectory
 };
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
+use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaConfig {
@@ -288,6 +289,12 @@ impl ExtractorEngine {
             return self.execute_optimized_pattern_matching(pattern_query, limit);
         }
         
+        // Check if this is a RustieNamedCaptureQuery
+        if let Some(named_query) = query.as_any().downcast_ref::<crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery>() {
+            println!("DEBUG: Detected RustieNamedCaptureQuery - using custom named capture scorer");
+            return self.execute_named_capture_matching(named_query, limit);
+        }
+        
         println!("DEBUG: Using standard Tantivy pattern matching");
         
         let searcher = self.reader.searcher();
@@ -372,6 +379,58 @@ impl ExtractorEngine {
                     sentence_result.matches = matches.to_vec();
                 } else {
                     println!("DEBUG: Could not downcast to OptimizedPatternMatchingScorer");
+                    sentence_result.matches = Vec::new();
+                }
+                
+                sentence_results.push(sentence_result);
+            }
+
+            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
+        }
+        
+        Ok(RustIeResult {
+            total_hits: sentence_results.len(),
+            score_docs: Vec::new(),
+            sentence_results,
+            max_score,
+        })
+    }
+
+    /// Execute named capture pattern matching queries using custom scorer
+    fn execute_named_capture_matching(&self, named_query: &crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery, limit: usize) -> Result<RustIeResult> {
+        println!("DEBUG: === NAMED CAPTURE EXECUTION PATH ===");
+        
+        let searcher = self.reader.searcher();
+        let top_docs = searcher.search(named_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
+        println!("DEBUG: top_docs = {:?}", top_docs);
+        
+        let mut sentence_results = Vec::new();
+        let mut max_score = None;
+
+        for (score, doc_address) in top_docs {
+            if let Ok(doc) = self.doc(doc_address) {
+                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
+                
+                // Get the segment order and document ID
+                let (segment_ord, _) = (doc_address.segment_ord, doc_address.doc_id);
+                let segment_reader = searcher.segment_reader(segment_ord);
+                
+                println!("DEBUG: Creating weight for named capture query");
+                let weight = named_query.weight(tantivy::query::EnableScoring::Enabled { 
+                    searcher: &searcher, 
+                    statistics_provider: &searcher 
+                })?;
+                
+                println!("DEBUG: Creating scorer from weight");
+                let mut scorer = weight.scorer(segment_reader, 1.0)?;
+                
+                // Get matches from the custom scorer
+                if let Some(named_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::named_capture_query::RustieNamedCaptureScorer>() {
+                    let matches = named_scorer.get_current_doc_matches();
+                    println!("DEBUG: Named captures = {:?}", matches);
+                    sentence_result.matches = matches.to_vec();
+                } else {
+                    println!("DEBUG: Could not downcast to RustieNamedCaptureScorer");
                     sentence_result.matches = Vec::new();
                 }
                 

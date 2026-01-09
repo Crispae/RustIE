@@ -52,3 +52,11 @@ path = "test_full_pipeline.rs"
 [[bin]]
 name = "graph_traversal_2"
 path = "src/bin/graph_traversal_2.rs"
+
+[[bin]]
+name = "test_parser"
+path = "src/bin/test_parser.rs"
+
+[[bin]]
+name = "test_compiler_features"
+path = "src/bin/test_compiler_features.rs"
