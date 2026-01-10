@@ -27,9 +27,9 @@ impl GraphTraversal {
     /// Execute a traversal pattern
     /// Mirrors the Scala GraphTraversal trait and its case classes.
     pub fn execute(&self, traversal: &Traversal, start_nodes: &[usize]) -> TraversalResult {
-        println!("DEBUG: Recursive traversal called (AST: {:?})", traversal);
-        println!("DEBUG: Traversal {:?} from nodes {:?}", traversal, start_nodes);
-        
+        log::debug!("Recursive traversal called (AST: {:?})", traversal);
+        log::debug!("Traversal {:?} from nodes {:?}", traversal, start_nodes);
+
         match traversal {
             Traversal::NoTraversal => TraversalResult::NoTraversal,
             Traversal::OutgoingWildcard => self.outgoing_wildcard(start_nodes),
@@ -162,13 +162,13 @@ impl GraphTraversal {
     fn concatenated_traversal(&self, start_nodes: &[usize], traversals: &[Traversal]) -> TraversalResult {
         let mut current_nodes = start_nodes.to_vec();
         for (i, traversal) in traversals.iter().enumerate() {
-            println!("DEBUG: Step {}: Traversal {:?} from nodes {:?}", i, traversal, current_nodes);
+            log::debug!("Step {}: Traversal {:?} from nodes {:?}", i, traversal, current_nodes);
             match self.execute(traversal, &current_nodes) {
                 TraversalResult::Success(nodes) => {
                     current_nodes = nodes;
                 }
                 TraversalResult::FailTraversal => {
-                    println!("DEBUG: Step {} failed", i);
+                    log::debug!("Step {} failed", i);
                     return TraversalResult::FailTraversal;
                 }
                 TraversalResult::NoTraversal => {
@@ -397,44 +397,57 @@ impl GraphTraversal {
         path: &mut Vec<usize>,
         results: &mut Vec<Vec<usize>>,
     ) {
-        println!("DEBUG: Recursing - node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+        log::debug!("Recursing - node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
         let num_steps = pattern.len();
         let idx = node * num_steps + step_idx;
         if step_idx == pattern.len() {
-            println!("DEBUG: Match found! Final path: {:?}", path);
+            log::debug!("Match found! Final path: {:?}", path);
             results.push(path.clone());
             return;
         }
+        // Cycle detection: skip if already visiting this node at this step in current path
         if memo[idx] {
-            println!("DEBUG: Memoized fail at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
-            return; // already failed here
+            log::debug!("Cycle detected at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+            return;
         }
-        memo[idx] = true;
+        memo[idx] = true; // Mark as visiting
         match &pattern[step_idx] {
             FlatPatternStep::Constraint(constraint_pat) => {
                 // Use the correct tokens for this constraint step
-                let constraint_idx = constraint_fields_and_tokens.iter().take(step_idx + 1).filter(|(f, _)| f.len() > 0).count() - 1;
+                let count = constraint_fields_and_tokens.iter()
+                    .take(step_idx + 1)
+                    .filter(|(f, _)| !f.is_empty())
+                    .count();
+                if count == 0 {
+                    log::debug!("No valid constraint fields at step {}", step_idx);
+                    memo[idx] = false; // Backtrack
+                    return;
+                }
+                let constraint_idx = count - 1;
                 let (field_name, tokens) = &constraint_fields_and_tokens[constraint_idx];
                 if let crate::compiler::ast::Pattern::Constraint(constraint) = constraint_pat {
                     if let Some(token) = tokens.get(node) {
                         let matches = constraint.matches(field_name, token);
                         if !matches {
-                            println!("DEBUG: Failed constraint at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                            log::debug!("Failed constraint at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                            memo[idx] = false; // Backtrack
                             return;
                         }
                     } else {
-                        println!("DEBUG: No token at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                        log::debug!("No token at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                        memo[idx] = false; // Backtrack
                         return;
                     }
                 } else {
-                    println!("DEBUG: Not a constraint pattern at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                    log::debug!("Not a constraint pattern at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
+                    memo[idx] = false; // Backtrack
                     return;
                 }
                 path.push(node);
-                println!("DEBUG: Pushed node {} to path: {:?}", node, path);
+                log::debug!("Pushed node {} to path: {:?}", node, path);
                 self.automaton_traverse_paths(pattern, node, step_idx + 1, memo, constraint_fields_and_tokens, path, results);
                 path.pop();
-                println!("DEBUG: Popped node, path is now: {:?}", path);
+                log::debug!("Popped node, path is now: {:?}", path);
             }
             FlatPatternStep::Traversal(traversal) => {
                 match traversal {
@@ -551,6 +564,7 @@ impl GraphTraversal {
                 }
             }
         }
+        memo[idx] = false; // Backtrack: allow other paths through this node
     }
 
     /// Wrapper: Run automaton traversal for all start nodes matching the first constraint, collect all paths
