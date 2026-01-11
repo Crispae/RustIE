@@ -24,10 +24,7 @@ pub struct QueryResponse {
     /// Query execution duration in seconds
     #[schema(example = 0.023)]
     pub duration: f32,
-    /// Total number of documents in the index
-    #[schema(example = 100)]
-    pub total_docs: usize,
-    /// Number of results returned
+    /// Number of matching results
     #[schema(example = 5)]
     pub result_count: usize,
     /// Maximum score among results
@@ -147,7 +144,6 @@ impl From<RustIeResult> for QueryResponse {
         QueryResponse {
             query: "".to_string(),
             duration: 0.0,
-            total_docs: odin_results.total_hits,
             result_count: results.len(),
             max_score: odin_results.max_score,
             results,

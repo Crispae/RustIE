@@ -55,7 +55,6 @@ pub async fn query_documents(
             let response = QueryResponse {
                 query: request.query.clone(),
                 duration,
-                total_docs: engine.num_docs(),
                 result_count: results.len(),
                 max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
                 results,
@@ -112,7 +111,6 @@ pub async fn simple_query(
             let response = QueryResponse {
                 query: query.clone(),
                 duration,
-                total_docs: engine.num_docs(),
                 result_count: results.len(),
                 max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
                 results,
