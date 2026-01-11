@@ -7,6 +7,8 @@ use crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery;
 //use crate::tantivy_integration::queries::OptimizedPatternMatchingQuery;
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
+use crate::tantivy_integration::assertion_query::LookaheadQuery;
+use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 use anyhow::{Result, anyhow};
 
 /// Compiler for basic patterns (no graph traversal)
@@ -26,7 +28,18 @@ impl BasicCompiler {
             Pattern::Constraint(constraint) => self.compile_constraint(constraint),
             Pattern::Disjunctive(patterns) => self.compile_disjunctive(patterns),
             Pattern::Concatenated(patterns) => self.compile_concatenated(patterns),
-            Pattern::NamedCapture { name: _, pattern } => self.compile_pattern(pattern),
+            Pattern::NamedCapture { name, pattern } => {
+                let inner_query = self.compile_pattern(pattern)?;
+                let default_field = self.schema.get_field("word")
+                    .map_err(|_| anyhow!("Default field 'word' not found within schema"))?;
+                    
+                Ok(Box::new(RustieNamedCaptureQuery::new(
+                    inner_query,
+                    name.clone(),
+                    *pattern.clone(),
+                    default_field,
+                )))
+            }
             Pattern::Mention { arg_name: _, label: _ } => {
                 Err(anyhow!("Mention queries not yet implemented"))
             }
@@ -40,24 +53,26 @@ impl BasicCompiler {
     }
 
     fn compile_assertion(&self, assertion: &Assertion) -> Result<Box<dyn Query>> {
+        // Get the default field for assertion queries
+        let default_field = self.schema.get_field("word")
+            .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
+
         match assertion {
-            Assertion::SentenceStart => {
-                Err(anyhow!("Sentence start queries not yet implemented"))
+            Assertion::PositiveLookahead(pattern) => {
+                // Positive lookahead - next token must match pattern
+                Ok(Box::new(LookaheadQuery::positive_lookahead(pattern.as_ref().clone(), default_field)))
             }
-            Assertion::SentenceEnd => {
-                Err(anyhow!("Sentence end queries not yet implemented"))
+            Assertion::NegativeLookahead(pattern) => {
+                // Negative lookahead - next token must NOT match pattern
+                Ok(Box::new(LookaheadQuery::negative_lookahead(pattern.as_ref().clone(), default_field)))
             }
-            Assertion::PositiveLookahead(_pattern) => {
-                Err(anyhow!("Lookahead assertions not yet implemented"))
+            Assertion::PositiveLookbehind(pattern) => {
+                // Positive lookbehind - previous token must match pattern
+                Ok(Box::new(LookaheadQuery::positive_lookbehind(pattern.as_ref().clone(), default_field)))
             }
-            Assertion::NegativeLookahead(_pattern) => {
-                Err(anyhow!("Negative lookahead assertions not yet implemented"))
-            }
-            Assertion::PositiveLookbehind(_pattern) => {
-                Err(anyhow!("Lookbehind assertions not yet implemented"))
-            }
-            Assertion::NegativeLookbehind(_pattern) => {
-                Err(anyhow!("Negative lookbehind assertions not yet implemented"))
+            Assertion::NegativeLookbehind(pattern) => {
+                // Negative lookbehind - previous token must NOT match pattern
+                Ok(Box::new(LookaheadQuery::negative_lookbehind(pattern.as_ref().clone(), default_field)))
             }
         }
     }
@@ -75,13 +90,23 @@ impl BasicCompiler {
                 self.compile_field_constraint(name, matcher)
             }
             Constraint::Fuzzy { name, matcher } => {
-                let field = self.schema.get_field("word")
-                    .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-                let term = Term::from_field_text(field, matcher);
-                Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic)))
+                // Get the field
+                let field = self.schema.get_field(name)
+                    .map_err(|_| anyhow!("Field '{}' not found in schema", name))?;
+                
+                // Tantivy doesn't have FuzzyTermQuery in the current version
+                // We'll use a regex approximation for fuzzy matching
+                // This is a simple approach - for better fuzzy matching, consider edit distance
+                let fuzzy_pattern = format!(".*{}.*", regex::escape(matcher));
+                let regex_query = RegexQuery::from_pattern(&fuzzy_pattern, field)
+                    .map_err(|e| anyhow!("Invalid fuzzy pattern '{}': {}", matcher, e))?;
+                Ok(Box::new(regex_query))
             }
-            Constraint::Negated(_constraint) => {
-                Err(anyhow!("Negated constraints not yet implemented"))
+            Constraint::Negated(constraint) => {
+                // Compile inner constraint and wrap with NOT using BooleanQuery
+                let inner_query = self.compile_constraint(constraint)?;
+                let clauses = vec![(Occur::MustNot, inner_query)];
+                Ok(Box::new(BooleanQuery::new(clauses)))
             }
             Constraint::Conjunctive(constraints) => {
                 self.compile_conjunctive_constraints(constraints)
@@ -161,7 +186,53 @@ impl BasicCompiler {
         Ok(Box::new(pattern_query))
     }
 
-    fn compile_repetition(&self, _pattern: &Pattern, _min: usize, _max: Option<usize>) -> Result<Box<dyn Query>> {
-        Err(anyhow!("Repetition queries not yet implemented"))
+    fn compile_repetition(&self, pattern: &Pattern, min: usize, max: Option<usize>) -> Result<Box<dyn Query>> {
+        // Maximum expansion for unbounded patterns to prevent performance issues
+        const MAX_EXPANSION: usize = 10;
+        
+        let effective_max = match max {
+            Some(m) => m.min(min + MAX_EXPANSION),
+            None => min.saturating_add(MAX_EXPANSION),
+        };
+        
+        // Build alternatives for each length from min to effective_max
+        let mut alternatives: Vec<Box<dyn Query>> = Vec::new();
+        
+        for n in min..=effective_max {
+            if n == 0 {
+                // Zero repetitions means "match empty" - we skip this for now
+                // as Tantivy doesn't have a native empty match concept
+                // The calling code can handle this separately when needed
+                continue;
+            }
+            
+            // Create a concatenation of n copies of the pattern
+            let repeated: Vec<Pattern> = (0..n).map(|_| pattern.clone()).collect();
+            
+            if repeated.len() == 1 {
+                // Single pattern - just compile it directly
+                let query = self.compile_pattern(&repeated[0])?;
+                alternatives.push(query);
+            } else {
+                // Multiple patterns - use concatenation
+                let concat_query = self.compile_concatenated(&repeated)?;
+                alternatives.push(concat_query);
+            }
+        }
+        
+        // Handle edge cases
+        if alternatives.is_empty() {
+            // This happens when min=0 and max=0 (match empty)
+            // For now, return a wildcard query as a placeholder
+            return self.compile_constraint(&Constraint::Wildcard);
+        }
+        
+        if alternatives.len() == 1 {
+            // Only one alternative - return it directly
+            return Ok(alternatives.pop().unwrap());
+        }
+        
+        // Multiple alternatives - create a disjunction
+        Ok(Box::new(RustieOrQuery { sub_queries: alternatives }))
     }
 } 

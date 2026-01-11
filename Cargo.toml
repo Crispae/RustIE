@@ -24,6 +24,8 @@ indicatif = "0.17"
 rand = "0.8"
 pest = "2.7"
 pest_derive = "2.7"
+utoipa = { version = "4", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
 
 [[bin]]
 name = "api_server"
@@ -52,3 +54,23 @@ path = "test_full_pipeline.rs"
 [[bin]]
 name = "graph_traversal_2"
 path = "src/bin/graph_traversal_2.rs"
+
+[[bin]]
+name = "test_parser"
+path = "src/bin/test_parser.rs"
+
+[[bin]]
+name = "test_compiler_features"
+path = "src/bin/test_compiler_features.rs"
+
+[[bin]]
+name = "comprehensive_test"
+path = "src/bin/comprehensive_test.rs"
+
+[[bin]]
+name = "create_gzip"
+path = "src/bin/create_gzip.rs"
+
+[[bin]]
+name = "create_test_index"
+path = "src/bin/create_test_index.rs"

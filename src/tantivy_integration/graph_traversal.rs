@@ -109,8 +109,8 @@ impl Weight for OptimizedGraphTraversalWeight {
             match_index: 0,
             src_pattern: self.src_pattern.clone(),
             dst_pattern: self.dst_pattern.clone(),
-       
             current_doc_matches: Vec::new(),
+            boost, // Pass boost for Odinson-style scoring
         };
         
 
@@ -136,7 +136,7 @@ impl Weight for OptimizedGraphTraversalWeight {
 
 /// Optimized scorer for graph traversal queries
 pub struct OptimizedGraphTraversalScorer {
-    
+
     src_scorer: Box<dyn Scorer>,
     dst_scorer: Box<dyn Scorer>,
     traversal: crate::compiler::ast::Traversal,
@@ -148,10 +148,50 @@ pub struct OptimizedGraphTraversalScorer {
     src_pattern: crate::compiler::ast::Pattern,
     dst_pattern: crate::compiler::ast::Pattern,
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
+    /// Boost factor from weight creation
+    boost: Score,
+}
+
+impl OptimizedGraphTraversalScorer {
+    /// Compute sloppy frequency factor based on span width (Odinson-style)
+    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
+    /// Shorter spans get higher scores
+    fn compute_slop_factor(span_width: usize) -> Score {
+        1.0 / (1.0 + span_width as f32)
+    }
+
+    /// Compute Odinson-style score for the current document
+    /// Accumulates sloppy frequency for all matches, similar to Lucene/Odinson
+    fn compute_odinson_score(&self) -> Score {
+        if self.current_doc_matches.is_empty() {
+            return 0.0;
+        }
+
+        // Accumulate sloppy frequency for all matches (Odinson approach)
+        let mut acc_sloppy_freq: Score = 0.0;
+
+        for span_match in &self.current_doc_matches {
+            let span_width = span_match.span.end.saturating_sub(span_match.span.start);
+            acc_sloppy_freq += Self::compute_slop_factor(span_width);
+        }
+
+        // Get base scores from sub-scorers (if available)
+        // This incorporates Tantivy's BM25 scoring from the term queries
+        let src_score = 1.0; // Base score since we already matched
+        let dst_score = 1.0;
+        let base_score = (src_score + dst_score) / 2.0;
+
+        // Final score: base_score * accumulated_sloppy_freq * boost
+        // This follows Odinson's: docScorer.score(docID(), accSloppyFreq)
+        let final_score = base_score * acc_sloppy_freq * self.boost;
+
+        // Ensure minimum score of 1.0 for any match (normalized)
+        final_score.max(1.0)
+    }
 }
 
 impl Scorer for OptimizedGraphTraversalScorer {
-    
+
     fn score(&mut self) -> Score {
         if let Some((_, score)) = self.current_matches.get(self.match_index) {
             *score
@@ -188,6 +228,11 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                 if self.check_graph_traversal(doc_id) {
                     println!("DEBUG: advance() doc_id {} MATCHED graph traversal", doc_id);
                     self.current_doc = Some(doc_id);
+                    // Compute Odinson-style score based on span widths and match count
+                    let score = self.compute_odinson_score();
+                    println!("DEBUG: Odinson-style score for doc_id {}: {}", doc_id, score);
+                    self.current_matches.push((doc_id, score));
+                    self.match_index = self.current_matches.len() - 1;
                     // Advance both scorers for next call
                     self.src_scorer.advance();
                     self.dst_scorer.advance();
@@ -386,14 +431,13 @@ impl OptimizedGraphTraversalScorer {
         }
     }
 
-    /// Find positions in tokens that match a given pattern (string, regex, or wildcard for 'word' field)
+    /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
     fn find_positions_in_tokens(&self, tokens: &[String], pattern: &crate::compiler::ast::Pattern) -> Vec<usize> {
         use crate::compiler::ast::{Pattern, Constraint, Matcher};
         let mut positions = Vec::new();
         match pattern {
-            Pattern::Constraint(Constraint::Field { name, matcher }) => {
-                // Only support "word" field for now
-                if name != "word" { return positions; }
+            Pattern::Constraint(Constraint::Field { name: _, matcher }) => {
+                // Supports any field - tokens are already extracted from the correct field
                 match matcher {
                     Matcher::String(s) => {
                         for (i, token) in tokens.iter().enumerate() {

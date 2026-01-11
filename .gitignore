@@ -31,3 +31,6 @@ Thumbs.db
 # === Logs and Debug ===
 *.log
 debug.log
+
+odinson-bare-api/
+test_api_index

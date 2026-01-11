@@ -13,6 +13,7 @@ use tantivy::{
     DocAddress, Score, collector::TopDocs, directory::MmapDirectory
 };
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
+use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaConfig {
@@ -32,7 +33,7 @@ pub struct FieldConfig {
 pub struct ExtractorEngine {
     index: Index,
     reader: IndexReader,
-    writer: IndexWriter,
+    writer: Option<IndexWriter>,
     schema: Schema,
     default_field: Field, // Can be directly used from schema
     sentence_length_field: Field, // Can be directly used from schema
@@ -50,7 +51,14 @@ impl ExtractorEngine {
         let dir = MmapDirectory::open(index_dir)?;
         let index = Index::open_or_create(dir, schema.clone())?;
         let reader = index.reader()?;
-        let writer = index.writer(50_000_000)?; // 50MB buffer
+        let writer = match index.writer(50_000_000) {
+            Ok(w) => Some(w),
+            Err(tantivy::TantivyError::LockFailure(e, _)) => {
+                log::warn!("Could not acquire index lock, running in READ-ONLY mode: {}", e);
+                None
+            },
+             Err(e) => return Err(anyhow::Error::from(e)),
+        };
 
         let default_field = schema.get_field("word").map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
         let sentence_length_field = schema.get_field("sentence_length").map_err(|_| anyhow!("Sentence length field not found in schema"))?;
@@ -140,10 +148,10 @@ impl ExtractorEngine {
         use crate::compiler::parser::QueryParser;
         let parser = QueryParser::new("word".to_string());
         let pattern = parser.parse_query(query)?;
-        println!("DEBUG: Pattern AST type = {:?}", std::any::type_name_of_val(&pattern));
-        println!("DEBUG: Pattern AST = {:?}", pattern);
+        log::debug!("Pattern AST type = {:?}", std::any::type_name_of_val(&pattern));
+        log::debug!("Pattern AST = {:?}", pattern);
         let tantivy_query = self.compiler().compile(query)?;
-        println!("DEBUG: Compiled query type = {:?}", std::any::type_name_of_val(tantivy_query.as_ref()));
+        log::debug!("Compiled query type = {:?}", std::any::type_name_of_val(tantivy_query.as_ref()));
         
         // Try to downcast to see if it's actually an OptimizedGraphTraversalQuery
         /*
@@ -157,10 +165,10 @@ impl ExtractorEngine {
         // skip the pattern matching entirely for better performance, but the previous code 
         // was still attempting pattern matching regardless.
         */
-        if let Some(graph_query) = tantivy_query.as_any().downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>() {
-            println!("DEBUG: Query is actually an OptimizedGraphTraversalQuery!");
+        if let Some(_graph_query) = tantivy_query.as_any().downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>() {
+            log::debug!("Query is actually an OptimizedGraphTraversalQuery!");
         } else {
-            println!("DEBUG: Query is NOT an OptimizedGraphTraversalQuery");
+            log::debug!("Query is NOT an OptimizedGraphTraversalQuery");
         }
         
         // Determine if this is a graph query
@@ -181,45 +189,45 @@ impl ExtractorEngine {
                          pattern: &crate::compiler::ast::Pattern,
                          is_graph_query: bool) -> Result<RustIeResult> {
         
-        println!("DEBUG: === EXECUTION PATH ANALYSIS ===");
-        println!("DEBUG: Pattern type: {:?}", std::any::type_name_of_val(pattern));
-        println!("DEBUG: is_graph_query: {}", is_graph_query);
-        println!("DEBUG: Query type: {:?}", std::any::type_name_of_val(query));
-        
+        log::debug!("=== EXECUTION PATH ANALYSIS ===");
+        log::debug!("Pattern type: {:?}", std::any::type_name_of_val(pattern));
+        log::debug!("is_graph_query: {}", is_graph_query);
+        log::debug!("Query type: {:?}", std::any::type_name_of_val(query));
+
         // CLEAR SEPARATION: Choose execution path based on pattern type
         match pattern {
             // Graph traversal pattern
             crate::compiler::ast::Pattern::GraphTraversal { .. } => {
-                println!("DEBUG: === GRAPH TRAVERSAL EXECUTION PATH ===");
+                log::debug!("=== GRAPH TRAVERSAL EXECUTION PATH ===");
                 self.execute_graph_traversal(query, limit, pattern)
             }
             // Pattern matching patterns (Concatenated and Constraint)
-            crate::compiler::ast::Pattern::Concatenated { .. } | 
+            crate::compiler::ast::Pattern::Concatenated { .. } |
             crate::compiler::ast::Pattern::Constraint { .. } => {
-                println!("DEBUG: === PATTERN MATCHING EXECUTION PATH ===");
+                log::debug!("=== PATTERN MATCHING EXECUTION PATH ===");
                 self.execute_pattern_matching(query, limit, pattern)
             }
             _ => {
-                println!("DEBUG: === FALLBACK EXECUTION PATH ===");
+                log::debug!("=== FALLBACK EXECUTION PATH ===");
                 self.execute_fallback(query, limit, pattern)
             }
         }
     }
 
     /// Execute graph traversal queries using dependency graph edges
-    fn execute_graph_traversal(&self, query: &dyn Query, limit: usize, pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        println!("DEBUG: Using GRAPH TRAVERSAL mechanism");
-        
+    fn execute_graph_traversal(&self, query: &dyn Query, limit: usize, _pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
+        log::debug!("Using GRAPH TRAVERSAL mechanism");
+
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        println!("DEBUG: top_docs = {:?}", top_docs);
-        
+        log::debug!("top_docs = {:?}", top_docs);
+
         let mut sentence_results = Vec::new();
         let mut max_score = None;
 
         for (score, doc_address) in top_docs {
             let mut matches = Vec::new();
-            
+
             // Get the segment order and document ID
             let (segment_ord, doc_id) = (doc_address.segment_ord, doc_address.doc_id);
             let segment_reader = searcher.segment_reader(segment_ord);
@@ -228,34 +236,34 @@ impl ExtractorEngine {
                 .as_any()
                 .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>()
             {
-                println!("DEBUG: Processing graph query for doc_address = {:?}", doc_address);
-                println!("DEBUG: Creating weight for graph query");
+                log::debug!("Processing graph query for doc_address = {:?}", doc_address);
+                log::debug!("Creating weight for graph query");
                 let weight = graph_query.weight(tantivy::query::EnableScoring::Enabled { searcher: &searcher,
                                                                                           statistics_provider: &searcher })?;
-                println!("DEBUG: Creating scorer from weight");
+                log::debug!("Creating scorer from weight");
                 let mut scorer = weight.scorer(segment_reader, 1.0)?;
-                println!("DEBUG: Scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
+                log::debug!("Scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
 
                 while scorer.doc() < doc_id {
                     if scorer.advance() == tantivy::TERMINATED {
                         break;
                     }
                 }
-                
+
                 if scorer.doc() == doc_id {
                     if let Some(graph_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>() {
-                        println!("DEBUG: Successfully downcast to OptimizedGraphTraversalScorer");
-                        println!("DEBUG: Extracting graph matches");
+                        log::debug!("Successfully downcast to OptimizedGraphTraversalScorer");
+                        log::debug!("Extracting graph matches");
                         matches = graph_scorer.get_current_doc_matches().to_vec();
-                        println!("DEBUG: Graph matches = {:?}", matches);
-                        println!("DEBUG: Number of matches found: {}", matches.len());
+                        log::debug!("Graph matches = {:?}", matches);
+                        log::debug!("Number of matches found: {}", matches.len());
                     } else {
-                        println!("DEBUG: WARNING: Scorer is NOT OptimizedGraphTraversalScorer!");
-                        println!("DEBUG: Actual scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
+                        log::warn!("Scorer is NOT OptimizedGraphTraversalScorer!");
+                        log::debug!("Actual scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
                     }
                 }
             } else {
-                println!("DEBUG: WARNING: Expected graph query but downcast failed!");
+                log::warn!("Expected graph query but downcast failed!");
             }
 
             // Extract sentence result
@@ -280,47 +288,110 @@ impl ExtractorEngine {
     fn execute_pattern_matching(&self, query: &dyn Query,
          limit: usize,
          pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        println!("DEBUG: Using PATTERN MATCHING mechanism");
-        
+        log::debug!("Using PATTERN MATCHING mechanism");
+
         // Check if this is a RustieConcatQuery
         if let Some(pattern_query) = query.as_any().downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatQuery>() {
-            println!("DEBUG: Detected RustieConcatQuery - using custom pattern matching scorer");
+            log::debug!("Detected RustieConcatQuery - using custom pattern matching scorer");
             return self.execute_optimized_pattern_matching(pattern_query, limit);
         }
-        
-        println!("DEBUG: Using standard Tantivy pattern matching");
-        
+
+        // Check if this is a RustieNamedCaptureQuery
+        if let Some(named_query) = query.as_any().downcast_ref::<crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery>() {
+            log::debug!("Detected RustieNamedCaptureQuery - using custom named capture scorer");
+            return self.execute_named_capture_matching(named_query, limit);
+        }
+
+        log::debug!("Using standard Tantivy pattern matching");
+
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        println!("DEBUG: top_docs = {:?}", top_docs);
-        
+        log::debug!("top_docs = {:?}", top_docs);
+
         let mut sentence_results = Vec::new();
+        let mut score_docs = Vec::new();
         let mut max_score = None;
 
         for (score, doc_address) in top_docs {
+            score_docs.push(RustieDoc::new(doc_address, score));
+            
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
                 let tokens = self.extract_field_values(&doc, "word");
-                
-                println!("DEBUG: Extracting pattern matches using direct token positions");
-                println!("DEBUG: Tokens in document: {:?}", tokens);
-                
+
+                log::debug!("Extracting pattern matches using direct token positions");
+                log::debug!("Tokens in document: {:?}", tokens);
+
                 // Use pattern's built-in extract_matching_positions instead of redundant function
                 let match_positions = pattern.extract_matching_positions("word", &tokens);
-                println!("DEBUG: Match positions found: {:?}", match_positions);
-                
+                log::debug!("Match positions found: {:?}", match_positions);
+
                 let mut pattern_matches = Vec::new();
-                
+
                 // Create captures for each matching position
                 for (i, &pos) in match_positions.iter().enumerate() {
                     let span = crate::types::Span { start: pos, end: pos + 1 };
                     let capture = crate::types::NamedCapture::new(format!("c{}", i), span.clone());
                     pattern_matches.push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));
                 }
-                
-                println!("DEBUG: Pattern matches = {:?}", pattern_matches);
-                println!("DEBUG: Number of pattern matches: {}", pattern_matches.len());
+
+                log::debug!("Pattern matches = {:?}", pattern_matches);
+                log::debug!("Number of pattern matches: {}", pattern_matches.len());
                 sentence_result.matches = pattern_matches;
+                sentence_results.push(sentence_result);
+            }
+
+            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
+        }
+        
+        Ok(RustIeResult {
+            total_hits: sentence_results.len(),
+            score_docs,
+            sentence_results,
+            max_score,
+        })
+    }
+
+    /// Execute optimized pattern matching queries using custom scorer
+    fn execute_optimized_pattern_matching(&self, pattern_query: &crate::tantivy_integration::concat_query::RustieConcatQuery, limit: usize) -> Result<RustIeResult> {
+        log::debug!("=== OPTIMIZED PATTERN MATCHING EXECUTION PATH ===");
+
+        let searcher = self.reader.searcher();
+        let top_docs = searcher.search(pattern_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
+        log::debug!("top_docs = {:?}", top_docs);
+
+        let mut sentence_results = Vec::new();
+        let mut max_score = None;
+
+        for (score, doc_address) in top_docs {
+            if let Ok(doc) = self.doc(doc_address) {
+                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
+
+                // Get the segment order and document ID
+                let (segment_ord, _doc_id) = (doc_address.segment_ord, doc_address.doc_id);
+                let segment_reader = searcher.segment_reader(segment_ord);
+
+                log::debug!("Creating weight for optimized pattern matching query");
+                let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled {
+                    searcher: &searcher,
+                    statistics_provider: &searcher
+                })?;
+
+                log::debug!("Creating scorer from weight");
+                let scorer = weight.scorer(segment_reader, 1.0)?;
+                log::debug!("Optimized pattern matching scorer type = {:?}", std::any::type_name_of_val(&*scorer));
+                log::debug!("Using custom pattern matching scorer");
+
+                // Get matches from the custom scorer
+                if let Some(pattern_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>() {
+                    let matches = pattern_scorer.get_current_doc_matches();
+                    log::debug!("Custom pattern matching matches = {:?}", matches);
+                    sentence_result.matches = matches.to_vec();
+                } else {
+                    log::debug!("Could not downcast to OptimizedPatternMatchingScorer");
+                    sentence_result.matches = Vec::new();
+                }
+
                 sentence_results.push(sentence_result);
             }
 
@@ -335,46 +406,44 @@ impl ExtractorEngine {
         })
     }
 
-    /// Execute optimized pattern matching queries using custom scorer
-    fn execute_optimized_pattern_matching(&self, pattern_query: &crate::tantivy_integration::concat_query::RustieConcatQuery, limit: usize) -> Result<RustIeResult> {
-        println!("DEBUG: === OPTIMIZED PATTERN MATCHING EXECUTION PATH ===");
-        
+    /// Execute named capture pattern matching queries using custom scorer
+    fn execute_named_capture_matching(&self, named_query: &crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery, limit: usize) -> Result<RustIeResult> {
+        log::debug!("=== NAMED CAPTURE EXECUTION PATH ===");
+
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(pattern_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        println!("DEBUG: top_docs = {:?}", top_docs);
-        
+        let top_docs = searcher.search(named_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
+        log::debug!("top_docs = {:?}", top_docs);
+
         let mut sentence_results = Vec::new();
         let mut max_score = None;
 
         for (score, doc_address) in top_docs {
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                
+
                 // Get the segment order and document ID
-                let (segment_ord, doc_id) = (doc_address.segment_ord, doc_address.doc_id);
+                let (segment_ord, _) = (doc_address.segment_ord, doc_address.doc_id);
                 let segment_reader = searcher.segment_reader(segment_ord);
-                
-                println!("DEBUG: Creating weight for optimized pattern matching query");
-                let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled { 
-                    searcher: &searcher, 
-                    statistics_provider: &searcher 
+
+                log::debug!("Creating weight for named capture query");
+                let weight = named_query.weight(tantivy::query::EnableScoring::Enabled {
+                    searcher: &searcher,
+                    statistics_provider: &searcher
                 })?;
-                
-                println!("DEBUG: Creating scorer from weight");
-                let mut scorer = weight.scorer(segment_reader, 1.0)?;
-                println!("DEBUG: Optimized pattern matching scorer type = {:?}", std::any::type_name_of_val(&*scorer));
-                println!("DEBUG: Using custom pattern matching scorer");
-                
+
+                log::debug!("Creating scorer from weight");
+                let scorer = weight.scorer(segment_reader, 1.0)?;
+
                 // Get matches from the custom scorer
-                if let Some(pattern_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>() {
-                    let matches = pattern_scorer.get_current_doc_matches();
-                    println!("DEBUG: Custom pattern matching matches = {:?}", matches);
+                if let Some(named_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::named_capture_query::RustieNamedCaptureScorer>() {
+                    let matches = named_scorer.get_current_doc_matches();
+                    log::debug!("Named captures = {:?}", matches);
                     sentence_result.matches = matches.to_vec();
                 } else {
-                    println!("DEBUG: Could not downcast to OptimizedPatternMatchingScorer");
+                    log::debug!("Could not downcast to RustieNamedCaptureScorer");
                     sentence_result.matches = Vec::new();
                 }
-                
+
                 sentence_results.push(sentence_result);
             }
 
@@ -391,7 +460,7 @@ impl ExtractorEngine {
 
     /// Execute fallback for other pattern types
     fn execute_fallback(&self, query: &dyn Query, limit: usize, pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        println!("DEBUG: Using FALLBACK mechanism for pattern type: {:?}", std::any::type_name_of_val(pattern));
+        log::debug!("Using FALLBACK mechanism for pattern type: {:?}", std::any::type_name_of_val(pattern));
         
         let searcher = self.reader.searcher();
         let top_docs = searcher.search(query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
@@ -507,8 +576,12 @@ impl ExtractorEngine {
         // Update the engine's vocabulary with any new labels
         // self.vocabulary = parser.vocabulary().clone(); // Removed vocabulary usage
         
-        for tantivy_doc in tantivy_docs {
-            self.writer.add_document(tantivy_doc)?;
+        if let Some(writer) = &mut self.writer {
+             for tantivy_doc in tantivy_docs {
+                writer.add_document(tantivy_doc)?;
+            }
+        } else {
+            return Err(anyhow!("Cannot add document: Engine is in READ-ONLY mode (index lock could not be acquired)"));
         }
         
         Ok(())
@@ -526,7 +599,11 @@ impl ExtractorEngine {
 
     /// Commit changes to the index
     pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit()?;
+        if let Some(writer) = &mut self.writer {
+            writer.commit()?;
+        } else {
+             return Err(anyhow!("Cannot commit: Engine is in READ-ONLY mode"));
+        }
         // Refresh the reader to see the new documents
         self.reader = self.index.reader()?;
         
@@ -537,8 +614,8 @@ impl ExtractorEngine {
     }
 
     /// Get the index writer (for advanced usage)
-    pub fn writer(&mut self) -> &mut IndexWriter {
-        &mut self.writer
+    pub fn writer(&mut self) -> Result<&mut IndexWriter> {
+        self.writer.as_mut().ok_or_else(|| anyhow!("Engine is in READ-ONLY mode"))
     }
 
     /// Get the schema

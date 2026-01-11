@@ -72,6 +72,7 @@ impl Weight for RustieConcatWeight {
             current_matches: Vec::new(),
             match_index: 0,
             current_doc_matches: Vec::new(),
+            boost, // Pass boost for Odinson-style scoring
         };
         let _ = scorer.advance();
         Ok(Box::new(scorer))
@@ -91,6 +92,43 @@ pub struct RustieConcatScorer {
     current_matches: Vec<(DocId, Score)>,
     match_index: usize,
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
+    /// Boost factor from weight creation
+    boost: Score,
+}
+
+impl RustieConcatScorer {
+    /// Compute sloppy frequency factor based on span width (Odinson-style)
+    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
+    /// Shorter spans get higher scores
+    fn compute_slop_factor(span_width: usize) -> Score {
+        1.0 / (1.0 + span_width as f32)
+    }
+
+    /// Compute Odinson-style score for the current document
+    /// Accumulates sloppy frequency for all matches, similar to Lucene/Odinson
+    fn compute_odinson_score(&self) -> Score {
+        if self.current_doc_matches.is_empty() {
+            return 0.0;
+        }
+
+        // Accumulate sloppy frequency for all matches (Odinson approach)
+        let mut acc_sloppy_freq: Score = 0.0;
+
+        for span_match in &self.current_doc_matches {
+            let span_width = span_match.span.end.saturating_sub(span_match.span.start);
+            acc_sloppy_freq += Self::compute_slop_factor(span_width);
+        }
+
+        // Base score from pattern matching
+        let base_score = 1.0;
+
+        // Final score: base_score * accumulated_sloppy_freq * boost
+        // This follows Odinson's: docScorer.score(docID(), accSloppyFreq)
+        let final_score = base_score * acc_sloppy_freq * self.boost;
+
+        // Ensure minimum score of 1.0 for any match (normalized)
+        final_score.max(1.0)
+    }
 }
 
 impl Scorer for RustieConcatScorer {
@@ -134,6 +172,10 @@ impl DocSet for RustieConcatScorer {
                 // Now check for valid sequence/position match in this doc
                 if self.check_pattern_matching(doc) {
                     self.current_doc = Some(doc);
+                    // Compute Odinson-style score based on span widths and match count
+                    let score = self.compute_odinson_score();
+                    self.current_matches.push((doc, score));
+                    self.match_index = self.current_matches.len() - 1;
                     return doc;
                 }
             }

@@ -1,6 +1,6 @@
 use pest::Parser;
 use pest_derive::Parser;
-use crate::compiler::ast::{Pattern, Constraint, Matcher};
+use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion};
 
 #[derive(Parser)]
 #[grammar = "query.pest"]
@@ -9,7 +9,34 @@ pub struct QueryParser;
 // Delegating AST builder
 pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
     match pair.as_rule() {
-        Rule::query | Rule::traversal_seq => {
+        Rule::query => {
+            let inner = pair.into_inner().next().unwrap();
+            build_ast(inner)
+        }
+        Rule::default_field_query => {
+            let inner = pair.into_inner().next().unwrap();
+            match inner.as_rule() {
+                Rule::default_string => {
+                    let value = inner.as_str().to_string();
+                    Pattern::Constraint(Constraint::Field {
+                        name: "word".to_string(),
+                        matcher: Matcher::String(value),
+                    })
+                }
+                Rule::default_regex => {
+                    let pattern = &inner.as_str()[1..inner.as_str().len()-1];
+                    Pattern::Constraint(Constraint::Field {
+                        name: "word".to_string(),
+                        matcher: Matcher::Regex {
+                            pattern: pattern.to_string(),
+                            regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
+                        },
+                    })
+                }
+                _ => unreachable!(),
+            }
+        }
+        Rule::traversal_seq => {
             let mut pairs = pair.into_inner();
             let mut src = build_ast(pairs.next().unwrap());
             let mut pairs = pairs.peekable();
@@ -17,8 +44,9 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                 if trav_pair.as_rule() == Rule::traversal {
                     let mut trav_inner = trav_pair.into_inner();
                     let traversal_op_pair = trav_inner.next().unwrap();
-                    let traversal_kind_pair = traversal_op_pair.into_inner().next().unwrap();
-                    let traversal = build_traversal(traversal_kind_pair);
+                    // traversal_op_pair is traversal_op, which contains the actual traversal type
+                    let inner_traversal = traversal_op_pair.into_inner().next().unwrap();
+                    let traversal = build_traversal_op(inner_traversal);
                     let dst = build_ast(trav_inner.next().unwrap());
                     src = Pattern::GraphTraversal {
                         src: Box::new(src),
@@ -33,7 +61,7 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
             let mut patterns = Vec::new();
             for inner in pair.into_inner() {
                 match inner.as_rule() {
-                    Rule::pattern | Rule::named_capture | Rule::sequence | Rule::constraint => {
+                    Rule::quantified_pattern | Rule::named_capture | Rule::sequence => {
                         patterns.push(build_ast(inner));
                     }
                     Rule::WHITESPACE => {}
@@ -46,13 +74,33 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                 Pattern::Concatenated(patterns)
             }
         }
+        Rule::quantified_pattern => {
+            let mut pairs = pair.into_inner();
+            let atomic = build_ast(pairs.next().unwrap());
+            if let Some(quant_pair) = pairs.next() {
+                // quant_pair is pattern_quantifier, which contains greedy_quantifier or lazy_quantifier
+                let inner_quant = quant_pair.into_inner().next().unwrap();
+                let (min, max, _is_lazy) = parse_quantifier(inner_quant);
+                Pattern::Repetition {
+                    pattern: Box::new(atomic),
+                    min,
+                    max,
+                }
+            } else {
+                atomic
+            }
+        }
+        Rule::atomic_pattern => {
+            let inner = pair.into_inner().next().unwrap();
+            build_ast(inner)
+        }
         Rule::named_capture => {
             let mut inner = pair.into_inner();
             let name = inner.next().unwrap().as_str().to_string();
             let pattern = build_ast(inner.next().unwrap());
             Pattern::NamedCapture { name, pattern: Box::new(pattern) }
         }
-        Rule::pattern | Rule::group => {
+        Rule::group => {
             let inner = pair.into_inner().next().unwrap();
             build_ast(inner)
         }
@@ -63,7 +111,88 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                 Pattern::Constraint(Constraint::Wildcard)
             }
         }
+        Rule::assertion_pattern => {
+            let inner = pair.into_inner().next().unwrap();
+            Pattern::Assertion(build_assertion(inner))
+        }
         _ => panic!("Unsupported pattern for now: {:?}", pair.as_rule()),
+    }
+}
+
+fn parse_quantifier(pair: pest::iterators::Pair<Rule>) -> (usize, Option<usize>, bool) {
+    let text = pair.as_str();
+    match pair.as_rule() {
+        Rule::greedy_quantifier => {
+            // Check if it's a simple string literal first
+            match text {
+                "*" => return (0, None, false),
+                "+" => return (1, None, false),
+                "?" => return (0, Some(1), false),
+                _ => {}
+            }
+            
+            // Otherwise, it should be a range_quantifier
+            let mut inner_pairs = pair.into_inner();
+            if let Some(inner) = inner_pairs.next() {
+                if inner.as_rule() == Rule::range_quantifier {
+                    let mut pairs = inner.into_inner();
+                    let min_str = pairs.next();
+                    let max_str = pairs.next();
+                    let min = min_str.map(|p| p.as_str().parse().unwrap()).unwrap_or(0);
+                    let max = max_str.and_then(|p| p.as_str().parse::<usize>().ok());
+                    (min, max, false)
+                } else {
+                    panic!("Unexpected inner rule in greedy_quantifier: {:?}, text: {}", inner.as_rule(), text)
+                }
+            } else {
+                // Fallback: try to parse as range quantifier from text
+                if text.starts_with('{') && text.ends_with('}') {
+                    let content = &text[1..text.len()-1];
+                    let parts: Vec<&str> = content.split(',').collect();
+                    let min = parts.get(0).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                    let max = parts.get(1).and_then(|s| s.trim().parse::<usize>().ok());
+                    (min, max, false)
+                } else {
+                    panic!("Unexpected greedy quantifier: {}", text)
+                }
+            }
+        }
+        Rule::lazy_quantifier => {
+            // Check if it's a simple string literal first
+            match text {
+                "*?" => return (0, None, true),
+                "+?" => return (1, None, true),
+                "??" => return (0, Some(1), true),
+                _ => {}
+            }
+            
+            // Otherwise, it should be a lazy_range_quantifier
+            let mut inner_pairs = pair.into_inner();
+            if let Some(inner) = inner_pairs.next() {
+                if inner.as_rule() == Rule::lazy_range_quantifier {
+                    let mut pairs = inner.into_inner();
+                    let min_str = pairs.next();
+                    let max_str = pairs.next();
+                    let min = min_str.map(|p| p.as_str().parse().unwrap()).unwrap_or(0);
+                    let max = max_str.and_then(|p| p.as_str().parse::<usize>().ok());
+                    (min, max, true)
+                } else {
+                    panic!("Unexpected inner rule in lazy_quantifier: {:?}, text: {}", inner.as_rule(), text)
+                }
+            } else {
+                // Fallback: try to parse as lazy range quantifier from text
+                if text.starts_with('{') && text.ends_with("}?") {
+                    let content = &text[1..text.len()-2];
+                    let parts: Vec<&str> = content.split(',').collect();
+                    let min = parts.get(0).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+                    let max = parts.get(1).and_then(|s| s.trim().parse::<usize>().ok());
+                    (min, max, true)
+                } else {
+                    panic!("Unexpected lazy quantifier: {}", text)
+                }
+            }
+        }
+        _ => panic!("Unexpected quantifier rule: {:?}, text: {}", pair.as_rule(), text),
     }
 }
 
@@ -90,16 +219,45 @@ fn build_constraint(pair: pest::iterators::Pair<Rule>) -> Constraint {
                 Constraint::Conjunctive(children)
             }
         }
+        Rule::negated_atom => {
+            let mut inner = pair.into_inner();
+            let first = inner.next().unwrap();
+            if first.as_str() == "!" {
+                // Negated atom
+                let atom = inner.next().unwrap();
+                Constraint::Negated(Box::new(build_constraint(atom)))
+            } else {
+                // Regular atom (no negation)
+                build_constraint(first)
+            }
+        }
         Rule::atom => {
+            let inner = pair.into_inner().next().unwrap();
+            build_constraint(inner)
+        }
+        Rule::group_constraint => {
             let inner = pair.into_inner().next().unwrap();
             build_constraint(inner)
         }
         Rule::field_constraint => {
             let mut inner = pair.into_inner();
             let field = inner.next().unwrap().as_str().to_string();
+            let op = inner.next().unwrap().as_str();
             let value_pair = inner.next().unwrap();
+            let fuzzy_op = inner.next();
+            
             let matcher = match value_pair.as_rule() {
-                Rule::value => Matcher::String(value_pair.as_str().to_string()),
+                Rule::value => {
+                    let value = value_pair.as_str().to_string();
+                    if fuzzy_op.is_some() {
+                        // Fuzzy matching - store as Fuzzy constraint
+                        return Constraint::Fuzzy {
+                            name: field,
+                            matcher: value,
+                        };
+                    }
+                    Matcher::String(value)
+                }
                 Rule::regex_value => {
                     let pattern = &value_pair.as_str()[1..value_pair.as_str().len()-1];
                     Matcher::Regex {
@@ -109,9 +267,17 @@ fn build_constraint(pair: pest::iterators::Pair<Rule>) -> Constraint {
                 }
                 _ => unreachable!(),
             };
-            Constraint::Field {
-                name: field,
-                matcher,
+            
+            if op == "!=" {
+                Constraint::Negated(Box::new(Constraint::Field {
+                    name: field,
+                    matcher,
+                }))
+            } else {
+                Constraint::Field {
+                    name: field,
+                    matcher,
+                }
             }
         }
         Rule::wildcard => Constraint::Wildcard,
@@ -119,7 +285,37 @@ fn build_constraint(pair: pest::iterators::Pair<Rule>) -> Constraint {
     }
 }
 
-fn build_traversal(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::Traversal {
+fn build_assertion(pair: pest::iterators::Pair<Rule>) -> Assertion {
+    match pair.as_rule() {
+        Rule::lookahead_assertion => {
+            let inner = pair.into_inner().next().unwrap();
+            build_assertion(inner)
+        }
+        Rule::lookbehind_assertion => {
+            let inner = pair.into_inner().next().unwrap();
+            build_assertion(inner)
+        }
+        Rule::positive_lookahead => {
+            let inner = pair.into_inner().next().unwrap();
+            Assertion::PositiveLookahead(Box::new(build_ast(inner)))
+        }
+        Rule::negative_lookahead => {
+            let inner = pair.into_inner().next().unwrap();
+            Assertion::NegativeLookahead(Box::new(build_ast(inner)))
+        }
+        Rule::positive_lookbehind => {
+            let inner = pair.into_inner().next().unwrap();
+            Assertion::PositiveLookbehind(Box::new(build_ast(inner)))
+        }
+        Rule::negative_lookbehind => {
+            let inner = pair.into_inner().next().unwrap();
+            Assertion::NegativeLookbehind(Box::new(build_ast(inner)))
+        }
+        _ => panic!("Unsupported assertion: {:?}", pair.as_rule()),
+    }
+}
+
+fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::Traversal {
     match pair.as_rule() {
         Rule::outgoing_wildcard => crate::compiler::ast::Traversal::OutgoingWildcard,
         Rule::incoming_wildcard => crate::compiler::ast::Traversal::IncomingWildcard,
@@ -128,38 +324,7 @@ fn build_traversal(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::T
             let label_pair = inner.next().unwrap();
             let quantifier_pair = inner.next(); // This might be None if no quantifier
             
-            let base_traversal = match label_pair.as_rule() {
-                Rule::label => crate::compiler::ast::Traversal::Outgoing(crate::compiler::ast::Matcher::String(label_pair.as_str().to_string())),
-                Rule::traversal_regex => {
-                    let pattern = &label_pair.as_str()[1..label_pair.as_str().len()-1];
-                    crate::compiler::ast::Traversal::Outgoing(crate::compiler::ast::Matcher::Regex {
-                        pattern: pattern.to_string(),
-                        regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
-                    })
-                }
-                Rule::traversal_label => {
-                    let mut inner = label_pair.into_inner();
-                    let inner_pair = inner.next().unwrap();
-                    match inner_pair.as_rule() {
-                        Rule::label => crate::compiler::ast::Traversal::Outgoing(crate::compiler::ast::Matcher::String(inner_pair.as_str().to_string())),
-                        Rule::traversal_regex => {
-                            let pattern = &inner_pair.as_str()[1..inner_pair.as_str().len()-1];
-                            crate::compiler::ast::Traversal::Outgoing(crate::compiler::ast::Matcher::Regex {
-                                pattern: pattern.to_string(),
-                                regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
-                            })
-                        }
-                        other => {
-                            eprintln!("[DEBUG] Unexpected outgoing traversal_label inner rule: {:?}, text: {}", other, inner_pair.as_str());
-                            unreachable!()
-                        }
-                    }
-                }
-                other => {
-                    eprintln!("[DEBUG] Unexpected outgoing traversal label rule: {:?}, text: {}", other, label_pair.as_str());
-                    unreachable!()
-                }
-            };
+            let base_traversal = build_traversal_label(label_pair, true);
             
             // Check if there's a quantifier and wrap accordingly
             if quantifier_pair.is_some() {
@@ -173,38 +338,7 @@ fn build_traversal(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::T
             let label_pair = inner.next().unwrap();
             let quantifier_pair = inner.next(); // This might be None if no quantifier
             
-            let base_traversal = match label_pair.as_rule() {
-                Rule::label => crate::compiler::ast::Traversal::Incoming(crate::compiler::ast::Matcher::String(label_pair.as_str().to_string())),
-                Rule::traversal_regex => {
-                    let pattern = &label_pair.as_str()[1..label_pair.as_str().len()-1];
-                    crate::compiler::ast::Traversal::Incoming(crate::compiler::ast::Matcher::Regex {
-                        pattern: pattern.to_string(),
-                        regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
-                    })
-                }
-                Rule::traversal_label => {
-                    let mut inner = label_pair.into_inner();
-                    let inner_pair = inner.next().unwrap();
-                    match inner_pair.as_rule() {
-                        Rule::label => crate::compiler::ast::Traversal::Incoming(crate::compiler::ast::Matcher::String(inner_pair.as_str().to_string())),
-                        Rule::traversal_regex => {
-                            let pattern = &inner_pair.as_str()[1..inner_pair.as_str().len()-1];
-                            crate::compiler::ast::Traversal::Incoming(crate::compiler::ast::Matcher::Regex {
-                                pattern: pattern.to_string(),
-                                regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
-                            })
-                        }
-                        other => {
-                            eprintln!("[DEBUG] Unexpected incoming traversal_label inner rule: {:?}, text: {}", other, inner_pair.as_str());
-                            unreachable!()
-                        }
-                    }
-                }
-                other => {
-                    eprintln!("[DEBUG] Unexpected incoming traversal label rule: {:?}, text: {}", other, label_pair.as_str());
-                    unreachable!()
-                }
-            };
+            let base_traversal = build_traversal_label(label_pair, false);
             
             // Check if there's a quantifier and wrap accordingly
             if quantifier_pair.is_some() {
@@ -213,8 +347,67 @@ fn build_traversal(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::T
                 base_traversal
             }
         }
+        Rule::disjunctive_traversal => {
+            let mut labels = Vec::new();
+            for label_pair in pair.into_inner() {
+                if label_pair.as_rule() == Rule::traversal_label {
+                    labels.push(build_traversal_label(label_pair, true));
+                }
+            }
+            if labels.len() == 1 {
+                labels.pop().unwrap()
+            } else {
+                crate::compiler::ast::Traversal::Disjunctive(labels)
+            }
+        }
+        Rule::concatenated_traversal => {
+            let mut labels = Vec::new();
+            for label_pair in pair.into_inner() {
+                if label_pair.as_rule() == Rule::traversal_label {
+                    labels.push(build_traversal_label(label_pair, true));
+                }
+            }
+            if labels.len() == 1 {
+                labels.pop().unwrap()
+            } else {
+                crate::compiler::ast::Traversal::Concatenated(labels)
+            }
+        }
         other => {
-            eprintln!("[DEBUG] Unexpected traversal rule: {:?}, text: {}", other, pair.as_str());
+            eprintln!("[DEBUG] Unexpected traversal op rule: {:?}, text: {}", other, pair.as_str());
+            unreachable!()
+        }
+    }
+}
+
+fn build_traversal_label(pair: pest::iterators::Pair<Rule>, outgoing: bool) -> crate::compiler::ast::Traversal {
+    match pair.as_rule() {
+        Rule::label => {
+            let matcher = crate::compiler::ast::Matcher::String(pair.as_str().to_string());
+            if outgoing {
+                crate::compiler::ast::Traversal::Outgoing(matcher)
+            } else {
+                crate::compiler::ast::Traversal::Incoming(matcher)
+            }
+        }
+        Rule::traversal_regex => {
+            let pattern = &pair.as_str()[1..pair.as_str().len()-1];
+            let matcher = crate::compiler::ast::Matcher::Regex {
+                pattern: pattern.to_string(),
+                regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
+            };
+            if outgoing {
+                crate::compiler::ast::Traversal::Outgoing(matcher)
+            } else {
+                crate::compiler::ast::Traversal::Incoming(matcher)
+            }
+        }
+        Rule::traversal_label => {
+            let inner = pair.into_inner().next().unwrap();
+            build_traversal_label(inner, outgoing)
+        }
+        _ => {
+            eprintln!("[DEBUG] Unexpected traversal label rule: {:?}, text: {}", pair.as_rule(), pair.as_str());
             unreachable!()
         }
     }

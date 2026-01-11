@@ -169,8 +169,8 @@ impl DocumentParser {
                                         Ok(bytes) => {
                                             tantivy_doc.add_bytes(binary_field, &bytes);
                                         }
-                                        Err(_) => {
-                                            // Graph serialization failed, continue without it
+                                        Err(e) => {
+                                            log::warn!("Graph serialization failed: {}", e);
                                         }
                                     }
                                 }

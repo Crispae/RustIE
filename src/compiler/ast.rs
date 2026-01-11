@@ -70,11 +70,9 @@ impl Constraint {
     }
 }
 
-/// Assertions for position-based matching
+/// Assertions for position-based matching (lookahead and lookbehind only)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Assertion {
-    SentenceStart,
-    SentenceEnd,
     PositiveLookahead(Box<Pattern>),
     NegativeLookahead(Box<Pattern>),
     PositiveLookbehind(Box<Pattern>),
@@ -223,16 +221,6 @@ impl Ast {
             name,
             pattern: Box::new(pattern),
         }
-    }
-
-    /// Create a sentence start assertion
-    pub fn sentence_start_assertion() -> Pattern {
-        Pattern::Assertion(Assertion::SentenceStart)
-    }
-
-    /// Create a sentence end assertion
-    pub fn sentence_end_assertion() -> Pattern {
-        Pattern::Assertion(Assertion::SentenceEnd)
     }
 
     /// Create a repetition pattern
