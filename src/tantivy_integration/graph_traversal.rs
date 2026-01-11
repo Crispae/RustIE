@@ -386,14 +386,13 @@ impl OptimizedGraphTraversalScorer {
         }
     }
 
-    /// Find positions in tokens that match a given pattern (string, regex, or wildcard for 'word' field)
+    /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
     fn find_positions_in_tokens(&self, tokens: &[String], pattern: &crate::compiler::ast::Pattern) -> Vec<usize> {
         use crate::compiler::ast::{Pattern, Constraint, Matcher};
         let mut positions = Vec::new();
         match pattern {
-            Pattern::Constraint(Constraint::Field { name, matcher }) => {
-                // Only support "word" field for now
-                if name != "word" { return positions; }
+            Pattern::Constraint(Constraint::Field { name: _, matcher }) => {
+                // Supports any field - tokens are already extracted from the correct field
                 match matcher {
                     Matcher::String(s) => {
                         for (i, token) in tokens.iter().enumerate() {

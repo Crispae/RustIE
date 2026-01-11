@@ -428,20 +428,41 @@ fn get_test_cases() -> Vec<TestCase> {
         },
 
         // === Graph Outgoing ===
-        // Note: Graph traversal currently works best with 'word' field constraints
+        // Graph traversal works with any field (word, pos, lemma, entity, etc.)
         TestCase {
-            name: "graph_out_nsubj",
+            name: "graph_out_nsubj_word",
             query: "[word=eats] >nsubj [word=John]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'eats' with John as subject",
+            description: "Find 'eats' with John as subject (word field)",
         },
         TestCase {
-            name: "graph_out_dobj",
+            name: "graph_out_dobj_word",
             query: "[word=eats] >dobj [word=pizza]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'eats' with pizza as direct object",
+            description: "Find 'eats' with pizza as direct object (word field)",
+        },
+        TestCase {
+            name: "graph_out_nsubj_pos",
+            query: "[pos=/VB.*/] >nsubj [pos=/NN.*/]",
+            category: TestCategory::GraphOutgoing,
+            expected_min_hits: 1,
+            description: "Find verbs with noun subjects (pos field)",
+        },
+        TestCase {
+            name: "graph_out_dobj_pos",
+            query: "[pos=/VB.*/] >dobj [pos=/NN.*/]",
+            category: TestCategory::GraphOutgoing,
+            expected_min_hits: 1,
+            description: "Find verbs with noun objects (pos field)",
+        },
+        TestCase {
+            name: "graph_out_lemma",
+            query: "[lemma=eat] >dobj [lemma=pizza]",
+            category: TestCategory::GraphOutgoing,
+            expected_min_hits: 1,
+            description: "Find 'eat' lemma with 'pizza' as object (lemma field)",
         },
         TestCase {
             name: "graph_out_nsubj_cat",
