@@ -5,6 +5,7 @@ use tantivy::{
     Result as TantivyResult,
     DocSet,
 };
+use log::debug;
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
@@ -49,12 +50,19 @@ impl OptimizedGraphTraversalQuery {
 }
 
 impl Query for OptimizedGraphTraversalQuery {
-    
+
     fn weight(&self, scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
         let src_weight = self.src_query.weight(scoring)?;
         let dst_weight = self.dst_query.weight(scoring)?;
-        
-        
+
+        // Pre-compute flattened pattern once at Weight creation (not per document)
+        let full_pattern = Pattern::GraphTraversal {
+            src: Box::new(self.src_pattern.clone()),
+            traversal: self.traversal.clone(),
+            dst: Box::new(self.dst_pattern.clone()),
+        };
+        let mut flat_steps = Vec::new();
+        flatten_graph_traversal_pattern(&full_pattern, &mut flat_steps);
 
         Ok(Box::new(OptimizedGraphTraversalWeight {
             src_weight,
@@ -63,6 +71,7 @@ impl Query for OptimizedGraphTraversalQuery {
             dst_pattern: self.dst_pattern.clone(),
             traversal: self.traversal.clone(),
             dependencies_binary_field: self.dependencies_binary_field,
+            flat_steps, // Cached flattened pattern
         }))
     }
 }
@@ -89,15 +98,17 @@ struct OptimizedGraphTraversalWeight {
     dependencies_binary_field: Field,
     src_pattern: crate::compiler::ast::Pattern,
     dst_pattern: crate::compiler::ast::Pattern,
+    /// Pre-computed flattened pattern steps (cached once per query)
+    flat_steps: Vec<FlatPatternStep>,
 }
 
 impl Weight for OptimizedGraphTraversalWeight {
-    
+
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
-        // Create fresh scorers for finding documents
+        // Create scorers once (fixed: was previously creating twice wastefully)
         let src_scorer = self.src_weight.scorer(reader, boost)?;
         let dst_scorer = self.dst_weight.scorer(reader, boost)?;
-        
+
         let mut scorer = OptimizedGraphTraversalScorer {
             src_scorer,
             dst_scorer,
@@ -110,22 +121,14 @@ impl Weight for OptimizedGraphTraversalWeight {
             src_pattern: self.src_pattern.clone(),
             dst_pattern: self.dst_pattern.clone(),
             current_doc_matches: Vec::new(),
-            boost, // Pass boost for Odinson-style scoring
+            boost,
+            // Pass cached flattened pattern (computed once per query, not per document)
+            flat_steps: self.flat_steps.clone(),
         };
-        
 
-        
-        // Create fresh scorers for traversal (since the previous ones were consumed)
-        let src_scorer_for_traversal = self.src_weight.scorer(reader, boost)?;
-        let dst_scorer_for_traversal = self.dst_weight.scorer(reader, boost)?;
-        
-        // Replace the consumed scorers with fresh ones
-        scorer.src_scorer = src_scorer_for_traversal;
-        scorer.dst_scorer = dst_scorer_for_traversal;
-        
         // Advance to the first document
-        let first_doc = scorer.advance();
-        
+        let _ = scorer.advance();
+
         Ok(Box::new(scorer))
     }
 
@@ -136,7 +139,6 @@ impl Weight for OptimizedGraphTraversalWeight {
 
 /// Optimized scorer for graph traversal queries
 pub struct OptimizedGraphTraversalScorer {
-
     src_scorer: Box<dyn Scorer>,
     dst_scorer: Box<dyn Scorer>,
     traversal: crate::compiler::ast::Traversal,
@@ -150,6 +152,8 @@ pub struct OptimizedGraphTraversalScorer {
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
     /// Boost factor from weight creation
     boost: Score,
+    /// Pre-computed flattened pattern steps (cached from Weight)
+    flat_steps: Vec<FlatPatternStep>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -213,10 +217,10 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
             // If either scorer is exhausted, we're done
             if src_doc == tantivy::TERMINATED || dst_doc == tantivy::TERMINATED {
                 self.current_doc = None;
-                println!("DEBUG: advance() terminated: src_doc = {}, dst_doc = {}", src_doc, dst_doc);
+                debug!("advance() terminated: src_doc = {}, dst_doc = {}", src_doc, dst_doc);
                 return tantivy::TERMINATED;
             }
-            println!("DEBUG: advance() considering src_doc = {}, dst_doc = {}", src_doc, dst_doc);
+            debug!("advance() considering src_doc = {}, dst_doc = {}", src_doc, dst_doc);
             if src_doc < dst_doc {
                 self.src_scorer.advance();
             } else if dst_doc < src_doc {
@@ -224,13 +228,13 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
             } else {
                 // src_doc == dst_doc: both have matches in this doc
                 let doc_id = src_doc;
-                println!("DEBUG: advance() found candidate doc_id = {}", doc_id);
+                debug!("advance() found candidate doc_id = {}", doc_id);
                 if self.check_graph_traversal(doc_id) {
-                    println!("DEBUG: advance() doc_id {} MATCHED graph traversal", doc_id);
+                    debug!("advance() doc_id {} MATCHED graph traversal", doc_id);
                     self.current_doc = Some(doc_id);
                     // Compute Odinson-style score based on span widths and match count
                     let score = self.compute_odinson_score();
-                    println!("DEBUG: Odinson-style score for doc_id {}: {}", doc_id, score);
+                    debug!("Odinson-style score for doc_id {}: {}", doc_id, score);
                     self.current_matches.push((doc_id, score));
                     self.match_index = self.current_matches.len() - 1;
                     // Advance both scorers for next call
@@ -238,7 +242,7 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                     self.dst_scorer.advance();
                     return doc_id;
                 } else {
-                    println!("DEBUG: advance() doc_id {} did NOT match graph traversal", doc_id);
+                    debug!("advance() doc_id {} did NOT match graph traversal", doc_id);
                     // No match, advance both scorers
                     self.src_scorer.advance();
                     self.dst_scorer.advance();
@@ -280,13 +284,12 @@ impl OptimizedGraphTraversalScorer {
             }
         };
 
-        // Phase 2: Extract tokens for each constraint step
-        let mut flat_steps = Vec::new();
-        flatten_graph_traversal_pattern(&self.traversal_to_pattern(), &mut flat_steps);
+        // Phase 2: Use cached flat_steps (computed once per query, not per document)
+        let flat_steps = &self.flat_steps;
 
         // For each constraint step, extract the field name and tokens
         let mut constraint_fields_and_tokens = Vec::new();
-        for step in &flat_steps {
+        for step in flat_steps {
             if let FlatPatternStep::Constraint(pat) = step {
                 let field_name = match pat {
                     crate::compiler::ast::Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, .. }) => name.as_str(),
@@ -319,24 +322,24 @@ impl OptimizedGraphTraversalScorer {
         };
 
         if src_positions.is_empty() {
-            println!("DEBUG: src_positions empty");
+            debug!("src_positions empty");
             return false;
         }
-        
+
         // Phase 4: Get binary dependency graph
         let binary_data = match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
             Some(data) => data,
             None => {
-                println!("DEBUG: No binary dependency graph");
+                debug!("No binary dependency graph");
                 return false;
             }
         };
-        
+
         // Phase 5: Deserialize the graph
         let graph = match DirectedGraph::from_bytes(binary_data) {
             Ok(graph) => graph,
             Err(_) => {
-                println!("DEBUG: Failed to deserialize graph");
+                debug!("Failed to deserialize graph");
                 return false;
             }
         };
@@ -349,8 +352,8 @@ impl OptimizedGraphTraversalScorer {
             let all_paths = traversal_engine.automaton_query_paths(&flat_steps, &[src_pos], &constraint_fields_and_tokens);
             for path in &all_paths {
                 // Collect captures for each constraint step
-                println!("DEBUG: flat_steps = {:?}", flat_steps);
-                println!("DEBUG: path = {:?}", path);
+                debug!("flat_steps = {:?}", flat_steps);
+                debug!("path = {:?}", path);
                 let mut captures = Vec::new();
                 let mut constraint_idx = 0;
                 for (step_idx, step) in flat_steps.iter().enumerate() {
@@ -377,7 +380,7 @@ impl OptimizedGraphTraversalScorer {
                     let min_pos = *path.iter().min().unwrap();
                     let max_pos = *path.iter().max().unwrap();
                     let span = crate::types::Span { start: min_pos, end: max_pos + 1 };
-                    println!("DEBUG: Adding SpanWithCaptures: span = {:?}, captures = {:?}", span, captures);
+                    debug!("Adding SpanWithCaptures: span = {:?}, captures = {:?}", span, captures);
                     self.current_doc_matches.push(crate::types::SpanWithCaptures::with_captures(span, captures));
                 }
             }
@@ -417,8 +420,8 @@ impl OptimizedGraphTraversalScorer {
 
     // NEW: expose matches for the current doc
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
-        println!("DEBUG: get_current_doc_matches called, current_doc_matches.len() = {}", self.current_doc_matches.len());
-        println!("DEBUG: current_doc_matches = {:?}", self.current_doc_matches);
+        debug!("get_current_doc_matches called, current_doc_matches.len() = {}", self.current_doc_matches.len());
+        debug!("current_doc_matches = {:?}", self.current_doc_matches);
         &self.current_doc_matches
     }
 
@@ -446,10 +449,10 @@ impl OptimizedGraphTraversalScorer {
                             }
                         }
                     }
-                    Matcher::Regex { pattern, .. } => {
-                        let re = regex::Regex::new(pattern).unwrap();
+                    // Use the pre-compiled regex from the Matcher for performance
+                    Matcher::Regex { regex, .. } => {
                         for (i, token) in tokens.iter().enumerate() {
-                            if re.is_match(token) {
+                            if regex.is_match(token) {
                                 positions.push(i);
                             }
                         }
@@ -457,9 +460,8 @@ impl OptimizedGraphTraversalScorer {
                 }
             }
             Pattern::Constraint(Constraint::Wildcard) => {
-                for i in 0..tokens.len() {
-                    positions.push(i);
-                }
+                // Optimize: use (0..tokens.len()).collect() instead of pushing one by one
+                positions = (0..tokens.len()).collect();
             }
             _ => {}
         }

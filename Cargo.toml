@@ -36,32 +36,8 @@ name = "data_parser"
 path = "src/bin/data_parser.rs"
 
 [[bin]]
-name = "query_parser"
-path = "src/bin/query_parser.rs"
-
-[[bin]]
 name = "document_indexer"
 path = "src/bin/document_indexer.rs"
-
-[[bin]]
-name = "test_queries"
-path = "test_queries.rs"
-
-[[bin]]
-name = "test_full_pipeline"
-path = "test_full_pipeline.rs"
-
-[[bin]]
-name = "graph_traversal_2"
-path = "src/bin/graph_traversal_2.rs"
-
-[[bin]]
-name = "test_parser"
-path = "src/bin/test_parser.rs"
-
-[[bin]]
-name = "test_compiler_features"
-path = "src/bin/test_compiler_features.rs"
 
 [[bin]]
 name = "comprehensive_test"

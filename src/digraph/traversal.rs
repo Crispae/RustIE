@@ -575,10 +575,18 @@ impl GraphTraversal {
         constraint_fields_and_tokens: &[(String, Vec<String>)],
     ) -> Vec<Vec<usize>> {
         let mut all_results = Vec::new();
+        // Use graph's node count for proper memo sizing (fixes potential out-of-bounds)
+        let node_count = self.graph.node_count();
+        if node_count == 0 || pattern.is_empty() {
+            return all_results;
+        }
         for &start_node in candidate_nodes {
-            // Use the tokens for the first constraint step for memo size
-            let tokens_len = if let Some((_, tokens)) = constraint_fields_and_tokens.get(0) { tokens.len() } else { 0 };
-            let mut memo = vec![false; tokens_len * pattern.len()];
+            // Validate start_node is within bounds
+            if start_node >= node_count {
+                log::warn!("Start node {} exceeds graph node count {}", start_node, node_count);
+                continue;
+            }
+            let mut memo = vec![false; node_count * pattern.len()];
             let mut path = Vec::new();
             self.automaton_traverse_paths(pattern, start_node, 0, &mut memo, constraint_fields_and_tokens, &mut path, &mut all_results);
         }
@@ -592,10 +600,18 @@ impl GraphTraversal {
         candidate_nodes: &[usize],
         constraint_fields_and_tokens: &[(String, Vec<String>)],
     ) -> bool {
+        // Use graph's node count for proper memo sizing (fixes potential out-of-bounds)
+        let node_count = self.graph.node_count();
+        if node_count == 0 || pattern.is_empty() {
+            return false;
+        }
         for &start_node in candidate_nodes {
-            // Use the tokens for the first constraint step for memo size
-            let tokens_len = if let Some((_, tokens)) = constraint_fields_and_tokens.get(0) { tokens.len() } else { 0 };
-            let mut memo = vec![false; tokens_len * pattern.len()];
+            // Validate start_node is within bounds
+            if start_node >= node_count {
+                log::warn!("Start node {} exceeds graph node count {}", start_node, node_count);
+                continue;
+            }
+            let mut memo = vec![false; node_count * pattern.len()];
             if self.automaton_traverse(pattern, start_node, 0, &mut memo, constraint_fields_and_tokens) {
                 return true;
             }

@@ -10,6 +10,9 @@ use tantivy::schema::Schema;
 use crate::data::document::{Document as RustDoc, Field as DocField};
 use crate::digraph::graph::DirectedGraph;
 
+/// Required fields that must exist in the schema for core functionality
+const REQUIRED_FIELDS: &[&str] = &["doc_id", "sentence_id", "sentence_length", "word"];
+
 /// Parser for JSON and gzipped JSON documents
 pub struct DocumentParser {
     schema: Schema,
@@ -19,6 +22,78 @@ impl DocumentParser {
     /// Create a new DocumentParser with the given schema
     pub fn new(schema: Schema) -> Self {
         Self { schema }
+    }
+
+    /// Validate that all required fields exist in the schema
+    /// Call this before processing documents to catch configuration errors early
+    pub fn validate_schema(&self) -> Result<()> {
+        let mut missing_fields = Vec::new();
+        for &field_name in REQUIRED_FIELDS {
+            if self.schema.get_field(field_name).is_err() {
+                missing_fields.push(field_name);
+            }
+        }
+        if !missing_fields.is_empty() {
+            return Err(anyhow!(
+                "Schema validation failed: missing required fields: {:?}",
+                missing_fields
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check if a field exists in the schema
+    pub fn has_field(&self, field_name: &str) -> bool {
+        self.schema.get_field(field_name).is_ok()
+    }
+
+    /// Get a field from schema with a descriptive error
+    fn get_field_checked(&self, field_name: &str) -> Result<tantivy::schema::Field> {
+        self.schema.get_field(field_name).map_err(|_| {
+            anyhow!("Field '{}' not found in schema", field_name)
+        })
+    }
+
+    /// Validate document structure before indexing
+    /// Checks for valid edge indices and consistent token counts
+    pub fn validate_document(&self, doc: &RustDoc) -> Result<()> {
+        for (sentence_idx, sentence) in doc.sentences.iter().enumerate() {
+            let token_count = sentence.numTokens as usize;
+
+            for field in &sentence.fields {
+                match field {
+                    DocField::TokensField { name, tokens, .. } => {
+                        // Warn if token count doesn't match declared numTokens
+                        if tokens.len() != token_count {
+                            log::warn!(
+                                "Document '{}' sentence {}: field '{}' has {} tokens but numTokens is {}",
+                                doc.id, sentence_idx, name, tokens.len(), token_count
+                            );
+                        }
+                    }
+                    DocField::GraphField { name, edges, .. } => {
+                        // Validate edge indices are within bounds
+                        for (from, to, rel) in edges {
+                            let from_idx = *from as usize;
+                            let to_idx = *to as usize;
+                            if from_idx >= token_count {
+                                return Err(anyhow!(
+                                    "Document '{}' sentence {}: edge {}->{}:{} has invalid 'from' index {} (token count: {})",
+                                    doc.id, sentence_idx, from, to, rel, from_idx, token_count
+                                ));
+                            }
+                            if to_idx >= token_count {
+                                return Err(anyhow!(
+                                    "Document '{}' sentence {}: edge {}->{}:{} has invalid 'to' index {} (token count: {})",
+                                    doc.id, sentence_idx, from, to, rel, to_idx, token_count
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Parse a JSON file (regular or gzipped)

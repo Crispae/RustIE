@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use regex::Regex;
 
 /// Matcher for string or regex patterns
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,16 +13,34 @@ impl Matcher {
     pub fn string(s: String) -> Self {
         Matcher::String(s)
     }
-    /// Create a regex matcher (pre-compiles the regex)
-    pub fn regex(pattern: String) -> Self {
-        let regex = std::sync::Arc::new(regex::Regex::new(&pattern).expect("Invalid regex pattern"));
-        Matcher::Regex { pattern, regex }
+
+    /// Create a regex matcher with validation (returns Result)
+    /// Use this for user-provided patterns to handle invalid regex gracefully
+    pub fn try_regex(pattern: String) -> Result<Self, regex::Error> {
+        let regex = regex::Regex::new(&pattern)?;
+        Ok(Matcher::Regex { pattern, regex: std::sync::Arc::new(regex) })
     }
+
+    /// Create a regex matcher (pre-compiles the regex)
+    /// Panics if the regex is invalid - use try_regex for user input
+    pub fn regex(pattern: String) -> Self {
+        Self::try_regex(pattern.clone())
+            .unwrap_or_else(|e| panic!("Invalid regex pattern '{}': {}", pattern, e))
+    }
+
     /// Check if a token matches this matcher
     pub fn matches(&self, token: &str) -> bool {
         match self {
             Matcher::String(s) => token == s,
             Matcher::Regex { regex, .. } => regex.is_match(token),
+        }
+    }
+
+    /// Get the pattern string (for both String and Regex variants)
+    pub fn pattern_str(&self) -> &str {
+        match self {
+            Matcher::String(s) => s,
+            Matcher::Regex { pattern, .. } => pattern,
         }
     }
 }

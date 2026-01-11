@@ -8,12 +8,22 @@ use std::fs;
 use std::path::Path;
 // Import from tantivy
 use tantivy::{
-    doc, Index, IndexReader, IndexWriter, 
-    query::Query, schema::{Field, Schema, TantivyDocument, Value}, 
+    doc, Index, IndexReader, IndexWriter,
+    query::Query, schema::{Field, Schema, TantivyDocument, Value},
     DocAddress, Score, collector::TopDocs, directory::MmapDirectory
 };
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
+
+// Field name constants for consistency across the codebase
+pub const FIELD_WORD: &str = "word";
+pub const FIELD_LEMMA: &str = "lemma";
+pub const FIELD_POS: &str = "pos";
+pub const FIELD_ENTITY: &str = "entity";
+pub const FIELD_SENTENCE_LENGTH: &str = "sentence_length";
+pub const FIELD_DEPENDENCIES_BINARY: &str = "dependencies_binary";
+pub const FIELD_DOC_ID: &str = "doc_id";
+pub const FIELD_SENTENCE_ID: &str = "sentence_id";
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaConfig {
@@ -60,9 +70,9 @@ impl ExtractorEngine {
              Err(e) => return Err(anyhow::Error::from(e)),
         };
 
-        let default_field = schema.get_field("word").map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-        let sentence_length_field = schema.get_field("sentence_length").map_err(|_| anyhow!("Sentence length field not found in schema"))?;
-        let dependencies_binary_field = schema.get_field("dependencies_binary").map_err(|_| anyhow!("Dependencies binary field not found in schema"))?;
+        let default_field = schema.get_field(FIELD_WORD).map_err(|_| anyhow!("Default field '{}' not found in schema", FIELD_WORD))?;
+        let sentence_length_field = schema.get_field(FIELD_SENTENCE_LENGTH).map_err(|_| anyhow!("Sentence length field '{}' not found in schema", FIELD_SENTENCE_LENGTH))?;
+        let dependencies_binary_field = schema.get_field(FIELD_DEPENDENCIES_BINARY).map_err(|_| anyhow!("Dependencies binary field '{}' not found in schema", FIELD_DEPENDENCIES_BINARY))?;
 
         Ok(Self {
             index,
@@ -72,7 +82,7 @@ impl ExtractorEngine {
             default_field,
             sentence_length_field,
             dependencies_binary_field,
-            parent_doc_id_field: "doc_id".to_string(),
+            parent_doc_id_field: FIELD_DOC_ID.to_string(),
             output_fields,
         })
     }
@@ -121,7 +131,7 @@ impl ExtractorEngine {
         
         // Get output fields from config, with defaults if not specified
         let output_fields = config.output_fields.unwrap_or_else(|| {
-            vec!["word".to_string(), "lemma".to_string(), "pos".to_string(), "entity".to_string()]
+            vec![FIELD_WORD.to_string(), FIELD_LEMMA.to_string(), FIELD_POS.to_string(), FIELD_ENTITY.to_string()]
         });
         
         Ok((builder.build(), output_fields))
@@ -146,7 +156,7 @@ impl ExtractorEngine {
     pub fn query_with_limit(&self, query: &str, limit: usize) -> Result<RustIeResult> {
         // Parse the query string to get the original pattern
         use crate::compiler::parser::QueryParser;
-        let parser = QueryParser::new("word".to_string());
+        let parser = QueryParser::new(FIELD_WORD.to_string());
         let pattern = parser.parse_query(query)?;
         log::debug!("Pattern AST type = {:?}", std::any::type_name_of_val(&pattern));
         log::debug!("Pattern AST = {:?}", pattern);
@@ -317,13 +327,13 @@ impl ExtractorEngine {
             
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                let tokens = self.extract_field_values(&doc, "word");
+                let tokens = self.extract_field_values(&doc, FIELD_WORD);
 
                 log::debug!("Extracting pattern matches using direct token positions");
                 log::debug!("Tokens in document: {:?}", tokens);
 
                 // Use pattern's built-in extract_matching_positions instead of redundant function
-                let match_positions = pattern.extract_matching_positions("word", &tokens);
+                let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
                 log::debug!("Match positions found: {:?}", match_positions);
 
                 let mut pattern_matches = Vec::new();
@@ -471,10 +481,10 @@ impl ExtractorEngine {
         for (score, doc_address) in top_docs {
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                let tokens = self.extract_field_values(&doc, "word");
-                
+                let tokens = self.extract_field_values(&doc, FIELD_WORD);
+
                 // Use the pattern to find all matching positions (single-token matches)
-                let match_positions = pattern.extract_matching_positions("word", &tokens);
+                let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
                 // For single-token matches, assign a random name to each capture
                 use rand::{distributions::Alphanumeric, Rng};
                 let mut fallback_matches = Vec::new();
@@ -506,12 +516,12 @@ impl ExtractorEngine {
 
     /// Extract sentence result from a Tantivy document
     fn extract_sentence_result(&self, doc: &TantivyDocument, score: Score) -> Result<SentenceResult> {
-        
+
         // Extract document fields
-        let document_id = self.extract_field_value(doc, "doc_id")
+        let document_id = self.extract_field_value(doc, FIELD_DOC_ID)
             .unwrap_or_else(|| "unknown".to_string());
-        
-        let sentence_id = self.extract_field_value(doc, "sentence_id")
+
+        let sentence_id = self.extract_field_value(doc, FIELD_SENTENCE_ID)
             .unwrap_or_else(|| "0".to_string());
         
         // Extract all configured output fields dynamically
