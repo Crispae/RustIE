@@ -60,3 +60,11 @@ path = "src/bin/test_parser.rs"
 [[bin]]
 name = "test_compiler_features"
 path = "src/bin/test_compiler_features.rs"
+
+[[bin]]
+name = "comprehensive_test"
+path = "src/bin/comprehensive_test.rs"
+
+[[bin]]
+name = "create_gzip"
+path = "src/bin/create_gzip.rs"

@@ -49,10 +49,8 @@ value =     @{ ASCII_ALPHANUMERIC+ }
 regex_value = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
 wildcard = { "*" }
 
-// Assertions
-assertion_pattern = { sentence_start | sentence_end | lookahead_assertion | lookbehind_assertion }
-sentence_start = { "<s>" }
-sentence_end = { "</s>" }
+// Assertions (lookahead and lookbehind only)
+assertion_pattern = { lookahead_assertion | lookbehind_assertion }
 lookahead_assertion = { positive_lookahead | negative_lookahead }
 positive_lookahead = { "(?=" ~ sequence ~ ")" }
 negative_lookahead = { "(?!" ~ sequence ~ ")" }

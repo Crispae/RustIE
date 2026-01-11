@@ -287,8 +287,6 @@ fn build_constraint(pair: pest::iterators::Pair<Rule>) -> Constraint {
 
 fn build_assertion(pair: pest::iterators::Pair<Rule>) -> Assertion {
     match pair.as_rule() {
-        Rule::sentence_start => Assertion::SentenceStart,
-        Rule::sentence_end => Assertion::SentenceEnd,
         Rule::lookahead_assertion => {
             let inner = pair.into_inner().next().unwrap();
             build_assertion(inner)

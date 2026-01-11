@@ -7,7 +7,7 @@ use crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery;
 //use crate::tantivy_integration::queries::OptimizedPatternMatchingQuery;
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
-use crate::tantivy_integration::assertion_query::{SentenceAssertionQuery, AssertionType, LookaheadQuery};
+use crate::tantivy_integration::assertion_query::LookaheadQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 use anyhow::{Result, anyhow};
 
@@ -56,16 +56,8 @@ impl BasicCompiler {
         // Get the default field for assertion queries
         let default_field = self.schema.get_field("word")
             .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-            
+
         match assertion {
-            Assertion::SentenceStart => {
-                // Sentence start assertion - matches at position 0
-                Ok(Box::new(SentenceAssertionQuery::new(AssertionType::SentenceStart, default_field)))
-            }
-            Assertion::SentenceEnd => {
-                // Sentence end assertion - matches at last position
-                Ok(Box::new(SentenceAssertionQuery::new(AssertionType::SentenceEnd, default_field)))
-            }
             Assertion::PositiveLookahead(pattern) => {
                 // Positive lookahead - next token must match pattern
                 Ok(Box::new(LookaheadQuery::positive_lookahead(pattern.as_ref().clone(), default_field)))
