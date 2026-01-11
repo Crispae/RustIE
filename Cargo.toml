@@ -24,6 +24,8 @@ indicatif = "0.17"
 rand = "0.8"
 pest = "2.7"
 pest_derive = "2.7"
+utoipa = { version = "4", features = ["actix_extras"] }
+utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
 
 [[bin]]
 name = "api_server"
@@ -68,3 +70,7 @@ path = "src/bin/comprehensive_test.rs"
 [[bin]]
 name = "create_gzip"
 path = "src/bin/create_gzip.rs"
+
+[[bin]]
+name = "create_test_index"
+path = "src/bin/create_test_index.rs"

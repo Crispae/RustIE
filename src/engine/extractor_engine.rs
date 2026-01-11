@@ -33,7 +33,7 @@ pub struct FieldConfig {
 pub struct ExtractorEngine {
     index: Index,
     reader: IndexReader,
-    writer: IndexWriter,
+    writer: Option<IndexWriter>,
     schema: Schema,
     default_field: Field, // Can be directly used from schema
     sentence_length_field: Field, // Can be directly used from schema
@@ -51,7 +51,14 @@ impl ExtractorEngine {
         let dir = MmapDirectory::open(index_dir)?;
         let index = Index::open_or_create(dir, schema.clone())?;
         let reader = index.reader()?;
-        let writer = index.writer(50_000_000)?; // 50MB buffer
+        let writer = match index.writer(50_000_000) {
+            Ok(w) => Some(w),
+            Err(tantivy::TantivyError::LockFailure(e, _)) => {
+                log::warn!("Could not acquire index lock, running in READ-ONLY mode: {}", e);
+                None
+            },
+             Err(e) => return Err(anyhow::Error::from(e)),
+        };
 
         let default_field = schema.get_field("word").map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
         let sentence_length_field = schema.get_field("sentence_length").map_err(|_| anyhow!("Sentence length field not found in schema"))?;
@@ -302,9 +309,12 @@ impl ExtractorEngine {
         log::debug!("top_docs = {:?}", top_docs);
 
         let mut sentence_results = Vec::new();
+        let mut score_docs = Vec::new();
         let mut max_score = None;
 
         for (score, doc_address) in top_docs {
+            score_docs.push(RustieDoc::new(doc_address, score));
+            
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
                 let tokens = self.extract_field_values(&doc, "word");
@@ -336,7 +346,7 @@ impl ExtractorEngine {
         
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
-            score_docs: Vec::new(),
+            score_docs,
             sentence_results,
             max_score,
         })
@@ -566,8 +576,12 @@ impl ExtractorEngine {
         // Update the engine's vocabulary with any new labels
         // self.vocabulary = parser.vocabulary().clone(); // Removed vocabulary usage
         
-        for tantivy_doc in tantivy_docs {
-            self.writer.add_document(tantivy_doc)?;
+        if let Some(writer) = &mut self.writer {
+             for tantivy_doc in tantivy_docs {
+                writer.add_document(tantivy_doc)?;
+            }
+        } else {
+            return Err(anyhow!("Cannot add document: Engine is in READ-ONLY mode (index lock could not be acquired)"));
         }
         
         Ok(())
@@ -585,7 +599,11 @@ impl ExtractorEngine {
 
     /// Commit changes to the index
     pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit()?;
+        if let Some(writer) = &mut self.writer {
+            writer.commit()?;
+        } else {
+             return Err(anyhow!("Cannot commit: Engine is in READ-ONLY mode"));
+        }
         // Refresh the reader to see the new documents
         self.reader = self.index.reader()?;
         
@@ -596,8 +614,8 @@ impl ExtractorEngine {
     }
 
     /// Get the index writer (for advanced usage)
-    pub fn writer(&mut self) -> &mut IndexWriter {
-        &mut self.writer
+    pub fn writer(&mut self) -> Result<&mut IndexWriter> {
+        self.writer.as_mut().ok_or_else(|| anyhow!("Engine is in READ-ONLY mode"))
     }
 
     /// Get the schema
