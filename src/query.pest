@@ -28,11 +28,13 @@ quantifier = { "?" }
 sequence = { named_capture | quantified_pattern ~ (WHITESPACE+ ~ quantified_pattern)+ | quantified_pattern }
 quantified_pattern = { atomic_pattern ~ pattern_quantifier? }
 atomic_pattern = _{ constraint | group | assertion_pattern | named_capture }
-pattern_quantifier = { greedy_quantifier | lazy_quantifier }
-greedy_quantifier = { "*" | "+" | "?" | range_quantifier }
+// IMPORTANT: Try lazy quantifiers first since they are longer (e.g., "*?" before "*")
+// PEG parsers match the first alternative, so longer patterns must come first
+pattern_quantifier = { lazy_quantifier | greedy_quantifier }
 lazy_quantifier = { "*?" | "+?" | "??" | lazy_range_quantifier }
-range_quantifier = { "{" ~ unsigned_int? ~ "," ~ unsigned_int? ~ "}" }
+greedy_quantifier = { "*" | "+" | "?" | range_quantifier }
 lazy_range_quantifier = { "{" ~ unsigned_int? ~ "," ~ unsigned_int? ~ "}?" }
+range_quantifier = { "{" ~ unsigned_int? ~ "," ~ unsigned_int? ~ "}" }
 unsigned_int = @{ ASCII_DIGIT+ }
 group = { "(" ~ sequence ~ ")" }
 

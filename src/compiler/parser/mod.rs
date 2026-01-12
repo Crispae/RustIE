@@ -429,4 +429,171 @@ mod tests {
         let result = parser.parse_query("(?<! [word=test])");
         assert!(result.is_ok(), "Failed to parse negative lookbehind: {:?}", result.err());
     }
+
+    // ==================== Adjacent Pattern Tests (NEW) ====================
+
+    #[test]
+    fn test_parse_adjacent_patterns() {
+        let parser = parser();
+        // Query like [word=the] [word=cat] should match adjacent tokens
+        let result = parser.parse_query("[word=the] [word=cat]");
+        assert!(result.is_ok(), "Failed to parse adjacent patterns: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Concatenated(patterns) => {
+                assert_eq!(patterns.len(), 2, "Expected 2 adjacent patterns");
+            }
+            _ => panic!("Expected Concatenated pattern for adjacent tokens, got {:?}", pattern),
+        }
+    }
+
+    #[test]
+    fn test_parse_three_adjacent_patterns() {
+        let parser = parser();
+        let result = parser.parse_query("[word=the] [pos=JJ] [word=cat]");
+        assert!(result.is_ok(), "Failed to parse three adjacent patterns: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Concatenated(patterns) => {
+                assert_eq!(patterns.len(), 3, "Expected 3 adjacent patterns");
+            }
+            _ => panic!("Expected Concatenated pattern, got {:?}", pattern),
+        }
+    }
+
+    #[test]
+    fn test_parse_adjacent_with_wildcard() {
+        let parser = parser();
+        // [word=the] [] [word=cat] - any token between "the" and "cat"
+        let result = parser.parse_query("[word=the] [] [word=cat]");
+        assert!(result.is_ok(), "Failed to parse adjacent with wildcard: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Concatenated(patterns) => {
+                assert_eq!(patterns.len(), 3);
+            }
+            _ => panic!("Expected Concatenated pattern, got {:?}", pattern),
+        }
+    }
+
+    #[test]
+    fn test_parse_adjacent_with_repetition() {
+        let parser = parser();
+        // [word=cat] []*? [word=dog] - cat followed by 0+ tokens (lazy) then dog
+        let result = parser.parse_query("[word=cat] []*? [word=dog]");
+        assert!(result.is_ok(), "Failed to parse adjacent with repetition: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Concatenated(patterns) => {
+                assert_eq!(patterns.len(), 3, "Expected 3 patterns, got {:?}", patterns);
+                // Check middle pattern is a Repetition
+                match &patterns[1] {
+                    Pattern::Repetition { min, max, .. } => {
+                        assert_eq!(*min, 0);
+                        assert_eq!(*max, None); // unbounded
+                    }
+                    _ => panic!("Expected Repetition pattern in middle, got {:?}", patterns[1]),
+                }
+            }
+            _ => panic!("Expected Concatenated pattern, got {:?}", pattern),
+        }
+    }
+
+    // ==================== Extended Regex Tests (NEW) ====================
+
+    #[test]
+    fn test_parse_regex_with_caret_anchor() {
+        let parser = parser();
+        // Regex with ^ anchor (start of string)
+        let result = parser.parse_query("[word=/^[A-Z].*/]");
+        assert!(result.is_ok(), "Failed to parse regex with caret: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_regex_with_dollar_anchor() {
+        let parser = parser();
+        // Regex with $ anchor (end of string)
+        let result = parser.parse_query("[word=/.*ing$/]");
+        assert!(result.is_ok(), "Failed to parse regex with dollar: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_regex_with_character_range() {
+        let parser = parser();
+        // Regex with character range [a-z]
+        let result = parser.parse_query("[word=/[a-z]+/]");
+        assert!(result.is_ok(), "Failed to parse regex with char range: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_regex_with_quantifier_braces() {
+        let parser = parser();
+        // Regex with {n,m} quantifier
+        let result = parser.parse_query("[word=/a{2,5}/]");
+        assert!(result.is_ok(), "Failed to parse regex with braces quantifier: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_regex_complex_pattern() {
+        let parser = parser();
+        // Complex regex: uppercase letter followed by lowercase
+        let result = parser.parse_query("[word=/^[A-Z][a-z]*$/]");
+        assert!(result.is_ok(), "Failed to parse complex regex: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_default_regex_extended() {
+        let parser = parser();
+        // Default field with extended regex
+        let result = parser.parse_query("/^[A-Z][a-z]+$/");
+        assert!(result.is_ok(), "Failed to parse extended default regex: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_traversal_regex_extended() {
+        let parser = parser();
+        // Graph traversal with extended regex label
+        let result = parser.parse_query("[word=eats] >/nsubj|dobj|iobj/ []");
+        assert!(result.is_ok(), "Failed to parse traversal with extended regex: {:?}", result.err());
+    }
+
+    // ==================== Combined Pattern Tests ====================
+
+    #[test]
+    fn test_parse_adjacent_then_traversal() {
+        let parser = parser();
+        // Adjacent patterns followed by graph traversal
+        let result = parser.parse_query("[word=the] [word=cat] >nsubj [word=eats]");
+        assert!(result.is_ok(), "Failed to parse adjacent then traversal: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_parse_disjunction_or_semantics() {
+        let parser = parser();
+        // [word=cat | word=dog] - OR at token level
+        let result = parser.parse_query("[word=cat | word=dog]");
+        assert!(result.is_ok(), "Failed to parse disjunction: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Constraint(Constraint::Disjunctive(constraints)) => {
+                assert_eq!(constraints.len(), 2, "Expected 2 disjuncts");
+            }
+            _ => panic!("Expected Disjunctive constraint, got {:?}", pattern),
+        }
+    }
+
+    #[test]
+    fn test_parse_conjunction_and_semantics() {
+        let parser = parser();
+        // [word=cat & pos=/N.*/] - AND at token level
+        let result = parser.parse_query("[word=cat & pos=/N.*/]");
+        assert!(result.is_ok(), "Failed to parse conjunction: {:?}", result.err());
+        let pattern = result.unwrap();
+        match pattern {
+            Pattern::Constraint(Constraint::Conjunctive(constraints)) => {
+                assert_eq!(constraints.len(), 2, "Expected 2 conjuncts");
+            }
+            _ => panic!("Expected Conjunctive constraint, got {:?}", pattern),
+        }
+    }
 } 
