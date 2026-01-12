@@ -36,26 +36,82 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                 _ => unreachable!(),
             }
         }
-        Rule::traversal_seq => {
+        Rule::pattern_chain => {
             let mut pairs = pair.into_inner();
-            let mut src = build_ast(pairs.next().unwrap());
-            let mut pairs = pairs.peekable();
-            while let Some(trav_pair) = pairs.next() {
-                if trav_pair.as_rule() == Rule::traversal {
-                    let mut trav_inner = trav_pair.into_inner();
-                    let traversal_op_pair = trav_inner.next().unwrap();
-                    // traversal_op_pair is traversal_op, which contains the actual traversal type
-                    let inner_traversal = traversal_op_pair.into_inner().next().unwrap();
-                    let traversal = build_traversal_op(inner_traversal);
-                    let dst = build_ast(trav_inner.next().unwrap());
-                    src = Pattern::GraphTraversal {
-                        src: Box::new(src),
-                        traversal,
-                        dst: Box::new(dst),
-                    };
+            let first = build_ast(pairs.next().unwrap());
+
+            // Collect all pattern links
+            let mut patterns = vec![first];
+            let mut pending_traversal: Option<crate::compiler::ast::Traversal> = None;
+
+            for link_pair in pairs {
+                match link_pair.as_rule() {
+                    Rule::pattern_link => {
+                        // pattern_link contains either traversal or quantified_pattern
+                        let inner = link_pair.into_inner().next().unwrap();
+                        match inner.as_rule() {
+                            Rule::traversal => {
+                                // Process traversal: traversal_op followed by quantified_pattern
+                                let mut trav_inner = inner.into_inner();
+                                let traversal_op_pair = trav_inner.next().unwrap();
+                                let inner_traversal = traversal_op_pair.into_inner().next().unwrap();
+                                pending_traversal = Some(build_traversal_op(inner_traversal));
+
+                                // The destination pattern follows inside the traversal
+                                if let Some(dst_pair) = trav_inner.next() {
+                                    let dst = build_ast(dst_pair);
+                                    // Wrap current patterns into src
+                                    let src = if patterns.len() == 1 {
+                                        patterns.pop().unwrap()
+                                    } else {
+                                        Pattern::Concatenated(patterns)
+                                    };
+                                    patterns = vec![Pattern::GraphTraversal {
+                                        src: Box::new(src),
+                                        traversal: pending_traversal.take().unwrap(),
+                                        dst: Box::new(dst),
+                                    }];
+                                }
+                            }
+                            Rule::quantified_pattern => {
+                                // Adjacent pattern (no traversal) - add to sequence
+                                patterns.push(build_ast(inner));
+                            }
+                            _ => {}
+                        }
+                    }
+                    Rule::traversal => {
+                        // Direct traversal (backward compat)
+                        let mut trav_inner = link_pair.into_inner();
+                        let traversal_op_pair = trav_inner.next().unwrap();
+                        let inner_traversal = traversal_op_pair.into_inner().next().unwrap();
+                        let traversal = build_traversal_op(inner_traversal);
+                        let dst = build_ast(trav_inner.next().unwrap());
+                        let src = if patterns.len() == 1 {
+                            patterns.pop().unwrap()
+                        } else {
+                            Pattern::Concatenated(patterns)
+                        };
+                        patterns = vec![Pattern::GraphTraversal {
+                            src: Box::new(src),
+                            traversal,
+                            dst: Box::new(dst),
+                        }];
+                    }
+                    Rule::quantified_pattern => {
+                        // Adjacent pattern
+                        patterns.push(build_ast(link_pair));
+                    }
+                    _ => {}
                 }
             }
-            src
+
+            // Return final pattern
+            if patterns.len() == 1 {
+                patterns.pop().unwrap()
+            } else {
+                Pattern::Concatenated(patterns)
+            }
         }
         Rule::sequence => {
             let mut patterns = Vec::new();

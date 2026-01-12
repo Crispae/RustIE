@@ -21,8 +21,8 @@ impl Collector for OdinsonCollector {
     type Fruit = RustIeResult;
     type Child = OdinsonSegmentCollector;
 
-    fn for_segment(&self, _segment_local_id: u32, _segment: &SegmentReader) -> TantivyResult<Self::Child> {
-        Ok(OdinsonSegmentCollector::new(self.limit))
+    fn for_segment(&self, segment_local_id: u32, _segment: &SegmentReader) -> TantivyResult<Self::Child> {
+        Ok(OdinsonSegmentCollector::new(self.limit, segment_local_id))
     }
 
     fn requires_scoring(&self) -> bool {
@@ -55,14 +55,16 @@ impl Collector for OdinsonCollector {
 /// Segment-level collector for Odinson queries
 pub struct OdinsonSegmentCollector {
     limit: usize,
+    segment_ord: u32,
     score_docs: Vec<RustieDoc>,
     max_score: Option<Score>,
 }
 
 impl OdinsonSegmentCollector {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, segment_ord: u32) -> Self {
         Self {
             limit,
+            segment_ord,
             score_docs: Vec::new(),
             max_score: None,
         }
@@ -73,13 +75,12 @@ impl SegmentCollector for OdinsonSegmentCollector {
     type Fruit = RustIeResult;
 
     fn collect(&mut self, doc: DocId, score: Score) {
-        // Convert segment-local doc ID to global doc address
-        // This is a simplified implementation
-        let doc_address = tantivy::DocAddress::new(0, doc); // segment_id would be set properly
-        
+        // Convert segment-local doc ID to global doc address using correct segment_ord
+        let doc_address = tantivy::DocAddress::new(self.segment_ord, doc);
+
         let score_doc = RustieDoc::new(doc_address, score);
         self.score_docs.push(score_doc);
-        
+
         self.max_score = self.max_score.map(|s| s.max(score)).or(Some(score));
     }
 
@@ -112,8 +113,8 @@ impl Collector for OdinsonSpanCollector {
     type Fruit = RustIeResult;
     type Child = OdinsonSpanSegmentCollector;
 
-    fn for_segment(&self, _segment_local_id: u32, _segment: &SegmentReader) -> TantivyResult<Self::Child> {
-        Ok(OdinsonSpanSegmentCollector::new(self.limit))
+    fn for_segment(&self, segment_local_id: u32, _segment: &SegmentReader) -> TantivyResult<Self::Child> {
+        Ok(OdinsonSpanSegmentCollector::new(self.limit, segment_local_id))
     }
 
     fn requires_scoring(&self) -> bool {
@@ -145,6 +146,7 @@ impl Collector for OdinsonSpanCollector {
 /// Segment-level collector that also collects spans
 pub struct OdinsonSpanSegmentCollector {
     limit: usize,
+    segment_ord: u32,
     score_docs: Vec<RustieDoc>,
     max_score: Option<Score>,
     spans: Vec<Span>,
@@ -152,9 +154,10 @@ pub struct OdinsonSpanSegmentCollector {
 }
 
 impl OdinsonSpanSegmentCollector {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, segment_ord: u32) -> Self {
         Self {
             limit,
+            segment_ord,
             score_docs: Vec::new(),
             max_score: None,
             spans: Vec::new(),
@@ -175,10 +178,11 @@ impl SegmentCollector for OdinsonSpanSegmentCollector {
     type Fruit = RustIeResult;
 
     fn collect(&mut self, doc: DocId, score: Score) {
-        let doc_address = tantivy::DocAddress::new(0, doc);
+        // Convert segment-local doc ID to global doc address using correct segment_ord
+        let doc_address = tantivy::DocAddress::new(self.segment_ord, doc);
         let score_doc = RustieDoc::new(doc_address, score);
         self.score_docs.push(score_doc);
-        
+
         self.max_score = self.max_score.map(|s| s.max(score)).or(Some(score));
     }
 

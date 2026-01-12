@@ -257,8 +257,9 @@ pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern
                                     matched = false; break;
                                 }
                             }
-                            crate::compiler::ast::Matcher::Regex { pattern, .. } => {
-                                if pos < len && regex::Regex::new(pattern).unwrap().is_match(&tokens[pos]) {
+                            // Use pre-compiled regex from Matcher for performance
+                            crate::compiler::ast::Matcher::Regex { regex, .. } => {
+                                if pos < len && regex.is_match(&tokens[pos]) {
                                     let span = crate::types::Span { start: pos, end: pos + 1 };
                                     let capture = crate::types::NamedCapture::new(format!("c{}", pos), span.clone());
                                     match_seq.push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));

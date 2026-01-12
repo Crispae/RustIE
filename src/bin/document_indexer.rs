@@ -406,8 +406,10 @@ mod tests {
 
     #[test]
     fn test_pattern_matching() {
-        let indexer = DocumentIndexer::new(Path::new("./test_index"), None, false).unwrap();
-        
+        // Use a temporary directory for the index
+        let temp_dir = TempDir::new().unwrap();
+        let indexer = DocumentIndexer::new(temp_dir.path(), None, false).unwrap();
+
         assert!(indexer.matches_pattern("test.json", "*.json"));
         assert!(indexer.matches_pattern("document.json", "*.json"));
         assert!(!indexer.matches_pattern("test.txt", "*.json"));
@@ -418,15 +420,17 @@ mod tests {
     fn test_find_json_files() {
         let temp_dir = TempDir::new().unwrap();
         let test_dir = temp_dir.path();
-        
+
         // Create some test files
         fs::write(test_dir.join("test1.json"), "{}").unwrap();
         fs::write(test_dir.join("test2.json"), "[]").unwrap();
         fs::write(test_dir.join("ignore.txt"), "text").unwrap();
-        
-        let indexer = DocumentIndexer::new(Path::new("./test_index"), None, false).unwrap();
+
+        // Use a temporary directory for the index
+        let index_temp_dir = TempDir::new().unwrap();
+        let indexer = DocumentIndexer::new(index_temp_dir.path(), None, false).unwrap();
         let files = indexer.find_json_files(test_dir, "*.json").unwrap();
-        
+
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|f| f.file_name().unwrap() == "test1.json"));
         assert!(files.iter().any(|f| f.file_name().unwrap() == "test2.json"));
