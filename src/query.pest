@@ -1,13 +1,16 @@
 WHITESPACE = _{ " " | "\t" | "\n" }
 
-query = { traversal_seq | default_field_query }
+query = { pattern_chain | default_field_query }
 
 // Default field queries (bare strings/regex without brackets)
 default_field_query = { default_string | default_regex }
 default_string = @{ ASCII_ALPHANUMERIC+ }
-default_regex = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
+// Extended regex: support standard Rust/Tantivy regex characters including ^$-{} and whitespace
+default_regex = @{ "/" ~ (!("/" | "\n") ~ ANY)* ~ "/" }
 
-traversal_seq = { quantified_pattern ~ (traversal)* }
+// Pattern chain: allows both adjacent patterns and graph traversals
+pattern_chain = { quantified_pattern ~ pattern_link* }
+pattern_link = { traversal | quantified_pattern }
 traversal = { traversal_op ~ quantified_pattern }
 traversal_op = { outgoing_wildcard | incoming_wildcard | outgoing | incoming | disjunctive_traversal | concatenated_traversal }
 outgoing_wildcard = { ">>" }
@@ -17,7 +20,8 @@ incoming = { "<" ~ traversal_label ~ quantifier? }
 disjunctive_traversal = { ">" ~ traversal_label ~ ( "|" ~ traversal_label )+ }
 concatenated_traversal = { ">" ~ traversal_label ~ ( ">" ~ traversal_label )+ }
 traversal_label = { traversal_regex | label }
-traversal_regex = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
+// Extended regex: support standard Rust/Tantivy regex syntax
+traversal_regex = @{ "/" ~ (!("/" | "\n") ~ ANY)* ~ "/" }
 label = @{ ASCII_ALPHANUMERIC+ }
 quantifier = { "?" }
 
@@ -46,7 +50,8 @@ field_name = @{ ASCII_ALPHANUMERIC+ }
 comparison_op = { "=" | "!=" }
 fuzzy_op = { "~" }
 value =     @{ ASCII_ALPHANUMERIC+ }
-regex_value = @{ "/" ~ (ASCII_ALPHANUMERIC | "." | "*" | "+" | "?" | "|" | "[" | "]" | "(" | ")" | "\\" )* ~ "/" }
+// Extended regex: support standard Rust/Tantivy regex syntax (any character except unescaped / or newline)
+regex_value = @{ "/" ~ (!("/" | "\n") ~ ANY)* ~ "/" }
 wildcard = { "*" }
 
 // Assertions (lookahead and lookbehind only)

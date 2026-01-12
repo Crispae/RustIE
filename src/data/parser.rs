@@ -293,4 +293,272 @@ impl DocumentParser {
         decoder.read_to_string(&mut json_str)?;
         self.parse_json(&json_str)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::document::Sentence;
+    use tantivy::schema::SchemaBuilder;
+
+    /// Create a test schema with all required fields
+    fn create_complete_schema() -> Schema {
+        let mut builder = SchemaBuilder::new();
+        builder.add_text_field("doc_id", tantivy::schema::TEXT | tantivy::schema::STORED);
+        builder.add_text_field("sentence_id", tantivy::schema::TEXT | tantivy::schema::STORED);
+        builder.add_u64_field("sentence_length", tantivy::schema::STORED);
+        builder.add_text_field("word", tantivy::schema::TEXT | tantivy::schema::STORED);
+        builder.add_text_field("lemma", tantivy::schema::TEXT | tantivy::schema::STORED);
+        builder.add_bytes_field("dependencies_binary", tantivy::schema::STORED);
+        builder.build()
+    }
+
+    /// Create a schema missing some required fields
+    fn create_incomplete_schema() -> Schema {
+        let mut builder = SchemaBuilder::new();
+        builder.add_text_field("doc_id", tantivy::schema::TEXT | tantivy::schema::STORED);
+        // Missing: sentence_id, sentence_length, word
+        builder.build()
+    }
+
+    /// Create a test document with valid structure
+    fn create_valid_document() -> RustDoc {
+        RustDoc {
+            id: "test_doc".to_string(),
+            metadata: vec![],
+            sentences: vec![
+                Sentence {
+                    numTokens: 3,
+                    fields: vec![
+                        DocField::TokensField {
+                            name: "word".to_string(),
+                            tokens: vec!["John".to_string(), "eats".to_string(), "pizza".to_string()],
+                        },
+                        DocField::GraphField {
+                            name: "dependencies".to_string(),
+                            roots: vec![1],
+                            edges: vec![
+                                (1, 0, "nsubj".to_string()),  // eats -> John
+                                (1, 2, "dobj".to_string()),   // eats -> pizza
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    /// Create a document with invalid edge indices
+    fn create_document_with_invalid_edges() -> RustDoc {
+        RustDoc {
+            id: "invalid_doc".to_string(),
+            metadata: vec![],
+            sentences: vec![
+                Sentence {
+                    numTokens: 3,
+                    fields: vec![
+                        DocField::TokensField {
+                            name: "word".to_string(),
+                            tokens: vec!["John".to_string(), "eats".to_string(), "pizza".to_string()],
+                        },
+                        DocField::GraphField {
+                            name: "dependencies".to_string(),
+                            roots: vec![1],
+                            edges: vec![
+                                (1, 0, "nsubj".to_string()),
+                                (10, 2, "dobj".to_string()),  // Invalid: from_idx 10 >= token_count 3
+                            ],
+                        },
+                    ],
+                },
+            ],
+        }
+    }
+
+    // ==================== Schema Validation Tests ====================
+
+    #[test]
+    fn test_validate_schema_success() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        assert!(parser.validate_schema().is_ok());
+    }
+
+    #[test]
+    fn test_validate_schema_missing_fields() {
+        let schema = create_incomplete_schema();
+        let parser = DocumentParser::new(schema);
+        let result = parser.validate_schema();
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("missing required fields"));
+        assert!(error_msg.contains("sentence_id"));
+        assert!(error_msg.contains("sentence_length"));
+        assert!(error_msg.contains("word"));
+    }
+
+    #[test]
+    fn test_has_field_exists() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        assert!(parser.has_field("doc_id"));
+        assert!(parser.has_field("word"));
+        assert!(parser.has_field("sentence_length"));
+    }
+
+    #[test]
+    fn test_has_field_not_exists() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        assert!(!parser.has_field("nonexistent_field"));
+        assert!(!parser.has_field("fake_field"));
+    }
+
+    // ==================== Document Validation Tests ====================
+
+    #[test]
+    fn test_validate_document_valid() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let doc = create_valid_document();
+        assert!(parser.validate_document(&doc).is_ok());
+    }
+
+    #[test]
+    fn test_validate_document_invalid_from_index() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let doc = create_document_with_invalid_edges();
+        let result = parser.validate_document(&doc);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("invalid 'from' index"));
+        assert!(error_msg.contains("10"));
+        assert!(error_msg.contains("token count: 3"));
+    }
+
+    #[test]
+    fn test_validate_document_invalid_to_index() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let doc = RustDoc {
+            id: "invalid_to".to_string(),
+            metadata: vec![],
+            sentences: vec![
+                Sentence {
+                    numTokens: 3,
+                    fields: vec![
+                        DocField::TokensField {
+                            name: "word".to_string(),
+                            tokens: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                        },
+                        DocField::GraphField {
+                            name: "dependencies".to_string(),
+                            roots: vec![0],
+                            edges: vec![
+                                (0, 99, "edge".to_string()),  // Invalid: to_idx 99 >= token_count 3
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+        let result = parser.validate_document(&doc);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("invalid 'to' index"));
+        assert!(error_msg.contains("99"));
+    }
+
+    #[test]
+    fn test_validate_document_empty_sentences() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let doc = RustDoc {
+            id: "empty_doc".to_string(),
+            metadata: vec![],
+            sentences: vec![],  // No sentences
+        };
+        assert!(parser.validate_document(&doc).is_ok());
+    }
+
+    #[test]
+    fn test_validate_document_multiple_sentences() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let doc = RustDoc {
+            id: "multi_sentence".to_string(),
+            metadata: vec![],
+            sentences: vec![
+                Sentence {
+                    numTokens: 2,
+                    fields: vec![
+                        DocField::TokensField {
+                            name: "word".to_string(),
+                            tokens: vec!["Hello".to_string(), "world".to_string()],
+                        },
+                        DocField::GraphField {
+                            name: "dependencies".to_string(),
+                            roots: vec![0],
+                            edges: vec![(0, 1, "det".to_string())],
+                        },
+                    ],
+                },
+                Sentence {
+                    numTokens: 3,
+                    fields: vec![
+                        DocField::TokensField {
+                            name: "word".to_string(),
+                            tokens: vec!["Good".to_string(), "bye".to_string(), "now".to_string()],
+                        },
+                        DocField::GraphField {
+                            name: "dependencies".to_string(),
+                            roots: vec![0],
+                            edges: vec![
+                                (0, 1, "amod".to_string()),
+                                (0, 2, "advmod".to_string()),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+        assert!(parser.validate_document(&doc).is_ok());
+    }
+
+    // ==================== JSON Parsing Tests ====================
+
+    #[test]
+    fn test_parse_json_single_document() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let json = r#"{"id": "doc1", "metadata": [], "sentences": []}"#;
+        let result = parser.parse_json(json);
+        assert!(result.is_ok());
+        let docs = result.unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].id, "doc1");
+    }
+
+    #[test]
+    fn test_parse_json_array_of_documents() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let json = r#"[{"id": "doc1", "metadata": [], "sentences": []}, {"id": "doc2", "metadata": [], "sentences": []}]"#;
+        let result = parser.parse_json(json);
+        assert!(result.is_ok());
+        let docs = result.unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, "doc1");
+        assert_eq!(docs[1].id, "doc2");
+    }
+
+    #[test]
+    fn test_parse_json_invalid() {
+        let schema = create_complete_schema();
+        let parser = DocumentParser::new(schema);
+        let json = "not valid json";
+        let result = parser.parse_json(json);
+        assert!(result.is_err());
+    }
 } 
