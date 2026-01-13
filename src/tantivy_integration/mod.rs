@@ -1,4 +1,5 @@
 pub mod spans;
+pub mod utils;
 pub mod collector;
 // pub mode pattern_query;
 pub mod boolean_query;

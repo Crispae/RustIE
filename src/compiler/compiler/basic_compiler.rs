@@ -168,12 +168,48 @@ impl BasicCompiler {
         Ok(Box::new(RustieOrQuery { sub_queries }))
     }
 
+    fn is_mandatory_pattern(&self, pattern: &Pattern) -> bool {
+        match pattern {
+            Pattern::Repetition { min, .. } => *min > 0,
+            Pattern::Assertion(assertion) => {
+                match assertion {
+                    Assertion::NegativeLookahead(_) | Assertion::NegativeLookbehind(_) => false,
+                    _ => true,
+                }
+            }
+            Pattern::NamedCapture { pattern, .. } => self.is_mandatory_pattern(pattern),
+            Pattern::Disjunctive(patterns) => {
+                // Mandatory only if all alternatives are mandatory
+                !patterns.is_empty() && patterns.iter().all(|p| self.is_mandatory_pattern(p))
+            }
+            Pattern::Concatenated(patterns) => {
+                // Mandatory if any part is mandatory
+                patterns.iter().any(|p| self.is_mandatory_pattern(p))
+            }
+            Pattern::Constraint(_) => true,
+            _ => true,
+        }
+    }
+
     fn compile_concatenated(&self, patterns: &[Pattern]) -> Result<Box<dyn Query>> {
-        // Create sub-queries for each pattern
+        // Create sub-queries ONLY for mandatory patterns to avoid over-filtering
+        // Documents that don't match optional patterns should still be considered
         let mut sub_queries = Vec::new();
         for pattern in patterns {
-            let query = self.compile_pattern(pattern)?;
-            sub_queries.push(query);
+            if self.is_mandatory_pattern(pattern) {
+                let query = self.compile_pattern(pattern)?;
+                sub_queries.push(query);
+            }
+        }
+        
+        // If no mandatory patterns found, we must add a query that matches all documents
+        // that could potentially be a match. A simple "word:* " regex query works as a fallback.
+        if sub_queries.is_empty() {
+            let field = self.schema.get_field("word")
+                .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
+            let all_query = RegexQuery::from_pattern(".*", field)
+                .map_err(|e| anyhow!("Invalid fallback regex: {}", e))?;
+            sub_queries.push(Box::new(all_query));
         }
         
         // Create the concatenated pattern

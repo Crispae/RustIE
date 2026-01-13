@@ -155,21 +155,20 @@ impl RustieNamedCaptureScorer {
             Err(_) => return,
         };
         
-        // Extract field values
-        let tokens: Vec<String> = if let Ok(field) = self.reader.schema().get_field("word") { // Should use default_field name
-             doc.get_all(field)
-                .filter_map(|v| Value::as_str(&v).map(|s| s.to_string()))
-                .collect()
-        } else {
-            vec![]
-        };
+        // 1. Get tokens for the default field
+        let field_name = self.reader.schema().get_field_name(self.default_field);
+        let tokens = crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), &doc, field_name);
 
         if tokens.is_empty() {
              return;
         }
 
         // 2. Find matching positions
-        let match_positions = self.pattern.extract_matching_positions("word", &tokens);
+        // We use a field cache for consistency, even if it's just one field for now
+        let mut field_cache = std::collections::HashMap::new();
+        field_cache.insert(field_name.to_string(), tokens.clone());
+
+        let match_positions = self.pattern.extract_matching_positions(field_name, &tokens);
 
         // 3. Create named captures
         for pos in match_positions {

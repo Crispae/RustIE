@@ -195,8 +195,20 @@ fn main() -> Result<()> {
                 let term = tantivy::Term::from_field_text(word_field, test_word);
                 let term_query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
                 match searcher.search(&term_query, &tantivy::collector::Count) {
-                    Ok(count) => println!("  Raw TermQuery for '{}': {} hits", test_word, count),
-                    Err(e) => println!("  Raw TermQuery for '{}' error: {}", test_word, e),
+                    Ok(count) => println!("  Raw TermQuery for '{}' (word): {} hits", test_word, count),
+                    Err(e) => println!("  Raw TermQuery for '{}' (word) error: {}", test_word, e),
+                }
+            }
+
+            // Test tag field
+            if let Ok(tag_field) = schema.get_field("tag") {
+                for test_tag in &["DT", "JJ", "NN", "VBZ", "NNP"] {
+                    let term = tantivy::Term::from_field_text(tag_field, test_tag);
+                    let term_query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+                    match searcher.search(&term_query, &tantivy::collector::Count) {
+                        Ok(count) => println!("  Raw TermQuery for '{}' (tag): {} hits", test_tag, count),
+                        Err(e) => println!("  Raw TermQuery for '{}' (tag) error: {}", test_tag, e),
+                    }
                 }
             }
 
@@ -710,7 +722,7 @@ fn print_category_summary(results: &[TestResult]) {
     }
 
     let mut categories: Vec<_> = category_stats.iter().collect();
-    categories.sort_by_key(|(name, _)| name.clone());
+    categories.sort_by_key(|(name, _)| (*name).clone());
 
     for (category, (passed, total)) in categories {
         let bar = create_progress_bar(*passed, *total, 20);

@@ -824,23 +824,7 @@ impl OptimizedGraphTraversalScorer {
     /// Extract tokens from a specific field in the document
     /// Decodes position-aware format if necessary
     fn extract_tokens_from_field(&self, doc: &tantivy::schema::TantivyDocument, field_name: &str) -> Vec<String> {
-        if let Ok(field) = self.reader.schema().get_field(field_name) {
-            let raw_values: Vec<String> = doc.get_all(field)
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-
-            // For token fields stored in position-aware format (e.g., "John|eats|pizza"),
-            // decode by splitting on | to get individual tokens
-            let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
-            if token_fields.contains(&field_name) && raw_values.len() == 1 {
-                // Single encoded string - decode it
-                raw_values[0].split('|').map(|s| s.to_string()).collect()
-            } else {
-                raw_values
-            }
-        } else {
-            vec![]
-        }
+        crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), doc, field_name)
     }
     
     /// Find positions that match a pattern (for backward compatibility)
