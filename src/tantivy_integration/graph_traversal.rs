@@ -4,13 +4,17 @@ use tantivy::{
     DocId, Score, SegmentReader,
     Result as TantivyResult,
     DocSet,
+    store::StoreReader,
 };
 use log::debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
 use crate::compiler::ast::{Pattern, Constraint, Traversal};
-use rand::{distributions::Alphanumeric, Rng};
+
+// Global counter for generating unique capture names (much faster than rand)
+static CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 
 
@@ -109,12 +113,31 @@ impl Weight for OptimizedGraphTraversalWeight {
         let src_scorer = self.src_weight.scorer(reader, boost)?;
         let dst_scorer = self.dst_weight.scorer(reader, boost)?;
 
+        // Cache the store reader (created once, reused for all documents in this segment)
+        let store_reader = reader.get_store_reader(1)?;
+
+        // Pre-extract constraint field names from flat_steps (computed once, not per document)
+        let constraint_field_names: Vec<String> = self.flat_steps.iter()
+            .filter_map(|step| {
+                if let FlatPatternStep::Constraint(pat) = step {
+                    let field_name = match pat {
+                        crate::compiler::ast::Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, .. }) => name.clone(),
+                        _ => "word".to_string(),
+                    };
+                    Some(field_name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let mut scorer = OptimizedGraphTraversalScorer {
             src_scorer,
             dst_scorer,
             traversal: self.traversal.clone(),
             dependencies_binary_field: self.dependencies_binary_field,
             reader: reader.clone(),
+            store_reader,
             current_doc: None,
             current_matches: Vec::new(),
             match_index: 0,
@@ -124,6 +147,7 @@ impl Weight for OptimizedGraphTraversalWeight {
             boost,
             // Pass cached flattened pattern (computed once per query, not per document)
             flat_steps: self.flat_steps.clone(),
+            constraint_field_names,
         };
 
         // Advance to the first document
@@ -144,6 +168,8 @@ pub struct OptimizedGraphTraversalScorer {
     traversal: crate::compiler::ast::Traversal,
     dependencies_binary_field: Field,
     reader: SegmentReader,
+    /// Cached store reader (created once, reused for all documents)
+    store_reader: StoreReader,
     current_doc: Option<DocId>,
     current_matches: Vec<(DocId, Score)>,
     match_index: usize,
@@ -154,6 +180,8 @@ pub struct OptimizedGraphTraversalScorer {
     boost: Score,
     /// Pre-computed flattened pattern steps (cached from Weight)
     flat_steps: Vec<FlatPatternStep>,
+    /// Pre-extracted constraint field names (cached from flat_steps)
+    constraint_field_names: Vec<String>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -266,38 +294,34 @@ impl OptimizedGraphTraversalScorer {
     
 
     /// Check if a document has valid graph traversal from source to destination
-    fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {        
+    fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {
+        use std::time::Instant;
+        // Static counters for profiling
+        static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static GRAPH_DESER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+
         // Clear matches from previous document
         self.current_doc_matches.clear();
-        
-        // Phase 1: Get document
-        let store_reader = match self.reader.get_store_reader(1) {
-            Ok(reader) => reader,
-            Err(_) => {
-                return false;
-            }
-        };
-        let doc = match store_reader.get(doc_id) {
+
+        // Phase 1: Get document using cached store_reader (fast!)
+        let doc = match self.store_reader.get(doc_id) {
             Ok(doc) => doc,
             Err(_) => {
                 return false;
             }
         };
 
-        // Phase 2: Use cached flat_steps (computed once per query, not per document)
+        // Phase 2: Use cached flat_steps and constraint_field_names
         let flat_steps = &self.flat_steps;
 
-        // For each constraint step, extract the field name and tokens
-        let mut constraint_fields_and_tokens = Vec::new();
-        for step in flat_steps {
-            if let FlatPatternStep::Constraint(pat) = step {
-                let field_name = match pat {
-                    crate::compiler::ast::Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, .. }) => name.as_str(),
-                    _ => "word",
-                };
-                let tokens = self.extract_tokens_from_field(&doc, field_name);
-                constraint_fields_and_tokens.push((field_name.to_string(), tokens));
-            }
+        // Extract tokens for each constraint field (using cached field names)
+        let mut constraint_fields_and_tokens: Vec<(String, Vec<String>)> =
+            Vec::with_capacity(self.constraint_field_names.len());
+        for field_name in &self.constraint_field_names {
+            let tokens = self.extract_tokens_from_field(&doc, field_name);
+            constraint_fields_and_tokens.push((field_name.clone(), tokens));
         }
 
         // Find the first constraint in the flat_steps
@@ -336,6 +360,7 @@ impl OptimizedGraphTraversalScorer {
         };
 
         // Phase 5: Deserialize the graph
+        GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
         let graph = match DirectedGraph::from_bytes(binary_data) {
             Ok(graph) => graph,
             Err(_) => {
@@ -343,32 +368,36 @@ impl OptimizedGraphTraversalScorer {
                 return false;
             }
         };
-        
+
+        // Log candidate count periodically
+        if call_num > 0 && call_num % 500 == 0 {
+            let deser_count = GRAPH_DESER_COUNT.load(Ordering::Relaxed);
+            log::info!("Graph traversal stats: {} candidates checked, {} graphs deserialized",
+                call_num, deser_count);
+        }
+
         // Phase 7: Run automaton traversal for each src_pos
         let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
         let mut found = false;
-        
+
         for &src_pos in &src_positions {
             let all_paths = traversal_engine.automaton_query_paths(&flat_steps, &[src_pos], &constraint_fields_and_tokens);
             for path in &all_paths {
                 // Collect captures for each constraint step
                 debug!("flat_steps = {:?}", flat_steps);
                 debug!("path = {:?}", path);
-                let mut captures = Vec::new();
+                let mut captures = Vec::with_capacity(path.len());
                 let mut constraint_idx = 0;
-                for (step_idx, step) in flat_steps.iter().enumerate() {
+                for (_step_idx, step) in flat_steps.iter().enumerate() {
                     if let FlatPatternStep::Constraint(ref pat) = step {
                         if let Some(&node_idx) = path.get(constraint_idx) {
                             let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
                             let name = match pat {
                                 crate::compiler::ast::Pattern::NamedCapture { name, .. } => name.clone(),
                                 _ => {
-                                    let rand_name: String = rand::thread_rng()
-                                        .sample_iter(&rand::distributions::Alphanumeric)
-                                        .take(8)
-                                        .map(char::from)
-                                        .collect();
-                                    rand_name
+                                    // Use fast atomic counter instead of random generation
+                                    let id = CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                    format!("c{}", id)
                                 }
                             };
                             captures.push(crate::types::NamedCapture::new(name, span));
