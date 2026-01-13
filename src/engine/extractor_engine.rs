@@ -24,6 +24,8 @@ pub const FIELD_SENTENCE_LENGTH: &str = "sentence_length";
 pub const FIELD_DEPENDENCIES_BINARY: &str = "dependencies_binary";
 pub const FIELD_DOC_ID: &str = "doc_id";
 pub const FIELD_SENTENCE_ID: &str = "sentence_id";
+pub const FIELD_INCOMING_EDGES: &str = "incoming_edges";
+pub const FIELD_OUTGOING_EDGES: &str = "outgoing_edges";
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaConfig {
@@ -48,6 +50,8 @@ pub struct ExtractorEngine {
     default_field: Field, // Can be directly used from schema
     sentence_length_field: Field, // Can be directly used from schema
     dependencies_binary_field: Field, // Can be directly used from schema
+    incoming_edges_field: Field,
+    outgoing_edges_field: Field,
     parent_doc_id_field: String, // Can be directly used from schema
     output_fields: Vec<String>, // Can be directly used from schema
 }
@@ -73,6 +77,8 @@ impl ExtractorEngine {
         let default_field = schema.get_field(FIELD_WORD).map_err(|_| anyhow!("Default field '{}' not found in schema", FIELD_WORD))?;
         let sentence_length_field = schema.get_field(FIELD_SENTENCE_LENGTH).map_err(|_| anyhow!("Sentence length field '{}' not found in schema", FIELD_SENTENCE_LENGTH))?;
         let dependencies_binary_field = schema.get_field(FIELD_DEPENDENCIES_BINARY).map_err(|_| anyhow!("Dependencies binary field '{}' not found in schema", FIELD_DEPENDENCIES_BINARY))?;
+        let incoming_edges_field = schema.get_field(FIELD_INCOMING_EDGES).map_err(|_| anyhow!("Incoming edges field '{}' not found in schema", FIELD_INCOMING_EDGES))?;
+        let outgoing_edges_field = schema.get_field(FIELD_OUTGOING_EDGES).map_err(|_| anyhow!("Outgoing edges field '{}' not found in schema", FIELD_OUTGOING_EDGES))?;
 
         Ok(Self {
             index,
@@ -82,6 +88,8 @@ impl ExtractorEngine {
             default_field,
             sentence_length_field,
             dependencies_binary_field,
+            incoming_edges_field,
+            outgoing_edges_field,
             parent_doc_id_field: FIELD_DOC_ID.to_string(),
             output_fields,
         })
@@ -225,67 +233,93 @@ impl ExtractorEngine {
     }
 
     /// Execute graph traversal queries using dependency graph edges
+    /// OPTIMIZED: Single-pass collection instead of re-traversing for each result
     fn execute_graph_traversal(&self, query: &dyn Query, limit: usize, _pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        log::debug!("Using GRAPH TRAVERSAL mechanism");
+        log::debug!("Using GRAPH TRAVERSAL mechanism (OPTIMIZED SINGLE-PASS)");
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        log::debug!("top_docs = {:?}", top_docs);
+
+        // Downcast to graph query once
+        let graph_query = match query
+            .as_any()
+            .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>()
+        {
+            Some(gq) => gq,
+            None => {
+                log::warn!("Expected graph query but downcast failed!");
+                return Ok(RustIeResult {
+                    total_hits: 0,
+                    score_docs: Vec::new(),
+                    sentence_results: Vec::new(),
+                    max_score: None,
+                });
+            }
+        };
 
         let mut sentence_results = Vec::new();
-        let mut max_score = None;
+        let mut max_score: Option<Score> = None;
+        let mut count = 0;
 
-        for (score, doc_address) in top_docs {
-            let mut matches = Vec::new();
-
-            // Get the segment order and document ID
-            let (segment_ord, doc_id) = (doc_address.segment_ord, doc_address.doc_id);
-            let segment_reader = searcher.segment_reader(segment_ord);
-
-            if let Some(graph_query) = query
-                .as_any()
-                .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>()
-            {
-                log::debug!("Processing graph query for doc_address = {:?}", doc_address);
-                log::debug!("Creating weight for graph query");
-                let weight = graph_query.weight(tantivy::query::EnableScoring::Enabled { searcher: &searcher,
-                                                                                          statistics_provider: &searcher })?;
-                log::debug!("Creating scorer from weight");
-                let mut scorer = weight.scorer(segment_reader, 1.0)?;
-                log::debug!("Scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
-
-                while scorer.doc() < doc_id {
-                    if scorer.advance() == tantivy::TERMINATED {
-                        break;
-                    }
-                }
-
-                if scorer.doc() == doc_id {
-                    if let Some(graph_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>() {
-                        log::debug!("Successfully downcast to OptimizedGraphTraversalScorer");
-                        log::debug!("Extracting graph matches");
-                        matches = graph_scorer.get_current_doc_matches().to_vec();
-                        log::debug!("Graph matches = {:?}", matches);
-                        log::debug!("Number of matches found: {}", matches.len());
-                    } else {
-                        log::warn!("Scorer is NOT OptimizedGraphTraversalScorer!");
-                        log::debug!("Actual scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
-                    }
-                }
-            } else {
-                log::warn!("Expected graph query but downcast failed!");
+        // OPTIMIZED: Single pass through all segments
+        // Instead of using TopDocs and re-traversing, iterate scorer directly
+        for segment_ord in 0..searcher.segment_readers().len() {
+            if count >= limit {
+                break;
             }
 
-            // Extract sentence result
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                sentence_result.matches = matches;
-                sentence_results.push(sentence_result);
-            }
+            let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
+            // Create weight and scorer ONCE per segment
+            let weight = graph_query.weight(tantivy::query::EnableScoring::Enabled {
+                searcher: &searcher,
+                statistics_provider: &searcher
+            })?;
+
+            let mut scorer = weight.scorer(segment_reader, 1.0)?;
+
+            // Iterate through all matching documents in this segment
+            loop {
+                let doc_id = scorer.doc();
+                if doc_id == tantivy::TERMINATED {
+                    break;
+                }
+
+                if count >= limit {
+                    break;
+                }
+
+                let score = scorer.score();
+                let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                // Get matches from scorer (already computed during advance)
+                let matches = if let Some(graph_scorer) = scorer
+                    .as_any()
+                    .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>()
+                {
+                    graph_scorer.get_current_doc_matches().to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                // Extract sentence result
+                if let Ok(doc) = self.doc(doc_address) {
+                    let mut sentence_result = self.extract_sentence_result(&doc, score)?;
+                    sentence_result.matches = matches;
+                    sentence_results.push(sentence_result);
+                    count += 1;
+
+                    max_score = max_score.map(|s| s.max(score)).or(Some(score));
+                }
+
+                // Advance to next matching document
+                if scorer.advance() == tantivy::TERMINATED {
+                    break;
+                }
+            }
         }
-        
+
+        log::debug!("Graph traversal found {} results in single pass", sentence_results.len());
+
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
             score_docs: Vec::new(),

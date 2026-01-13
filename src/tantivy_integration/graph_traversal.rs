@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
-use crate::compiler::ast::{Pattern, Constraint, Traversal};
+use crate::compiler::ast::{Pattern, Traversal};
 
 // Global counter for generating unique capture names (much faster than rand)
 static CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -23,6 +23,8 @@ static CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 pub struct OptimizedGraphTraversalQuery {
     default_field: Field,
     dependencies_binary_field: Field,
+    incoming_edges_field: Field,
+    outgoing_edges_field: Field,
     src_query: Box<dyn Query>,
     traversal: crate::compiler::ast::Traversal,
     dst_query: Box<dyn Query>,
@@ -35,6 +37,8 @@ impl OptimizedGraphTraversalQuery {
     pub fn new(
         default_field: Field,
         dependencies_binary_field: Field,
+        incoming_edges_field: Field,
+        outgoing_edges_field: Field,
         src_query: Box<dyn Query>,
         traversal: crate::compiler::ast::Traversal,
         dst_query: Box<dyn Query>,
@@ -44,6 +48,8 @@ impl OptimizedGraphTraversalQuery {
         Self {
             default_field,
             dependencies_binary_field,
+            incoming_edges_field,
+            outgoing_edges_field,
             src_query,
             traversal,
             dst_query,
@@ -56,6 +62,13 @@ impl OptimizedGraphTraversalQuery {
 impl Query for OptimizedGraphTraversalQuery {
 
     fn weight(&self, scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
+        
+        // Note: Edge label filters are now included in src_query and dst_query 
+        // (added in graph_compiler.rs when creating combined_query)
+        // So we can use them directly without additional wrapping
+        
+        log::info!("Using combined_query (includes constraints + edge label filters) for candidate selection");
+        
         let src_weight = self.src_query.weight(scoring)?;
         let dst_weight = self.dst_query.weight(scoring)?;
 
@@ -85,6 +98,8 @@ impl tantivy::query::QueryClone for OptimizedGraphTraversalQuery {
         Box::new(OptimizedGraphTraversalQuery {
             default_field: self.default_field,
             dependencies_binary_field: self.dependencies_binary_field,
+            incoming_edges_field: self.incoming_edges_field,
+            outgoing_edges_field: self.outgoing_edges_field,
             src_query: self.src_query.box_clone(),
             traversal: self.traversal.clone(),
             dst_query: self.dst_query.box_clone(),
@@ -294,11 +309,16 @@ impl OptimizedGraphTraversalScorer {
     
 
     /// Check if a document has valid graph traversal from source to destination
+    /// 
+    /// Optimizations:
+    /// 1. Pre-checks ALL constraints before graph deserialization (early exit)
+    /// 2. Uses boolean query for early termination during traversal
+    /// 3. Tracks skipped graph deserializations for profiling
     fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {
-        use std::time::Instant;
         // Static counters for profiling
         static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
         static GRAPH_DESER_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static GRAPH_DESER_SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
         let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
 
@@ -316,6 +336,13 @@ impl OptimizedGraphTraversalScorer {
         // Phase 2: Use cached flat_steps and constraint_field_names
         let flat_steps = &self.flat_steps;
 
+        // Early exit if pattern is empty
+        if flat_steps.is_empty() {
+            debug!("Empty pattern, skipping");
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
         // Extract tokens for each constraint field (using cached field names)
         let mut constraint_fields_and_tokens: Vec<(String, Vec<String>)> =
             Vec::with_capacity(self.constraint_field_names.len());
@@ -324,42 +351,81 @@ impl OptimizedGraphTraversalScorer {
             constraint_fields_and_tokens.push((field_name.clone(), tokens));
         }
 
-        // Find the first constraint in the flat_steps
-        let first_constraint = flat_steps.iter().find_map(|step| {
-            if let FlatPatternStep::Constraint(pat) = step {
-                Some(pat)
-            } else {
-                None
-            }
-        });
+        // OPTIMIZATION 1: Pre-check ALL constraints and CACHE positions before graph deserialization
+        // This avoids redundant position finding later
+        let mut constraint_count = 0;
+        let mut total_constraints = 0;
+        let mut cached_positions: Vec<Vec<usize>> = Vec::new();  // Cache positions for each constraint
 
-        // Use the tokens for the first constraint to find source positions
-        let src_positions = match first_constraint {
-            Some(pat) => {
-                if let Some((_, tokens)) = constraint_fields_and_tokens.get(0) {
-                    self.find_positions_in_tokens(tokens, pat)
-                } else {
-                    vec![]
+        for step in flat_steps.iter() {
+            if let FlatPatternStep::Constraint(constraint_pat) = step {
+                total_constraints += 1;
+                // Check if this constraint has matches
+                // constraint_count is the index into constraint_fields_and_tokens
+                if constraint_count >= constraint_fields_and_tokens.len() {
+                    debug!("Constraint index {} out of bounds (len={}), skipping graph deserialization",
+                           constraint_count, constraint_fields_and_tokens.len());
+                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return false;
                 }
-            },
-            None => vec![],
-        };
 
-        if src_positions.is_empty() {
-            debug!("src_positions empty");
+                let (field_name, tokens) = &constraint_fields_and_tokens[constraint_count];
+
+                // Handle wildcard constraints - they always match, so skip pre-check
+                let is_wildcard = match constraint_pat {
+                    crate::compiler::ast::Pattern::Constraint(
+                        crate::compiler::ast::Constraint::Wildcard
+                    ) => true,
+                    _ => false,
+                };
+
+                if !is_wildcard {
+                    // For non-wildcard constraints, find and cache positions
+                    let positions = self.find_positions_in_tokens(tokens, constraint_pat);
+
+                    if positions.is_empty() {
+                        debug!("Constraint {} (field: {}) has no matches, skipping graph deserialization",
+                               constraint_count, field_name);
+                        GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        return false;  // Early exit - don't deserialize graph
+                    }
+                    cached_positions.push(positions);
+                } else {
+                    // Wildcard matches all positions
+                    cached_positions.push((0..tokens.len()).collect());
+                }
+
+                constraint_count += 1;
+            }
+            // Traversals don't need pre-checking
+        }
+
+        // Log why we're not skipping (for debugging)
+        if call_num > 0 && call_num % 500 == 0 {
+            debug!("Document {}: {} constraints checked, all passed (no skip)", doc_id, total_constraints);
+        }
+
+        // Use cached positions for src (first constraint)
+        let src_positions = cached_positions.get(0).cloned().unwrap_or_default();
+
+        // If no source positions and we have constraints, early exit
+        if constraint_count > 0 && src_positions.is_empty() {
+            debug!("src_positions empty and pattern has constraints, skipping");
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
 
-        // Phase 4: Get binary dependency graph
+        // Phase 4: Get binary dependency graph (only if all constraints passed)
         let binary_data = match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
             Some(data) => data,
             None => {
                 debug!("No binary dependency graph");
+                GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
         };
 
-        // Phase 5: Deserialize the graph
+        // Phase 5: Deserialize the graph (only reached if all constraints have matches)
         GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
         let graph = match DirectedGraph::from_bytes(binary_data) {
             Ok(graph) => graph,
@@ -369,18 +435,58 @@ impl OptimizedGraphTraversalScorer {
             }
         };
 
-        // Log candidate count periodically
+        // Log candidate count periodically with skipped count
         if call_num > 0 && call_num % 500 == 0 {
             let deser_count = GRAPH_DESER_COUNT.load(Ordering::Relaxed);
-            log::info!("Graph traversal stats: {} candidates checked, {} graphs deserialized",
-                call_num, deser_count);
+            let skipped_count = GRAPH_DESER_SKIPPED.load(Ordering::Relaxed);
+            let skip_rate = if call_num > 0 {
+                (skipped_count as f64 / call_num as f64) * 100.0
+            } else {
+                0.0
+            };
+            log::info!("Graph traversal stats: {} candidates checked, {} graphs deserialized ({} skipped, {:.1}% skip rate)",
+                call_num, deser_count, skipped_count, skip_rate);
         }
 
-        // Phase 7: Run automaton traversal for each src_pos
+        // Phase 7: Run automaton traversal for each src_pos with early termination
         let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
         let mut found = false;
 
+        // Handle traversal-only patterns (no constraints)
+        if constraint_count == 0 && src_positions.is_empty() {
+            // For traversal-only patterns, we'd need to start from root nodes or all nodes
+            // This is a complex edge case - for now, return false
+            debug!("Traversal-only pattern without source positions not yet supported");
+            return false;
+        }
+
+        // OPTIMIZATION: Use cached positions for dst (last constraint)
+        // This is like Odinson's mkInvIndex - we know which positions could be valid endpoints
+        let dst_positions: std::collections::HashSet<usize> = if constraint_count > 0 {
+            cached_positions.last()
+                .map(|pos| pos.iter().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Early exit: if dst_positions is empty and we have constraints, no match possible
+        if !dst_positions.is_empty() || constraint_count == 0 {
+            // Continue with traversal
+        } else {
+            debug!("dst_positions empty, no possible matches");
+            return false;
+        }
+
         for &src_pos in &src_positions {
+            // OPTIMIZATION: Skip if src == dst for multi-hop patterns (they must be different positions)
+            // For single-constraint patterns, this check is not needed
+            if constraint_count > 1 && dst_positions.len() == 1 && dst_positions.contains(&src_pos) {
+                // Only one dst position and it's the same as src - skip for multi-hop patterns
+                continue;
+            }
+
+            // Directly collect paths (removed double traversal - automaton_query was redundant)
             let all_paths = traversal_engine.automaton_query_paths(&flat_steps, &[src_pos], &constraint_fields_and_tokens);
             for path in &all_paths {
                 // Collect captures for each constraint step
@@ -415,6 +521,9 @@ impl OptimizedGraphTraversalScorer {
             }
             if !all_paths.is_empty() {
                 found = true;
+                // Early exit after first matching src_pos (we found at least one match)
+                // This significantly speeds up queries where we only care about existence
+                break;
             }
         }
         found

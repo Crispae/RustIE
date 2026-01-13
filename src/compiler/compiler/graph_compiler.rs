@@ -2,9 +2,9 @@ use tantivy::{
     query::{Query, BooleanQuery, Occur, TermQuery, RegexQuery},
     schema::{Term, Field, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal};
+use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
-use crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery;
+use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern};
 use crate::compiler::compiler::basic_compiler::BasicCompiler;
 
 /// Compiler for graph traversal patterns
@@ -58,7 +58,7 @@ impl GraphCompiler {
     }
 
     fn compile_graph_traversal(&self, src: &Pattern, traversal: &Traversal, dst: &Pattern) -> Result<Box<dyn Query>> {
-        // Build the full pattern to extract all constraints
+        // Build the full pattern to extract all constraints and edge labels
         let full_pattern = Pattern::GraphTraversal {
             src: Box::new(src.clone()),
             traversal: traversal.clone(),
@@ -77,7 +77,68 @@ impl GraphCompiler {
             }
         }
 
-        // Create combined index query - documents must match ALL constraints
+        // Extract edge labels from the full pattern and add them to the AND query
+        let mut flat_steps = Vec::new();
+        flatten_graph_traversal_pattern(&full_pattern, &mut flat_steps);
+        
+        let mut required_incoming = std::collections::HashSet::new();
+        let mut required_outgoing = std::collections::HashSet::new();
+        
+        for step in &flat_steps {
+            if let FlatPatternStep::Traversal(trav) = step {
+                match trav {
+                    Traversal::Outgoing(matcher) => {
+                        let label_str = matcher.pattern_str().to_string();
+                        required_outgoing.insert(label_str);
+                    },
+                    Traversal::Incoming(matcher) => {
+                        let label_str = matcher.pattern_str().to_string();
+                        required_incoming.insert(label_str);
+                    },
+                    Traversal::Optional(inner) => {
+                        // Extract from optional traversal
+                        match &**inner {
+                            Traversal::Outgoing(matcher) => {
+                                let label_str = matcher.pattern_str().to_string();
+                                required_outgoing.insert(label_str);
+                            },
+                            Traversal::Incoming(matcher) => {
+                                let label_str = matcher.pattern_str().to_string();
+                                required_incoming.insert(label_str);
+                            },
+                            _ => {}
+                        }
+                    },
+                    _ => {} // Wildcards/Disjunctions - skip for filtering
+                }
+            }
+        }
+
+        // Get edge label fields from schema
+        let incoming_edges_field = self.schema.get_field("incoming_edges")
+            .map_err(|_| anyhow!("Incoming edges field not found in schema"))?;
+        let outgoing_edges_field = self.schema.get_field("outgoing_edges")
+            .map_err(|_| anyhow!("Outgoing edges field not found in schema"))?;
+
+        // Add edge label filters to the AND query
+        for label in &required_outgoing {
+            let term = Term::from_field_text(outgoing_edges_field, &label);
+            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic));
+            sub_queries.push((Occur::Must, query));
+            log::debug!("Added outgoing edge filter to combined_query: {}", label);
+        }
+
+        for label in &required_incoming {
+            let term = Term::from_field_text(incoming_edges_field, &label);
+            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic));
+            sub_queries.push((Occur::Must, query));
+            log::debug!("Added incoming edge filter to combined_query: {}", label);
+        }
+
+        log::info!("Combined query includes {} constraints + {} edge label filters", 
+                   all_constraints.len(), required_incoming.len() + required_outgoing.len());
+
+        // Create combined index query - documents must match ALL constraints AND edge labels
         let combined_query: Box<dyn Query> = if sub_queries.len() == 1 {
             sub_queries.pop().unwrap().1
         } else if sub_queries.is_empty() {
@@ -90,6 +151,10 @@ impl GraphCompiler {
         // Get the dependencies fields from schema.
         let dependencies_binary_field = self.schema.get_field("dependencies_binary")
             .map_err(|_| anyhow!("Dependencies binary field not found in schema"))?;
+        let incoming_edges_field = self.schema.get_field("incoming_edges")
+            .map_err(|_| anyhow!("Incoming edges field not found in schema"))?;
+        let outgoing_edges_field = self.schema.get_field("outgoing_edges")
+            .map_err(|_| anyhow!("Outgoing edges field not found in schema"))?;
         let default_field = self.schema.get_field("word")
             .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
 
@@ -99,6 +164,8 @@ impl GraphCompiler {
         Ok(Box::new(OptimizedGraphTraversalQuery::new(
             default_field,
             dependencies_binary_field,
+            incoming_edges_field,
+            outgoing_edges_field,
             combined_query.box_clone(),  // Use combined query for src filtering
             traversal.clone(),
             combined_query,              // Use same combined query for dst filtering

@@ -245,8 +245,63 @@ impl DocumentParser {
                                             tantivy_doc.add_bytes(binary_field, &bytes);
                                         }
                                         Err(e) => {
-                                            log::warn!("Graph serialization failed: {}", e);
+                                    log::warn!("Graph serialization failed: {}", e);
                                         }
+                                    }
+                                }
+                                
+                                // Populate incoming and outgoing edge fields for filtering
+                                let mut outgoing_edges = Vec::new(); // outgoing[i] = list of labels
+                                let mut incoming_edges = Vec::new(); // incoming[i] = list of labels
+                                
+                                // Initialize vectors
+                                if let Some(tokens) = doc.get_tokens(sentence_idx, "word") {
+                                    outgoing_edges.resize(tokens.len(), Vec::new());
+                                    incoming_edges.resize(tokens.len(), Vec::new());
+                                }
+                                
+                                for (from, to, rel) in edges {
+                                    if (*from as usize) < outgoing_edges.len() {
+                                        outgoing_edges[*from as usize].push(rel.clone());
+                                    }
+                                    if (*to as usize) < incoming_edges.len() {
+                                        incoming_edges[*to as usize].push(rel.clone());
+                                    }
+                                }
+                                
+                                if let Ok(field) = self.schema.get_field("outgoing_edges") {
+                                    let mut total_outgoing_labels = 0;
+                                    for labels in outgoing_edges {
+                                        // Store space-separated labels for each token position
+                                        // or just all labels for the document?
+                                        // The requirement is to filter if the document *contains* the edge.
+                                        // Tantivy text fields are multi-valued.
+                                        // If we add "nsubj" multiple times, it's fine.
+                                        // But we need to make sure we are not associating them with specific positions yet in valid way for simple filtering.
+                                        // Query: "outgoing_edges:nsubj"
+                                        
+                                        // Strategy: Add all labels to the document field.
+                                        // Since we want position-independent filtering first.
+                                        for label in labels {
+                                             tantivy_doc.add_text(field, &label);
+                                             total_outgoing_labels += 1;
+                                        }
+                                    }
+                                    if total_outgoing_labels > 0 {
+                                        log::debug!("Indexed {} outgoing edge labels for sentence {}", total_outgoing_labels, sentence_idx);
+                                    }
+                                }
+                                
+                                if let Ok(field) = self.schema.get_field("incoming_edges") {
+                                    let mut total_incoming_labels = 0;
+                                    for labels in incoming_edges {
+                                        for label in labels {
+                                             tantivy_doc.add_text(field, &label);
+                                             total_incoming_labels += 1;
+                                        }
+                                    }
+                                    if total_incoming_labels > 0 {
+                                        log::debug!("Indexed {} incoming edge labels for sentence {}", total_incoming_labels, sentence_idx);
                                     }
                                 }
                             }

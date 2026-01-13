@@ -46,6 +46,14 @@ fields:
     type: "bytes"
     stored: true
   
+  # Dependency edge labels for filtering (Odinson optimization)
+  - name: "incoming_edges"
+    type: "text"  # Use text for multivalue token support
+    stored: true
+  - name: "outgoing_edges"
+    type: "text"
+    stored: true
+  
   # Document type
   - name: "type"
     type: "text"
