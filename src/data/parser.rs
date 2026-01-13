@@ -171,51 +171,21 @@ impl DocumentParser {
             for field in &sentence.fields {
                 match field {
                     DocField::TokensField { name, tokens, .. } => {
+                        // Use position-aware encoding for token fields
+                        // This ensures each token gets the correct position (0, 1, 2, ...)
+                        // instead of all tokens being at position 0
+                        let encoded = crate::tantivy_integration::position_tokenizer::encode_position_aware_tokens(tokens);
+
                         match name.as_str() {
-                            
-                            "raw" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("raw")?, token);
-                                }
-                            }
-                            "word" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("word")?, token);
-                                }
-                            }
-                            "lemma" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("lemma")?, token);
-                                }
-                            }
-                            "pos" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("pos")?, token);
-                                }
-                            }
-                            "tag" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("tag")?, token);
-                                }
-                            }
-                            "chunk" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("chunk")?, token);
-                                }
-                            }
-                            "entity" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("entity")?, token);
-                                }
-                            }
-                            "norm" => {
-                                for token in tokens {
-                                    tantivy_doc.add_text(self.schema.get_field("norm")?, token);
+                            "raw" | "word" | "lemma" | "pos" | "tag" | "chunk" | "entity" | "norm" => {
+                                if let Ok(field) = self.schema.get_field(name) {
+                                    tantivy_doc.add_text(field, &encoded);
                                 }
                             }
                             _ => {
+                                // For unknown fields, also use position-aware encoding
                                 if let Ok(field) = self.schema.get_field(name) {
-                                    tantivy_doc.add_text(field, &tokens.join(" "));
+                                    tantivy_doc.add_text(field, &encoded);
                                 }
                             }
                         }
@@ -251,15 +221,18 @@ impl DocumentParser {
                                 }
                                 
                                 // Populate incoming and outgoing edge fields for filtering
-                                let mut outgoing_edges = Vec::new(); // outgoing[i] = list of labels
-                                let mut incoming_edges = Vec::new(); // incoming[i] = list of labels
-                                
-                                // Initialize vectors
+                                // ODINSON-STYLE: Position-aware edge indexing
+                                // Each edge label is indexed at its token position
+                                let mut outgoing_edges: Vec<Vec<String>> = Vec::new(); // outgoing[i] = list of labels at position i
+                                let mut incoming_edges: Vec<Vec<String>> = Vec::new(); // incoming[i] = list of labels at position i
+
+                                // Initialize vectors based on sentence length
                                 if let Some(tokens) = doc.get_tokens(sentence_idx, "word") {
                                     outgoing_edges.resize(tokens.len(), Vec::new());
                                     incoming_edges.resize(tokens.len(), Vec::new());
                                 }
-                                
+
+                                // Populate edges at their token positions
                                 for (from, to, rel) in edges {
                                     if (*from as usize) < outgoing_edges.len() {
                                         outgoing_edges[*from as usize].push(rel.clone());
@@ -268,41 +241,17 @@ impl DocumentParser {
                                         incoming_edges[*to as usize].push(rel.clone());
                                     }
                                 }
-                                
+
+                                // Encode as position-aware format and add to document
+                                // Format: "|label1,label2||label3|" where | separates positions
                                 if let Ok(field) = self.schema.get_field("outgoing_edges") {
-                                    let mut total_outgoing_labels = 0;
-                                    for labels in outgoing_edges {
-                                        // Store space-separated labels for each token position
-                                        // or just all labels for the document?
-                                        // The requirement is to filter if the document *contains* the edge.
-                                        // Tantivy text fields are multi-valued.
-                                        // If we add "nsubj" multiple times, it's fine.
-                                        // But we need to make sure we are not associating them with specific positions yet in valid way for simple filtering.
-                                        // Query: "outgoing_edges:nsubj"
-                                        
-                                        // Strategy: Add all labels to the document field.
-                                        // Since we want position-independent filtering first.
-                                        for label in labels {
-                                             tantivy_doc.add_text(field, &label);
-                                             total_outgoing_labels += 1;
-                                        }
-                                    }
-                                    if total_outgoing_labels > 0 {
-                                        log::debug!("Indexed {} outgoing edge labels for sentence {}", total_outgoing_labels, sentence_idx);
-                                    }
+                                    let encoded = crate::tantivy_integration::position_tokenizer::encode_position_aware_edges(&outgoing_edges);
+                                    tantivy_doc.add_text(field, &encoded);
                                 }
-                                
+
                                 if let Ok(field) = self.schema.get_field("incoming_edges") {
-                                    let mut total_incoming_labels = 0;
-                                    for labels in incoming_edges {
-                                        for label in labels {
-                                             tantivy_doc.add_text(field, &label);
-                                             total_incoming_labels += 1;
-                                        }
-                                    }
-                                    if total_incoming_labels > 0 {
-                                        log::debug!("Indexed {} incoming edge labels for sentence {}", total_incoming_labels, sentence_idx);
-                                    }
+                                    let encoded = crate::tantivy_integration::position_tokenizer::encode_position_aware_edges(&incoming_edges);
+                                    tantivy_doc.add_text(field, &encoded);
                                 }
                             }
                             _ => {

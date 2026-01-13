@@ -6,6 +6,8 @@ pub mod concat_query;
 pub mod graph_traversal;
 pub mod assertion_query;
 pub mod named_capture_query;
+pub mod position_tokenizer;
+pub mod position_prefilter;
 
 pub use spans::*;
 pub use collector::*;
@@ -13,4 +15,6 @@ pub use concat_query::*;
 pub use graph_traversal::*;
 pub use boolean_query::*;
 pub use assertion_query::*;
-pub use named_capture_query::*; 
+pub use named_capture_query::*;
+pub use position_tokenizer::*;
+pub use position_prefilter::*; 

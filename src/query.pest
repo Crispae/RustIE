@@ -51,7 +51,7 @@ field_constraint = { field_name ~ comparison_op ~ (regex_value | value) ~ fuzzy_
 field_name = @{ ASCII_ALPHANUMERIC+ }
 comparison_op = { "=" | "!=" }
 fuzzy_op = { "~" }
-value =     @{ ASCII_ALPHANUMERIC+ }
+value = @{ (ASCII_ALPHANUMERIC | "-" | "_")+ }
 // Extended regex: support standard Rust/Tantivy regex syntax (any character except unescaped / or newline)
 regex_value = @{ "/" ~ (!("/" | "\n") ~ ANY)* ~ "/" }
 wildcard = { "*" }

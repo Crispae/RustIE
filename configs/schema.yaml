@@ -2,9 +2,13 @@
 output_fields:
   - "word"
 
+# Schema configuration
+# NOTE: All "string" and "text" type fields are automatically indexed with positions
+# (IndexRecordOption::WithFreqsAndPositions) to enable constraint position prefiltering.
+# This matches Odinson's behavior where all token fields have positions indexed.
 
 fields:
-  # Core token fields
+  # Core token fields (all indexed with positions for constraint prefiltering)
   - name: "word"
     type: "string"
     stored: true
@@ -24,10 +28,10 @@ fields:
     type: "string"
     stored: true
   - name: "norm"
-    type: "text"
+    type: "string"  # Token field - needs position-aware indexing
     stored: true
   - name: "raw"
-    type: "text"
+    type: "string"  # Token field - needs position-aware indexing
     stored: true
   
   # Document structure fields
@@ -46,12 +50,14 @@ fields:
     type: "bytes"
     stored: true
   
-  # Dependency edge labels for filtering (Odinson optimization)
+  # Dependency edge labels for filtering (Odinson-style position-aware)
+  # Uses custom tokenizer that indexes edge labels at their token positions
+  # This enables position-level filtering before graph traversal
   - name: "incoming_edges"
-    type: "text"  # Use text for multivalue token support
+    type: "edge_positions"  # Position-aware edge indexing
     stored: true
   - name: "outgoing_edges"
-    type: "text"
+    type: "edge_positions"  # Position-aware edge indexing
     stored: true
   
   # Document type

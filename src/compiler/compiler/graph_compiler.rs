@@ -123,16 +123,16 @@ impl GraphCompiler {
         // Add edge label filters to the AND query
         for label in &required_outgoing {
             let term = Term::from_field_text(outgoing_edges_field, &label);
-            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic));
+            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions));
             sub_queries.push((Occur::Must, query));
-            log::debug!("Added outgoing edge filter to combined_query: {}", label);
+            log::info!("Added outgoing edge filter: term='{}' in field outgoing_edges", label);
         }
 
         for label in &required_incoming {
             let term = Term::from_field_text(incoming_edges_field, &label);
-            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic));
+            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions));
             sub_queries.push((Occur::Must, query));
-            log::debug!("Added incoming edge filter to combined_query: {}", label);
+            log::info!("Added incoming edge filter: term='{}' in field incoming_edges", label);
         }
 
         log::info!("Combined query includes {} constraints + {} edge label filters", 

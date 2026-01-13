@@ -8,11 +8,14 @@
 //! - Named captures
 //! - Lookahead/lookbehind assertions
 
-use rustie::{Document, ExtractorEngine, RustIeResult};
+use rustie::{Document, ExtractorEngine};
 use std::path::Path;
 use std::fs;
-use anyhow::{Result, anyhow};
-use serde_json::Value;
+use std::error::Error;
+use anyhow::Result;
+use serde_json::Value as JsonValue;
+use tantivy::schema::Value;
+use tantivy::tokenizer::{Tokenizer, TokenStream};
 
 /// Test case structure
 struct TestCase {
@@ -118,18 +121,38 @@ fn main() -> Result<()> {
             println!("  Indexing: {}", path.display());
 
             let content = fs::read_to_string(&path)?;
-            let json_value: Value = serde_json::from_str(&content)?;
+            let json_value: JsonValue = serde_json::from_str(&content)?;
 
             // Try as single document or array
-            if let Ok(document) = serde_json::from_value::<Document>(json_value.clone()) {
+            let single_doc_result = serde_json::from_value::<Document>(json_value.clone());
+            let array_doc_result = serde_json::from_value::<Vec<Document>>(json_value.clone());
+            
+            if let Ok(document) = single_doc_result {
                 total_sentences += document.sentences.len();
                 engine.add_document(&document)?;
                 total_docs += 1;
-            } else if let Ok(documents) = serde_json::from_value::<Vec<Document>>(json_value) {
+                println!("    ✓ Successfully indexed as single document ({} sentences)", document.sentences.len());
+            } else if let Ok(documents) = array_doc_result {
                 for doc in &documents {
                     total_sentences += doc.sentences.len();
                     engine.add_document(doc)?;
                     total_docs += 1;
+                }
+                println!("    ✓ Successfully indexed as array of {} documents ({} total sentences)", documents.len(), total_sentences);
+            } else {
+                eprintln!("    ✗ ERROR: Failed to parse {} as Document or Vec<Document>", path.display());
+                if let Err(e) = single_doc_result {
+                    eprintln!("      Single document parse error: {}", e);
+                    // Try to show a snippet of the error
+                    if let Some(serde_error) = e.source() {
+                        eprintln!("      Root cause: {}", serde_error);
+                    }
+                }
+                if let Err(e) = array_doc_result {
+                    eprintln!("      Array parse error: {}", e);
+                    if let Some(serde_error) = e.source() {
+                        eprintln!("      Root cause: {}", serde_error);
+                    }
                 }
             }
         }
@@ -140,6 +163,76 @@ fn main() -> Result<()> {
     println!("\n  Documents indexed: {}", total_docs);
     println!("  Total sentences: {}", total_sentences);
     println!("  Index size (docs): {}", engine.num_docs());
+
+    // Debug: Check if basic term search works
+    println!("\n=== Debug: Testing basic Tantivy search ===");
+    {
+        let searcher = engine.searcher();
+        let schema = engine.schema();
+
+        // Try to find "John" in the word field
+        if let Ok(word_field) = schema.get_field("word") {
+            // Test with words that don't exist
+            let term = tantivy::Term::from_field_text(word_field, "John");
+            let term_query = tantivy::query::TermQuery::new(term.clone(), tantivy::schema::IndexRecordOption::Basic);
+
+            match searcher.search(&term_query, &tantivy::collector::Count) {
+                Ok(count) => println!("  Raw TermQuery for 'John' in word field: {} hits", count),
+                Err(e) => println!("  Raw TermQuery error: {}", e),
+            }
+
+            // Also try lowercase
+            let term_lower = tantivy::Term::from_field_text(word_field, "john");
+            let term_query_lower = tantivy::query::TermQuery::new(term_lower, tantivy::schema::IndexRecordOption::Basic);
+
+            match searcher.search(&term_query_lower, &tantivy::collector::Count) {
+                Ok(count) => println!("  Raw TermQuery for 'john' (lowercase): {} hits", count),
+                Err(e) => println!("  Raw TermQuery error: {}", e),
+            }
+
+            // Test with words that SHOULD exist in the document
+            for test_word in &["The", "TAZ", "interacts", "ROOT", "MID"] {
+                let term = tantivy::Term::from_field_text(word_field, test_word);
+                let term_query = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+                match searcher.search(&term_query, &tantivy::collector::Count) {
+                    Ok(count) => println!("  Raw TermQuery for '{}': {} hits", test_word, count),
+                    Err(e) => println!("  Raw TermQuery for '{}' error: {}", test_word, e),
+                }
+            }
+
+            // Try to see what terms exist in the first document
+            if engine.num_docs() > 0 {
+                let doc_address = tantivy::DocAddress::new(0, 0);
+                if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(doc_address) {
+                    println!("  First document word field values:");
+                    for value in doc.get_all(word_field) {
+                        if let Some(text) = value.as_str() {
+                            println!("    Raw stored value: '{}'", text);
+                            // Decode the position-aware format
+                            let tokens: Vec<&str> = text.split('|').collect();
+                            println!("    Decoded tokens: {:?}", tokens);
+                        }
+                    }
+                }
+            }
+
+            // Try to test with position-aware tokenizer directly
+            println!("  Testing position-aware tokenizer behavior...");
+            use rustie::tantivy_integration::position_tokenizer::PositionAwareTokenTokenizer;
+            let mut tokenizer = PositionAwareTokenTokenizer;
+            for test_text in &["The", "The|transcriptional|TAZ"] {
+                let mut stream = tokenizer.token_stream(test_text);
+                println!("    Tokenizing '{}':", test_text);
+                let mut pos = 0;
+                while stream.advance() {
+                    let token = stream.token();
+                    println!("      Position {}: '{}'", token.position, token.text);
+                    pos += 1;
+                    if pos > 10 { break; } // Limit output
+                }
+            }
+        }
+    }
 
     println!("\n=== Phase 2: Running Test Cases ===\n");
 
@@ -262,52 +355,52 @@ fn get_test_cases() -> Vec<TestCase> {
     vec![
         // === Basic Exact Match ===
         TestCase {
-            name: "exact_word_john",
-            query: "[word=John]",
+            name: "exact_word_taz",
+            query: "[word=TAZ]",
             category: TestCategory::BasicExactMatch,
             expected_min_hits: 1,
-            description: "Find exact word 'John'",
+            description: "Find exact word 'TAZ'",
         },
         TestCase {
-            name: "exact_word_cat",
-            query: "[word=cat]",
+            name: "exact_word_family",
+            query: "[word=family]",
             category: TestCategory::BasicExactMatch,
             expected_min_hits: 1,
-            description: "Find exact word 'cat'",
+            description: "Find exact word 'family'",
         },
         TestCase {
-            name: "exact_pos_vbd",
-            query: "[pos=VBD]",
+            name: "exact_pos_vbz",
+            query: "[tag=VBZ]",
             category: TestCategory::BasicExactMatch,
             expected_min_hits: 1,
-            description: "Find past tense verbs",
+            description: "Find present tense verbs",
         },
         TestCase {
-            name: "exact_lemma_discover",
-            query: "[lemma=discover]",
+            name: "exact_lemma_interact",
+            query: "[lemma=interact]",
             category: TestCategory::BasicExactMatch,
             expected_min_hits: 1,
-            description: "Find lemma 'discover'",
+            description: "Find lemma 'interact'",
         },
 
         // === Basic Regex Match ===
         TestCase {
             name: "regex_word_pattern",
-            query: "[word=/J.*/]",
+            query: "[word=/T.*/]",
             category: TestCategory::BasicRegex,
             expected_min_hits: 1,
-            description: "Find words starting with J",
+            description: "Find words starting with T",
         },
         TestCase {
             name: "regex_pos_verb",
-            query: "[pos=/VB.*/]",
+            query: "[tag=/VB.*/]",
             category: TestCategory::BasicRegex,
             expected_min_hits: 1,
             description: "Find any verb POS tag",
         },
         TestCase {
             name: "regex_pos_noun",
-            query: "[pos=/NN.*/]",
+            query: "[tag=/NN.*/]",
             category: TestCategory::BasicRegex,
             expected_min_hits: 1,
             description: "Find any noun POS tag",
@@ -323,62 +416,62 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Boolean AND ===
         TestCase {
             name: "bool_and_pos_word",
-            query: "[pos=NNP & word=John]",
+            query: "[tag=NNP & word=TAZ]",
             category: TestCategory::BooleanAnd,
             expected_min_hits: 1,
-            description: "Find proper noun 'John'",
+            description: "Find proper noun 'TAZ'",
         },
         TestCase {
             name: "bool_and_pos_lemma",
-            query: "[pos=VBZ & lemma=eat]",
+            query: "[tag=VBZ & lemma=interact]",
             category: TestCategory::BooleanAnd,
             expected_min_hits: 1,
-            description: "Find present tense verb 'eat'",
+            description: "Find present tense verb 'interact'",
         },
 
         // === Boolean OR ===
         TestCase {
             name: "bool_or_words",
-            query: "[word=John | word=Mary]",
+            query: "[word=TAZ | word=ROOT]",
             category: TestCategory::BooleanOr,
             expected_min_hits: 1,
-            description: "Find 'John' or 'Mary'",
+            description: "Find 'TAZ' or 'ROOT'",
         },
         TestCase {
             name: "bool_or_pos",
-            query: "[pos=VBD | pos=VBZ]",
+            query: "[tag=NN | tag=VBZ]",
             category: TestCategory::BooleanOr,
             expected_min_hits: 1,
-            description: "Find past or present tense verbs",
+            description: "Find nouns or present tense verbs",
         },
 
         // === Boolean NOT ===
         TestCase {
             name: "bool_not_lemma",
-            query: "[pos=NN & !lemma=cat]",
+            query: "[tag=NN & !lemma=family]",
             category: TestCategory::BooleanNot,
             expected_min_hits: 1,
-            description: "Find nouns that are not 'cat'",
+            description: "Find nouns that are not 'family'",
         },
 
         // === Sequence Simple ===
         TestCase {
             name: "seq_simple_det_noun",
-            query: "[pos=DT] [pos=NN]",
+            query: "[tag=DT] [tag=NN]",
             category: TestCategory::SequenceSimple,
             expected_min_hits: 1,
             description: "Find determiner followed by noun",
         },
         TestCase {
             name: "seq_simple_adj_noun",
-            query: "[pos=JJ] [pos=NN]",
+            query: "[tag=JJ] [tag=NN]",
             category: TestCategory::SequenceSimple,
             expected_min_hits: 1,
             description: "Find adjective followed by noun",
         },
         TestCase {
             name: "seq_simple_subj_verb",
-            query: "[pos=NNP] [pos=VBZ]",
+            query: "[tag=NNP] [tag=VBZ]",
             category: TestCategory::SequenceSimple,
             expected_min_hits: 1,
             description: "Find proper noun followed by verb",
@@ -387,14 +480,14 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Sequence Quantifier + ===
         TestCase {
             name: "seq_plus_adj",
-            query: "[pos=JJ]+ [pos=NN]",
+            query: "[tag=JJ]+ [tag=NN]",
             category: TestCategory::SequenceQuantifierPlus,
             expected_min_hits: 0,
             description: "Find one or more adjectives followed by noun (quantifier+ may have limited support)",
         },
         TestCase {
             name: "seq_plus_adv",
-            query: "[pos=RB]+ [pos=VBD]",
+            query: "[tag=RB]+ [tag=VBD]",
             category: TestCategory::SequenceQuantifierPlus,
             expected_min_hits: 0,
             description: "Find one or more adverbs followed by past verb",
@@ -403,7 +496,7 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Sequence Quantifier * ===
         TestCase {
             name: "seq_star_adj",
-            query: "[pos=DT] [pos=JJ]* [pos=NN]",
+            query: "[tag=DT] [tag=JJ]* [tag=NN]",
             category: TestCategory::SequenceQuantifierStar,
             expected_min_hits: 1,
             description: "Find det + optional adjectives + noun",
@@ -412,7 +505,7 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Sequence Quantifier ? ===
         TestCase {
             name: "seq_optional_det",
-            query: "[pos=DT]? [pos=NN]",
+            query: "[tag=DT]? [tag=NN]",
             category: TestCategory::SequenceQuantifierOptional,
             expected_min_hits: 1,
             description: "Find optional determiner + noun",
@@ -421,7 +514,7 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Sequence Quantifier {m,n} ===
         TestCase {
             name: "seq_range_adj",
-            query: "[pos=JJ]{1,3} [pos=NN]",
+            query: "[tag=JJ]{1,3} [tag=NN]",
             category: TestCategory::SequenceQuantifierRange,
             expected_min_hits: 0,
             description: "Find 1-3 adjectives followed by noun (range quantifier may have limited support)",
@@ -429,101 +522,108 @@ fn get_test_cases() -> Vec<TestCase> {
 
         // === Graph Outgoing ===
         // Graph traversal works with any field (word, pos, lemma, entity, etc.)
+        // Based on edges: [2, 3, "nsubj"] means TAZ (pos 2) has nsubj to interacts (pos 3)
+        // But wait, that's backwards - [2, 3, "nsubj"] means from 2 to 3 with label nsubj
+        // So TAZ (2) has nsubj edge TO interacts (3), meaning interacts is subject of TAZ
+        // Actually, looking at the edges more carefully: [2, 3, "nsubj"] means from token 2 to token 3
+        // So we need to check: [word=interacts] >nsubj [word=TAZ] or [word=TAZ] >nsubj [word=interacts]?
+        // The edge [2, 3, "nsubj"] means token 2 (TAZ) has an nsubj edge pointing to token 3 (interacts)
+        // So TAZ >nsubj interacts means "TAZ has interacts as its subject"
         TestCase {
             name: "graph_out_nsubj_word",
-            query: "[word=eats] >nsubj [word=John]",
+            query: "[word=TAZ] >nsubj [word=interacts]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'eats' with John as subject (word field)",
+            description: "Find 'TAZ' with interacts as subject (word field)",
         },
         TestCase {
-            name: "graph_out_dobj_word",
-            query: "[word=eats] >dobj [word=pizza]",
+            name: "graph_out_amod_word",
+            query: "[word=TAZ] >amod [word=transcriptional]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'eats' with pizza as direct object (word field)",
+            description: "Find 'TAZ' with transcriptional as amod (word field)",
         },
         TestCase {
             name: "graph_out_nsubj_pos",
-            query: "[pos=/VB.*/] >nsubj [pos=/NN.*/]",
+            query: "[tag=/VB.*/] >nsubj [tag=/NN.*/]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
             description: "Find verbs with noun subjects (pos field)",
         },
         TestCase {
-            name: "graph_out_dobj_pos",
-            query: "[pos=/VB.*/] >dobj [pos=/NN.*/]",
+            name: "graph_out_amod_pos",
+            query: "[tag=NNP] >amod [tag=JJ]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find verbs with noun objects (pos field)",
+            description: "Find proper nouns with adjective modifiers (pos field)",
         },
         TestCase {
             name: "graph_out_lemma",
-            query: "[lemma=eat] >dobj [lemma=pizza]",
+            query: "[lemma=taz] >amod [lemma=transcriptional]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'eat' lemma with 'pizza' as object (lemma field)",
+            description: "Find 'taz' lemma with 'transcriptional' as amod (lemma field)",
         },
         TestCase {
-            name: "graph_out_nsubj_cat",
-            query: "[word=sleeps] >nsubj [word=cat]",
+            name: "graph_out_rel1",
+            query: "[word=ROOT] >rel1 [word=MID]",
             category: TestCategory::GraphOutgoing,
             expected_min_hits: 1,
-            description: "Find 'sleeps' with cat as subject",
+            description: "Find 'ROOT' with MID as rel1",
         },
 
         // === Graph Incoming ===
         TestCase {
             name: "graph_in_nsubj",
-            query: "[word=John] <nsubj [word=eats]",
+            query: "[word=interacts] <nsubj [word=TAZ]",
             category: TestCategory::GraphIncoming,
             expected_min_hits: 1,
-            description: "Find John as subject of eats",
+            description: "Find interacts as subject of TAZ",
         },
         TestCase {
-            name: "graph_in_dobj",
-            query: "[word=pizza] <dobj [word=eats]",
+            name: "graph_in_amod",
+            query: "[word=transcriptional] <amod [word=TAZ]",
             category: TestCategory::GraphIncoming,
             expected_min_hits: 1,
-            description: "Find pizza as object of eats",
+            description: "Find transcriptional as amod of TAZ",
         },
 
         // === Graph Wildcard ===
         TestCase {
             name: "graph_wildcard_out",
-            query: "[word=eats] >> [word=John]",
+            query: "[word=TAZ] >> [word=interacts]",
             category: TestCategory::GraphWildcard,
             expected_min_hits: 0,
-            description: "Find any outgoing edge from eats (wildcard may not be fully supported)",
+            description: "Find any outgoing edge from TAZ (wildcard may not be fully supported)",
         },
         TestCase {
             name: "graph_wildcard_in",
-            query: "[word=pizza] << [word=eats]",
+            query: "[word=transcriptional] << [word=TAZ]",
             category: TestCategory::GraphWildcard,
             expected_min_hits: 0,
-            description: "Find any incoming edge to pizza from eats",
+            description: "Find any incoming edge to transcriptional from TAZ",
         },
 
         // === Graph Disjunctive ===
         TestCase {
             name: "graph_disj_subj",
-            query: "[word=eats] >nsubj|dobj [word=John]",
+            query: "[word=TAZ] >nsubj|amod [word=interacts]",
             category: TestCategory::GraphDisjunctive,
             expected_min_hits: 0,
-            description: "Find eats with John as subject or object (disjunctive traversal)",
+            description: "Find TAZ with interacts as subject or amod (disjunctive traversal)",
         },
 
         // === Named Capture ===
         TestCase {
             name: "named_capture_verb",
-            query: "(?<verb>[pos=/VB.*/])",
+            query: "(?<verb>[tag=/VB.*/])",
             category: TestCategory::NamedCapture,
             expected_min_hits: 1,
             description: "Capture verbs with name 'verb'",
         },
         TestCase {
             name: "named_capture_noun",
-            query: "(?<noun>[pos=NN])",
+            query: "(?<noun>[tag=NN])",
             category: TestCategory::NamedCapture,
             expected_min_hits: 1,
             description: "Capture nouns with name 'noun'",
@@ -532,23 +632,23 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Lookahead ===
         TestCase {
             name: "lookahead_positive",
-            query: "[pos=VBZ] (?=[word=pizza])",
+            query: "[tag=VBZ] (?=[word=family])",
             category: TestCategory::Lookahead,
             expected_min_hits: 0,
-            description: "Find verb followed by 'pizza'",
+            description: "Find verb followed by 'family'",
         },
         TestCase {
             name: "lookahead_negative",
-            query: "[pos=VBZ] (?![word=pizza])",
+            query: "[tag=VBZ] (?![word=family])",
             category: TestCategory::Lookahead,
             expected_min_hits: 1,
-            description: "Find verb NOT followed by 'pizza'",
+            description: "Find verb NOT followed by 'family'",
         },
 
         // === Lookbehind ===
         TestCase {
             name: "lookbehind_positive",
-            query: "(?<= [pos=DT]) [pos=NN]",
+            query: "(?<= [tag=DT]) [tag=NN]",
             category: TestCategory::Lookbehind,
             expected_min_hits: 0,
             description: "Find noun preceded by determiner (may not be fully supported)",
@@ -557,24 +657,24 @@ fn get_test_cases() -> Vec<TestCase> {
         // === Complex Patterns ===
         TestCase {
             name: "complex_np_full",
-            query: "[pos=DT]? [pos=JJ]* [pos=NN]+",
+            query: "[tag=DT]? [tag=JJ]* [tag=NN]+",
             category: TestCategory::Complex,
             expected_min_hits: 1,
             description: "Full noun phrase pattern",
         },
         TestCase {
             name: "complex_verb_phrase",
-            query: "[pos=/VB.*/] [pos=DT]? [pos=JJ]* [pos=NN]",
+            query: "[tag=/VB.*/] [tag=DT]? [tag=JJ]* [tag=NN]",
             category: TestCategory::Complex,
             expected_min_hits: 1,
             description: "Verb followed by noun phrase",
         },
         TestCase {
             name: "complex_graph_chain",
-            query: "[word=eats] >nsubj [word=John]",
+            query: "[word=TAZ] >nsubj [word=interacts]",
             category: TestCategory::Complex,
             expected_min_hits: 1,
-            description: "Verb eats with John as subject",
+            description: "TAZ with interacts as subject",
         },
     ]
 }
@@ -613,7 +713,6 @@ fn print_category_summary(results: &[TestResult]) {
     categories.sort_by_key(|(name, _)| name.clone());
 
     for (category, (passed, total)) in categories {
-        let percentage = (passed * 100) / total.max(&1);
         let bar = create_progress_bar(*passed, *total, 20);
         println!("  {:<30} {} ({}/{})", category, bar, passed, total);
     }
@@ -633,9 +732,9 @@ fn create_progress_bar(value: usize, max: usize, width: usize) -> String {
 /// Run detailed analysis on selected queries
 fn run_detailed_analysis(engine: &ExtractorEngine) -> Result<()> {
     let analysis_queries = vec![
-        ("[word=John]", "Simple word match"),
-        ("[pos=DT] [pos=NN]", "Simple sequence"),
-        ("[word=eats] >nsubj [word=John]", "Graph traversal"),
+        ("[word=TAZ]", "Simple word match"),
+        ("[tag=DT] [tag=NN]", "Simple sequence"),
+        ("[word=TAZ] >nsubj [word=interacts]", "Graph traversal"),
     ];
 
     for (query, description) in analysis_queries {

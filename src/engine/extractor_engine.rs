@@ -64,6 +64,20 @@ impl ExtractorEngine {
         let (schema, output_fields) = Self::create_schema_from_yaml(schema_path)?;
         let dir = MmapDirectory::open(index_dir)?;
         let index = Index::open_or_create(dir, schema.clone())?;
+
+        // Register custom tokenizers for position-aware indexing (Odinson-style)
+        // 1. Edge tokenizer: for incoming_edges and outgoing_edges fields
+        index.tokenizers().register(
+            "edge_position_tokenizer",
+            crate::tantivy_integration::position_tokenizer::PositionAwareEdgeTokenizer,
+        );
+        // 2. Token tokenizer: for word, lemma, pos, tag, entity, etc.
+        index.tokenizers().register(
+            "token_position_tokenizer",
+            crate::tantivy_integration::position_tokenizer::PositionAwareTokenTokenizer,
+        );
+        log::info!("Registered position-aware tokenizers (edge and token)");
+
         let reader = index.reader()?;
         let writer = match index.writer(50_000_000) {
             Ok(w) => Some(w),
@@ -101,31 +115,60 @@ impl ExtractorEngine {
         if !path.exists() {
             return Err(anyhow!("Schema file not found: {}", path.display()));
         }
-        
+
         let yaml_str = fs::read_to_string(path)
             .map_err(|e| anyhow!("Failed to read schema file {}: {}", path.display(), e))?;
-        
+
         let config: SchemaConfig = serde_yaml::from_str(&yaml_str)
             .map_err(|e| anyhow!("Invalid YAML schema in {}: {}", path.display(), e))?;
-        
+
         let mut builder = tantivy::schema::Schema::builder();
         for field in config.fields {
             match field.field_type.as_str() {
                 "text" => {
-                    let options = if field.stored { 
-                        tantivy::schema::TEXT | tantivy::schema::STORED 
-                    } else { 
-                        tantivy::schema::TEXT 
-                    };
+                    // Index text fields with positions (like Odinson) for constraint prefiltering
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+                    let indexing = TextFieldIndexing::default()
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
                     builder.add_text_field(&field.name, options);
+                    log::debug!("Added text field '{}' with positions", field.name);
                 }
                 "string" => {
-                    let options = if field.stored { 
-                        tantivy::schema::STRING | tantivy::schema::STORED 
-                    } else { 
-                        tantivy::schema::STRING 
-                    };
+                    // Index string fields with positions (Odinson-style) for constraint prefiltering
+                    // String fields are token fields (word, tag, entity, etc.)
+                    // CRITICAL: Use position-aware tokenizer to ensure each token gets correct position
+                    // Input format: "John|eats|pizza" -> positions 0, 1, 2
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+                    let indexing = TextFieldIndexing::default()
+                        .set_tokenizer("token_position_tokenizer")  // Position-aware tokenizer
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
                     builder.add_text_field(&field.name, options);
+                    log::debug!("Added string field '{}' with position-aware tokenizer", field.name);
+                }
+                // New type: position-aware edge fields (Odinson-style)
+                // Uses custom tokenizer that preserves token positions
+                "edge_positions" => {
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+
+                    // Use position-aware indexing with custom tokenizer
+                    let indexing = TextFieldIndexing::default()
+                        .set_tokenizer("edge_position_tokenizer")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
+                    builder.add_text_field(&field.name, options);
+                    log::info!("Added position-aware edge field: {}", field.name);
                 }
                 "u64" => {
                     builder.add_u64_field(&field.name, tantivy::schema::STORED);
@@ -136,13 +179,16 @@ impl ExtractorEngine {
                 _ => return Err(anyhow!("Unknown field type in schema: {}", field.field_type)),
             }
         }
-        
+
         // Get output fields from config, with defaults if not specified
         let output_fields = config.output_fields.unwrap_or_else(|| {
             vec![FIELD_WORD.to_string(), FIELD_LEMMA.to_string(), FIELD_POS.to_string(), FIELD_ENTITY.to_string()]
         });
+
+        let schema = builder.build();
+        log::info!("Schema created: all text/string fields indexed with positions (Odinson-style)");
         
-        Ok((builder.build(), output_fields))
+        Ok((schema, output_fields))
     }
 
     /// Get the number of documents in the index
@@ -592,9 +638,10 @@ impl ExtractorEngine {
     }
 
     /// Extract multiple field values from a Tantivy document
+    /// For token fields (word, lemma, pos, etc.), decodes the position-aware format
     fn extract_field_values(&self, doc: &TantivyDocument, field_name: &str) -> Vec<String> {
         if let Ok(field) = self.schema.get_field(field_name) {
-            doc.get_all(field).filter_map(|value| {
+            let raw_values: Vec<String> = doc.get_all(field).filter_map(|value| {
                 if let Some(text) = value.as_str() {
                     Some(text.to_string())
                 } else if let Some(u64_val) = value.as_u64() {
@@ -602,7 +649,18 @@ impl ExtractorEngine {
                 } else {
                     None
                 }
-            }).collect()
+            }).collect();
+
+            // For token fields stored in position-aware format (e.g., "John|eats|pizza"),
+            // decode by splitting on | to get individual tokens
+            // These fields use the position-aware encoding
+            let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
+            if token_fields.contains(&field_name) && raw_values.len() == 1 {
+                // Single encoded string - decode it
+                raw_values[0].split('|').map(|s| s.to_string()).collect()
+            } else {
+                raw_values
+            }
         } else {
             Vec::new()
         }
