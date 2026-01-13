@@ -138,19 +138,16 @@ pub async fn simple_query(
     )
 )]
 pub async fn index_stats(engine: web::Data<ExtractorEngine>) -> Result<HttpResponse> {
+    // Dynamically get field names from the schema
+    let fields: Vec<String> = engine.schema()
+        .fields()
+        .map(|(_field, entry)| entry.name().to_string())
+        .collect();
+
     Ok(HttpResponse::Ok().json(StatsResponse {
         total_docs: engine.num_docs(),
         index_path: "index".to_string(),
-        fields: vec![
-            "word".to_string(),
-            "lemma".to_string(),
-            "pos".to_string(),
-            "tag".to_string(),
-            "doc_id".to_string(),
-            "sentence_id".to_string(),
-            "sentence_length".to_string(),
-            "dependencies".to_string()
-        ],
+        fields,
     }))
 }
 

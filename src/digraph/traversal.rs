@@ -413,17 +413,17 @@ impl GraphTraversal {
         memo[idx] = true; // Mark as visiting
         match &pattern[step_idx] {
             FlatPatternStep::Constraint(constraint_pat) => {
-                // Use the correct tokens for this constraint step
-                let count = constraint_fields_and_tokens.iter()
-                    .take(step_idx + 1)
-                    .filter(|(f, _)| !f.is_empty())
+                // Count the number of Constraint steps in pattern[0..step_idx] to get the correct index
+                // into constraint_fields_and_tokens (which only contains Constraint entries, not Traversals)
+                let constraint_idx = pattern[..step_idx].iter()
+                    .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
                     .count();
-                if count == 0 {
-                    log::debug!("No valid constraint fields at step {}", step_idx);
+
+                if constraint_idx >= constraint_fields_and_tokens.len() {
+                    log::debug!("Constraint index {} out of bounds (len={})", constraint_idx, constraint_fields_and_tokens.len());
                     memo[idx] = false; // Backtrack
                     return;
                 }
-                let constraint_idx = count - 1;
                 let (field_name, tokens) = &constraint_fields_and_tokens[constraint_idx];
                 if let crate::compiler::ast::Pattern::Constraint(constraint) = constraint_pat {
                     if let Some(token) = tokens.get(node) {

@@ -4,8 +4,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: String,
-    pub metadata: Vec<String>,
+    pub metadata: Vec<MetadataField>,
     pub sentences: Vec<Sentence>,
+}
+
+/// Represents a metadata field in Odinson format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+pub enum MetadataField {
+    #[serde(rename = "ai.lum.odinson.TokensField")]
+    TokensField {
+        name: String,
+        tokens: Vec<String>,
+    },
 }
 
 /// Represents a single sentence with its fields
