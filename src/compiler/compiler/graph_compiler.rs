@@ -4,7 +4,7 @@ use tantivy::{
 };
 use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
-use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern};
+use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec};
 use crate::compiler::compiler::basic_compiler::BasicCompiler;
 
 /// Compiler for graph traversal patterns
@@ -55,6 +55,122 @@ impl GraphCompiler {
                 constraints.push(pattern.clone());
             }
         }
+    }
+
+    /// Try to build a CollapsedSpec for Odinson-style index-level position filtering.
+    /// Returns None if the constraint or traversal is not suitable for collapsing.
+    /// 
+    /// Rules:
+    /// - Constraint must be exact string matcher (not regex, not wildcard)
+    /// - Traversal must be simple Incoming/Outgoing with exact label (not wildcard, disjunction)
+    /// - For first constraint: use the first traversal step
+    /// - For last constraint: use the last traversal step
+    fn try_build_collapse_spec(
+        &self,
+        flat_steps: &[FlatPatternStep],
+        is_first: bool,
+        incoming_edges_field: Field,
+        outgoing_edges_field: Field,
+    ) -> Option<CollapsedSpec> {
+        // Count constraints to identify positions
+        let constraint_indices: Vec<usize> = flat_steps.iter().enumerate()
+            .filter(|(_, s)| matches!(s, FlatPatternStep::Constraint(_)))
+            .map(|(i, _)| i)
+            .collect();
+        
+        if constraint_indices.is_empty() {
+            return None;
+        }
+        
+        let total_constraints = constraint_indices.len();
+        let (constraint_step_idx, traversal_step_idx, constraint_idx) = if is_first {
+            // First constraint and the traversal after it
+            let c_idx = constraint_indices[0];
+            let t_idx = c_idx + 1; // Traversal is right after first constraint
+            (c_idx, t_idx, 0usize)
+        } else {
+            // Last constraint and the traversal before it
+            let c_idx = *constraint_indices.last()?;
+            let t_idx = c_idx.checked_sub(1)?; // Traversal is right before last constraint
+            (c_idx, t_idx, total_constraints - 1)
+        };
+        
+        // Get the constraint pattern - must be exact string matcher
+        let constraint_step = flat_steps.get(constraint_step_idx)?;
+        let (constraint_field_name, constraint_term) = match constraint_step {
+            FlatPatternStep::Constraint(Pattern::Constraint(
+                Constraint::Field { name, matcher: Matcher::String(term) }
+            )) => (name.clone(), term.clone()),
+            FlatPatternStep::Constraint(Pattern::NamedCapture { pattern, .. }) => {
+                // Unwrap named capture to get underlying constraint
+                match pattern.as_ref() {
+                    Pattern::Constraint(Constraint::Field { name, matcher: Matcher::String(term) }) => {
+                        (name.clone(), term.clone())
+                    }
+                    _ => return None, // Can't collapse
+                }
+            }
+            _ => return None, // Can't collapse regex/wildcard
+        };
+        
+        // Get the traversal - must be simple Incoming/Outgoing with exact label
+        let traversal_step = flat_steps.get(traversal_step_idx)?;
+        let (edge_field, edge_label) = match traversal_step {
+            FlatPatternStep::Traversal(Traversal::Incoming(Matcher::String(label))) => {
+                // Incoming edge: constraint node must have incoming edge
+                (incoming_edges_field, label.clone())
+            }
+            FlatPatternStep::Traversal(Traversal::Outgoing(Matcher::String(label))) => {
+                if is_first {
+                    // First constraint with outgoing: constraint node needs outgoing edge
+                    (outgoing_edges_field, label.clone())
+                } else {
+                    // Last constraint with outgoing (going TO it): constraint node needs incoming edge
+                    (incoming_edges_field, label.clone())
+                }
+            }
+            FlatPatternStep::Traversal(Traversal::Concatenated(traversals)) => {
+                // For concatenated traversals, extract the outermost edge
+                let relevant_trav = if is_first {
+                    traversals.first()
+                } else {
+                    traversals.last()
+                };
+                match relevant_trav {
+                    Some(Traversal::Incoming(Matcher::String(label))) => {
+                        (incoming_edges_field, label.clone())
+                    }
+                    Some(Traversal::Outgoing(Matcher::String(label))) => {
+                        if is_first {
+                            (outgoing_edges_field, label.clone())
+                        } else {
+                            (incoming_edges_field, label.clone())
+                        }
+                    }
+                    _ => return None, // Can't collapse
+                }
+            }
+            _ => return None, // Can't collapse wildcards/disjunctions/optional
+        };
+        
+        // Get constraint field
+        let constraint_field = self.schema.get_field(&constraint_field_name).ok()?;
+        
+        log::info!(
+            "Built CollapsedSpec for {} constraint: field='{}' term='{}' edge_label='{}'",
+            if is_first { "first" } else { "last" },
+            constraint_field_name,
+            constraint_term,
+            edge_label
+        );
+        
+        Some(CollapsedSpec {
+            constraint_field,
+            constraint_term,
+            edge_field,
+            edge_label,
+            constraint_idx,
+        })
     }
 
     fn compile_graph_traversal(&self, src: &Pattern, traversal: &Traversal, dst: &Pattern) -> Result<Box<dyn Query>> {
@@ -158,10 +274,32 @@ impl GraphCompiler {
         let default_field = self.schema.get_field("word")
             .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
 
+        // Try to build collapse specs for Odinson-style index-level position filtering
+        let src_collapse = self.try_build_collapse_spec(
+            &flat_steps,
+            true,  // first constraint
+            incoming_edges_field,
+            outgoing_edges_field,
+        );
+        let dst_collapse = self.try_build_collapse_spec(
+            &flat_steps,
+            false, // last constraint
+            incoming_edges_field,
+            outgoing_edges_field,
+        );
+        
+        if src_collapse.is_some() || dst_collapse.is_some() {
+            log::info!(
+                "Odinson-style collapsed query optimization enabled: src={}, dst={}",
+                src_collapse.is_some(),
+                dst_collapse.is_some()
+            );
+        }
+
         // Pass the combined query as BOTH src_query and dst_query
         // The OptimizedGraphTraversalQuery will use combined_query for initial filtering
         // Then the full pattern is used for graph traversal verification
-        Ok(Box::new(OptimizedGraphTraversalQuery::new(
+        Ok(Box::new(OptimizedGraphTraversalQuery::with_collapse_specs(
             default_field,
             dependencies_binary_field,
             incoming_edges_field,
@@ -171,6 +309,8 @@ impl GraphCompiler {
             combined_query,              // Use same combined query for dst filtering
             src.clone(),
             dst.clone(),
+            src_collapse,
+            dst_collapse,
         )))
     }
 } 
