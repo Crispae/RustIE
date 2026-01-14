@@ -50,3 +50,10 @@ path = "src/bin/create_gzip.rs"
 [[bin]]
 name = "create_test_index"
 path = "src/bin/create_test_index.rs"
+
+[[bin]]
+name = "profile_query"
+path = "src/bin/profile_query.rs"
+
+[profile.release]
+debug = true

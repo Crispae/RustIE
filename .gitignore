@@ -35,3 +35,5 @@ debug.log
 odinson-bare-api/
 test_api_index
 test_index
+PROFILING.md
+profile.json.gz

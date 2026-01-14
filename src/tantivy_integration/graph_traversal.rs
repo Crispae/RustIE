@@ -565,8 +565,8 @@ impl OptimizedGraphTraversalScorer {
 
             match &mut allowed[req.constraint_idx] {
                 None => {
-                    // First restriction: take positions
-                    allowed[req.constraint_idx] = Some(buf.clone());
+                    // First restriction: take positions (move instead of clone)
+                    allowed[req.constraint_idx] = Some(std::mem::take(&mut buf));
                 }
                 Some(existing) => {
                     // Intersect existing with buf
@@ -608,8 +608,8 @@ impl OptimizedGraphTraversalScorer {
             // Intersect constraint positions with existing allowed positions (from edges)
             match &mut allowed[req.constraint_idx] {
                 None => {
-                    // No edge restriction yet - take constraint positions
-                    allowed[req.constraint_idx] = Some(buf.clone());
+                    // No edge restriction yet - take constraint positions (move instead of clone)
+                    allowed[req.constraint_idx] = Some(std::mem::take(&mut buf));
                 }
                 Some(existing) => {
                     // Intersect: only positions that have BOTH the edge AND the constraint term
@@ -678,12 +678,13 @@ impl OptimizedGraphTraversalScorer {
 
         // Phase 2: Extract tokens ONLY for constraint fields that need regex checking
         // Skip extraction if allowed_positions is tiny and we can use it directly
-        let mut constraint_fields_and_tokens: Vec<(String, Vec<String>)> =
+        // Note: We reuse self.constraint_field_names directly instead of cloning field names
+        let mut constraint_tokens: Vec<Vec<String>> =
             Vec::with_capacity(self.constraint_field_names.len());
-        
+
         for field_name in &self.constraint_field_names {
             let tokens = self.extract_tokens_from_field(&doc, field_name);
-            constraint_fields_and_tokens.push((field_name.clone(), tokens));
+            constraint_tokens.push(tokens);
         }
 
         // Phase 3: Check constraints with position restrictions
@@ -692,12 +693,12 @@ impl OptimizedGraphTraversalScorer {
 
         for step in flat_steps.iter() {
             if let FlatPatternStep::Constraint(constraint_pat) = step {
-                if constraint_count >= constraint_fields_and_tokens.len() {
+                if constraint_count >= constraint_tokens.len() {
                     GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
 
-                let (_, tokens) = &constraint_fields_and_tokens[constraint_count];
+                let tokens = &constraint_tokens[constraint_count];
                 let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
                 
                 let is_wildcard = matches!(
@@ -762,16 +763,16 @@ impl OptimizedGraphTraversalScorer {
         }
 
         // Phase 5: Run traversal
-        let src_positions = cached_positions.get(0).cloned().unwrap_or_default();
+        let src_positions: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
         if constraint_count > 0 && src_positions.is_empty() {
             return false;
         }
 
         let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
         
-        for &src_pos in &src_positions {
+        for &src_pos in src_positions {
             let all_paths = traversal_engine.automaton_query_paths(
-                flat_steps, &[src_pos], &constraint_fields_and_tokens
+                flat_steps, &[src_pos], &self.constraint_field_names, &constraint_tokens
             );
             
             for path in &all_paths {

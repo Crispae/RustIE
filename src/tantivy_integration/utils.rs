@@ -20,7 +20,14 @@ pub fn extract_field_values(schema: &Schema, doc: &TantivyDocument, field_name: 
         let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
         if token_fields.contains(&field_name) && raw_values.len() == 1 {
             // Single encoded string - decode it
-            raw_values[0].split('|').map(|s| s.to_string()).collect()
+            // Pre-calculate capacity to avoid reallocations during iteration
+            let encoded = &raw_values[0];
+            let token_count = encoded.matches('|').count() + 1;
+            let mut tokens = Vec::with_capacity(token_count);
+            for s in encoded.split('|') {
+                tokens.push(s.to_string());
+            }
+            tokens
         } else {
             raw_values
         }
