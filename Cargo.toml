@@ -22,6 +22,7 @@ clap = { version = "4.0", features = ["derive"] }
 tempfile = "3.8"
 indicatif = "0.17"
 rand = "0.8"
+rayon = "1.10"
 pest = "2.7"
 pest_derive = "2.7"
 utoipa = { version = "4", features = ["actix_extras"] }
@@ -50,3 +51,10 @@ path = "src/bin/create_gzip.rs"
 [[bin]]
 name = "create_test_index"
 path = "src/bin/create_test_index.rs"
+
+[[bin]]
+name = "profile_query"
+path = "src/bin/profile_query.rs"
+
+[profile.release]
+debug = true

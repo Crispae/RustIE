@@ -320,11 +320,17 @@ impl DocumentIndexer {
         // Update statistics
         self.stats.total_sentences += document.sentences.len();
         
-        for (sentence_idx, sentence) in document.sentences.iter().enumerate() {
+        for (sentence_idx, _sentence) in document.sentences.iter().enumerate() {
+            // Count tokens
             if let Some(tokens_field) = document.get_field(sentence_idx, "word") {
                 if let Field::TokensField { tokens, .. } = tokens_field {
                     self.stats.total_tokens += tokens.len();
                 }
+            }
+            
+            // Count dependency labels (edges)
+            if let Some(deps) = document.get_dependencies(sentence_idx) {
+                self.stats.total_dependency_labels += deps.edges.len();
             }
         }
 

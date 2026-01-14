@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 // Import from tantivy
 use tantivy::{
     doc, Index, IndexReader, IndexWriter,
@@ -14,6 +15,7 @@ use tantivy::{
 };
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
+use rayon::prelude::*;
 
 // Field name constants for consistency across the codebase
 pub const FIELD_WORD: &str = "word";
@@ -24,6 +26,8 @@ pub const FIELD_SENTENCE_LENGTH: &str = "sentence_length";
 pub const FIELD_DEPENDENCIES_BINARY: &str = "dependencies_binary";
 pub const FIELD_DOC_ID: &str = "doc_id";
 pub const FIELD_SENTENCE_ID: &str = "sentence_id";
+pub const FIELD_INCOMING_EDGES: &str = "incoming_edges";
+pub const FIELD_OUTGOING_EDGES: &str = "outgoing_edges";
 
 #[derive(Debug, Deserialize)]
 pub struct SchemaConfig {
@@ -48,6 +52,8 @@ pub struct ExtractorEngine {
     default_field: Field, // Can be directly used from schema
     sentence_length_field: Field, // Can be directly used from schema
     dependencies_binary_field: Field, // Can be directly used from schema
+    incoming_edges_field: Field,
+    outgoing_edges_field: Field,
     parent_doc_id_field: String, // Can be directly used from schema
     output_fields: Vec<String>, // Can be directly used from schema
 }
@@ -60,6 +66,20 @@ impl ExtractorEngine {
         let (schema, output_fields) = Self::create_schema_from_yaml(schema_path)?;
         let dir = MmapDirectory::open(index_dir)?;
         let index = Index::open_or_create(dir, schema.clone())?;
+
+        // Register custom tokenizers for position-aware indexing (Odinson-style)
+        // 1. Edge tokenizer: for incoming_edges and outgoing_edges fields
+        index.tokenizers().register(
+            "edge_position_tokenizer",
+            crate::tantivy_integration::position_tokenizer::PositionAwareEdgeTokenizer,
+        );
+        // 2. Token tokenizer: for word, lemma, pos, tag, entity, etc.
+        index.tokenizers().register(
+            "token_position_tokenizer",
+            crate::tantivy_integration::position_tokenizer::PositionAwareTokenTokenizer,
+        );
+        log::info!("Registered position-aware tokenizers (edge and token)");
+
         let reader = index.reader()?;
         let writer = match index.writer(50_000_000) {
             Ok(w) => Some(w),
@@ -73,6 +93,8 @@ impl ExtractorEngine {
         let default_field = schema.get_field(FIELD_WORD).map_err(|_| anyhow!("Default field '{}' not found in schema", FIELD_WORD))?;
         let sentence_length_field = schema.get_field(FIELD_SENTENCE_LENGTH).map_err(|_| anyhow!("Sentence length field '{}' not found in schema", FIELD_SENTENCE_LENGTH))?;
         let dependencies_binary_field = schema.get_field(FIELD_DEPENDENCIES_BINARY).map_err(|_| anyhow!("Dependencies binary field '{}' not found in schema", FIELD_DEPENDENCIES_BINARY))?;
+        let incoming_edges_field = schema.get_field(FIELD_INCOMING_EDGES).map_err(|_| anyhow!("Incoming edges field '{}' not found in schema", FIELD_INCOMING_EDGES))?;
+        let outgoing_edges_field = schema.get_field(FIELD_OUTGOING_EDGES).map_err(|_| anyhow!("Outgoing edges field '{}' not found in schema", FIELD_OUTGOING_EDGES))?;
 
         Ok(Self {
             index,
@@ -82,6 +104,8 @@ impl ExtractorEngine {
             default_field,
             sentence_length_field,
             dependencies_binary_field,
+            incoming_edges_field,
+            outgoing_edges_field,
             parent_doc_id_field: FIELD_DOC_ID.to_string(),
             output_fields,
         })
@@ -93,31 +117,60 @@ impl ExtractorEngine {
         if !path.exists() {
             return Err(anyhow!("Schema file not found: {}", path.display()));
         }
-        
+
         let yaml_str = fs::read_to_string(path)
             .map_err(|e| anyhow!("Failed to read schema file {}: {}", path.display(), e))?;
-        
+
         let config: SchemaConfig = serde_yaml::from_str(&yaml_str)
             .map_err(|e| anyhow!("Invalid YAML schema in {}: {}", path.display(), e))?;
-        
+
         let mut builder = tantivy::schema::Schema::builder();
         for field in config.fields {
             match field.field_type.as_str() {
                 "text" => {
-                    let options = if field.stored { 
-                        tantivy::schema::TEXT | tantivy::schema::STORED 
-                    } else { 
-                        tantivy::schema::TEXT 
-                    };
+                    // Index text fields with positions (like Odinson) for constraint prefiltering
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+                    let indexing = TextFieldIndexing::default()
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
                     builder.add_text_field(&field.name, options);
+                    log::debug!("Added text field '{}' with positions", field.name);
                 }
                 "string" => {
-                    let options = if field.stored { 
-                        tantivy::schema::STRING | tantivy::schema::STORED 
-                    } else { 
-                        tantivy::schema::STRING 
-                    };
+                    // Index string fields with positions (Odinson-style) for constraint prefiltering
+                    // String fields are token fields (word, tag, entity, etc.)
+                    // CRITICAL: Use position-aware tokenizer to ensure each token gets correct position
+                    // Input format: "John|eats|pizza" -> positions 0, 1, 2
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+                    let indexing = TextFieldIndexing::default()
+                        .set_tokenizer("token_position_tokenizer")  // Position-aware tokenizer
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
                     builder.add_text_field(&field.name, options);
+                    log::debug!("Added string field '{}' with position-aware tokenizer", field.name);
+                }
+                // New type: position-aware edge fields (Odinson-style)
+                // Uses custom tokenizer that preserves token positions
+                "edge_positions" => {
+                    use tantivy::schema::{TextFieldIndexing, TextOptions, IndexRecordOption};
+
+                    // Use position-aware indexing with custom tokenizer
+                    let indexing = TextFieldIndexing::default()
+                        .set_tokenizer("edge_position_tokenizer")
+                        .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+
+                    let mut options = TextOptions::default().set_indexing_options(indexing);
+                    if field.stored {
+                        options = options.set_stored();
+                    }
+                    builder.add_text_field(&field.name, options);
+                    log::info!("Added position-aware edge field: {}", field.name);
                 }
                 "u64" => {
                     builder.add_u64_field(&field.name, tantivy::schema::STORED);
@@ -128,13 +181,16 @@ impl ExtractorEngine {
                 _ => return Err(anyhow!("Unknown field type in schema: {}", field.field_type)),
             }
         }
-        
+
         // Get output fields from config, with defaults if not specified
         let output_fields = config.output_fields.unwrap_or_else(|| {
             vec![FIELD_WORD.to_string(), FIELD_LEMMA.to_string(), FIELD_POS.to_string(), FIELD_ENTITY.to_string()]
         });
+
+        let schema = builder.build();
+        log::info!("Schema created: all text/string fields indexed with positions (Odinson-style)");
         
-        Ok((builder.build(), output_fields))
+        Ok((schema, output_fields))
     }
 
     /// Get the number of documents in the index
@@ -225,67 +281,114 @@ impl ExtractorEngine {
     }
 
     /// Execute graph traversal queries using dependency graph edges
+    /// OPTIMIZED: Parallel segment processing + Single-pass collection
     fn execute_graph_traversal(&self, query: &dyn Query, limit: usize, _pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        log::debug!("Using GRAPH TRAVERSAL mechanism");
+        log::debug!("Using GRAPH TRAVERSAL mechanism (PARALLEL + SINGLE-PASS)");
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        log::debug!("top_docs = {:?}", top_docs);
+        let num_segments = searcher.segment_readers().len();
 
-        let mut sentence_results = Vec::new();
-        let mut max_score = None;
+        // Downcast to graph query once
+        let graph_query = match query
+            .as_any()
+            .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>()
+        {
+            Some(gq) => gq,
+            None => {
+                log::warn!("Expected graph query but downcast failed!");
+                return Ok(RustIeResult {
+                    total_hits: 0,
+                    score_docs: Vec::new(),
+                    sentence_results: Vec::new(),
+                    max_score: None,
+                });
+            }
+        };
 
-        for (score, doc_address) in top_docs {
-            let mut matches = Vec::new();
+        // PARALLEL: Process all segments concurrently using Rayon
+        // Each segment is processed independently, results are merged at the end
+        let segment_results: Vec<(Vec<(SentenceResult, Score)>, u32)> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-            // Get the segment order and document ID
-            let (segment_ord, doc_id) = (doc_address.segment_ord, doc_address.doc_id);
-            let segment_reader = searcher.segment_reader(segment_ord);
+                // Create weight and scorer for this segment
+                let weight = match graph_query.weight(tantivy::query::EnableScoring::Enabled {
+                    searcher: &searcher,
+                    statistics_provider: &searcher
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::warn!("Failed to create weight for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-            if let Some(graph_query) = query
-                .as_any()
-                .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalQuery>()
-            {
-                log::debug!("Processing graph query for doc_address = {:?}", doc_address);
-                log::debug!("Creating weight for graph query");
-                let weight = graph_query.weight(tantivy::query::EnableScoring::Enabled { searcher: &searcher,
-                                                                                          statistics_provider: &searcher })?;
-                log::debug!("Creating scorer from weight");
-                let mut scorer = weight.scorer(segment_reader, 1.0)?;
-                log::debug!("Scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
+                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to create scorer for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-                while scorer.doc() < doc_id {
+                let mut segment_sentence_results = Vec::new();
+
+                // Iterate through all matching documents in this segment
+                loop {
+                    let doc_id = scorer.doc();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    // Get matches from scorer (already computed during advance)
+                    let matches = if let Some(graph_scorer) = scorer
+                        .as_any()
+                        .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>()
+                    {
+                        graph_scorer.get_current_doc_matches().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract sentence result - need to get doc from searcher
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
+                            sentence_result.matches = matches;
+                            segment_sentence_results.push((sentence_result, score));
+                        }
+                    }
+
+                    // Advance to next matching document
                     if scorer.advance() == tantivy::TERMINATED {
                         break;
                     }
                 }
 
-                if scorer.doc() == doc_id {
-                    if let Some(graph_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>() {
-                        log::debug!("Successfully downcast to OptimizedGraphTraversalScorer");
-                        log::debug!("Extracting graph matches");
-                        matches = graph_scorer.get_current_doc_matches().to_vec();
-                        log::debug!("Graph matches = {:?}", matches);
-                        log::debug!("Number of matches found: {}", matches.len());
-                    } else {
-                        log::warn!("Scorer is NOT OptimizedGraphTraversalScorer!");
-                        log::debug!("Actual scorer type = {:?}", std::any::type_name_of_val(scorer.as_ref()));
-                    }
-                }
-            } else {
-                log::warn!("Expected graph query but downcast failed!");
-            }
+                Some((segment_sentence_results, segment_ord as u32))
+            })
+            .collect();
 
-            // Extract sentence result
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                sentence_result.matches = matches;
-                sentence_results.push(sentence_result);
-            }
+        // MERGE: Combine results from all segments, sort by score, apply limit
+        let mut all_results: Vec<(SentenceResult, Score)> = segment_results
+            .into_iter()
+            .flat_map(|(results, _)| results)
+            .collect();
 
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
-        }
-        
+        // Sort by score descending (highest scores first)
+        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply limit
+        all_results.truncate(limit);
+
+        let max_score = all_results.first().map(|(_, score)| *score);
+        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+
+        log::debug!("Graph traversal found {} results using parallel segments", sentence_results.len());
+
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
             score_docs: Vec::new(),
@@ -363,51 +466,91 @@ impl ExtractorEngine {
     }
 
     /// Execute optimized pattern matching queries using custom scorer
+    /// OPTIMIZED: Parallel segment processing
     fn execute_optimized_pattern_matching(&self, pattern_query: &crate::tantivy_integration::concat_query::RustieConcatQuery, limit: usize) -> Result<RustIeResult> {
-        log::debug!("=== OPTIMIZED PATTERN MATCHING EXECUTION PATH ===");
+        log::debug!("=== OPTIMIZED PATTERN MATCHING (PARALLEL) ===");
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(pattern_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        log::debug!("top_docs = {:?}", top_docs);
+        let num_segments = searcher.segment_readers().len();
 
-        let mut sentence_results = Vec::new();
-        let mut max_score = None;
+        // PARALLEL: Process all segments concurrently using Rayon
+        let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-        for (score, doc_address) in top_docs {
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-
-                // Get the segment order and document ID
-                let (segment_ord, _doc_id) = (doc_address.segment_ord, doc_address.doc_id);
-                let segment_reader = searcher.segment_reader(segment_ord);
-
-                log::debug!("Creating weight for optimized pattern matching query");
-                let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled {
+                // Create weight and scorer for this segment
+                let weight = match pattern_query.weight(tantivy::query::EnableScoring::Enabled {
                     searcher: &searcher,
                     statistics_provider: &searcher
-                })?;
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::warn!("Failed to create weight for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-                log::debug!("Creating scorer from weight");
-                let scorer = weight.scorer(segment_reader, 1.0)?;
-                log::debug!("Optimized pattern matching scorer type = {:?}", std::any::type_name_of_val(&*scorer));
-                log::debug!("Using custom pattern matching scorer");
+                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to create scorer for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-                // Get matches from the custom scorer
-                if let Some(pattern_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>() {
-                    let matches = pattern_scorer.get_current_doc_matches();
-                    log::debug!("Custom pattern matching matches = {:?}", matches);
-                    sentence_result.matches = matches.to_vec();
-                } else {
-                    log::debug!("Could not downcast to OptimizedPatternMatchingScorer");
-                    sentence_result.matches = Vec::new();
+                let mut segment_sentence_results = Vec::new();
+
+                // Iterate through all matching documents in this segment
+                loop {
+                    let doc_id = scorer.advance();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    // Get matches from scorer (already computed during advance/pattern matching)
+                    let matches = if let Some(pattern_scorer) = scorer
+                        .as_any()
+                        .downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>()
+                    {
+                        pattern_scorer.get_current_doc_matches().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract sentence result
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
+                            sentence_result.matches = matches;
+                            segment_sentence_results.push((sentence_result, score));
+                        }
+                    }
                 }
 
-                sentence_results.push(sentence_result);
-            }
+                Some(segment_sentence_results)
+            })
+            .collect();
 
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
-        }
-        
+        // MERGE: Combine results from all segments, sort by score, apply limit
+        let mut all_results: Vec<(SentenceResult, Score)> = segment_results
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // Sort by score descending (highest scores first)
+        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply limit
+        all_results.truncate(limit);
+
+        let max_score = all_results.first().map(|(_, score)| *score);
+        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+
+        log::debug!("Optimized pattern matching found {} results using parallel segments", sentence_results.len());
+
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
             score_docs: Vec::new(),
@@ -558,9 +701,10 @@ impl ExtractorEngine {
     }
 
     /// Extract multiple field values from a Tantivy document
+    /// For token fields (word, lemma, pos, etc.), decodes the position-aware format
     fn extract_field_values(&self, doc: &TantivyDocument, field_name: &str) -> Vec<String> {
         if let Ok(field) = self.schema.get_field(field_name) {
-            doc.get_all(field).filter_map(|value| {
+            let raw_values: Vec<String> = doc.get_all(field).filter_map(|value| {
                 if let Some(text) = value.as_str() {
                     Some(text.to_string())
                 } else if let Some(u64_val) = value.as_u64() {
@@ -568,7 +712,18 @@ impl ExtractorEngine {
                 } else {
                     None
                 }
-            }).collect()
+            }).collect();
+
+            // For token fields stored in position-aware format (e.g., "John|eats|pizza"),
+            // decode by splitting on | to get individual tokens
+            // These fields use the position-aware encoding
+            let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
+            if token_fields.contains(&field_name) && raw_values.len() == 1 {
+                // Single encoded string - decode it
+                raw_values[0].split('|').map(|s| s.to_string()).collect()
+            } else {
+                raw_values
+            }
         } else {
             Vec::new()
         }

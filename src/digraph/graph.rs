@@ -347,7 +347,7 @@ impl DirectedGraph {
             if offset + edge_count * 4 > bytes.len() {
                 return Err(anyhow!("Insufficient bytes for incoming edges"));
             }
-            let mut edges = Vec::new();
+            let mut edges = Vec::with_capacity(edge_count);
             for _ in 0..edge_count {
                 let value = u32::from_le_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]) as usize;
                 edges.push(value);
@@ -367,7 +367,7 @@ impl DirectedGraph {
             if offset + edge_count * 4 > bytes.len() {
                 return Err(anyhow!("Insufficient bytes for outgoing edges"));
             }
-            let mut edges = Vec::new();
+            let mut edges = Vec::with_capacity(edge_count);
             for _ in 0..edge_count {
                 let value = u32::from_le_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]) as usize;
                 edges.push(value);
@@ -448,8 +448,9 @@ impl Vocabulary {
                 return Err(anyhow!("Insufficient bytes for term"));
             }
             
-            let term = String::from_utf8(bytes[offset..offset+term_len].to_vec())
-                .map_err(|e| anyhow!("Invalid UTF-8 in term: {}", e))?;
+            let term = std::str::from_utf8(&bytes[offset..offset+term_len])
+                .map_err(|e| anyhow!("Invalid UTF-8 in term: {}", e))?
+                .to_string();
             
             vocabulary.id_to_term.push(term.clone());
             vocabulary.term_to_id.insert(term, vocabulary.id_to_term.len() - 1);

@@ -159,66 +159,120 @@ impl LookaheadScorer {
             Err(_) => return false,
         };
         
-        // Extract tokens from the default field
-        let tokens = self.extract_tokens_from_field(&doc);
-        if tokens.is_empty() {
+        // Extract and split tokens for all potential fields
+        let mut field_cache = std::collections::HashMap::new();
+        let field_names = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm"];
+        for name in field_names {
+            let tokens = crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), &doc, name);
+            if !tokens.is_empty() {
+                field_cache.insert(name.to_string(), tokens);
+            }
+        }
+        
+        if field_cache.is_empty() {
             return false;
         }
         
         // Find positions matching the assertion pattern
-        let positions = self.find_positions_matching_pattern(&tokens, &self.assertion_pattern);
+        let positions = self.find_positions_matching_pattern(&field_cache, &self.assertion_pattern);
         
         // For lookahead assertions, just check if there are any matches
         // The actual position-relative filtering is done at a higher level
+        // Negative assertions should not exclude documents at the pre-filtering stage
+        // because the exclusion is position-relative.
         match self.lookahead_type {
             LookaheadType::PositiveLookahead | LookaheadType::PositiveLookbehind => {
                 !positions.is_empty()
             }
             LookaheadType::NegativeLookahead | LookaheadType::NegativeLookbehind => {
-                positions.is_empty()
+                true 
             }
         }
     }
     
-    fn extract_tokens_from_field(&self, doc: &tantivy::schema::TantivyDocument) -> Vec<String> {
-        doc.get_all(self.default_field)
-            .filter_map(|v| Value::as_str(&v).map(|s| s.to_string()))
-            .collect()
+    fn extract_tokens_from_field(&self, _doc: &tantivy::schema::TantivyDocument) -> Vec<String> {
+        // Deprecated: field extraction now happens in check_assertion using the cache
+        vec![]
     }
     
-    fn find_positions_matching_pattern(&self, tokens: &[String], pattern: &Pattern) -> Vec<usize> {
+    fn find_positions_matching_pattern(&self, field_cache: &std::collections::HashMap<String, Vec<String>>, pattern: &Pattern) -> Vec<usize> {
         use crate::compiler::ast::{Constraint, Matcher};
         
         let mut positions = Vec::new();
+        
+        // Use 'word' field to determine length
+        let len = field_cache.get("word").or_else(|| field_cache.values().next()).map(|v| v.len()).unwrap_or(0);
+        if len == 0 { return positions; }
+
         match pattern {
-            Pattern::Constraint(Constraint::Field { name, matcher }) => {
-                if name != "word" { return positions; }
-                match matcher {
-                    Matcher::String(s) => {
-                        for (i, token) in tokens.iter().enumerate() {
-                            if token == s {
-                                positions.push(i);
-                            }
-                        }
-                    }
-                    Matcher::Regex { pattern, .. } => {
-                        if let Ok(re) = regex::Regex::new(pattern) {
-                            for (i, token) in tokens.iter().enumerate() {
-                                if re.is_match(token) {
-                                    positions.push(i);
-                                }
-                            }
-                        }
+            Pattern::Constraint(constraint) => {
+                for i in 0..len {
+                    if matches_constraint_at_position(constraint, field_cache, i) {
+                        positions.push(i);
                     }
                 }
             }
-            Pattern::Constraint(Constraint::Wildcard) => {
-                for i in 0..tokens.len() {
-                    positions.push(i);
+            Pattern::NamedCapture { pattern, .. } => {
+                return self.find_positions_matching_pattern(field_cache, pattern);
+            }
+            Pattern::Disjunctive(patterns) => {
+                for pat in patterns {
+                    positions.extend(self.find_positions_matching_pattern(field_cache, pat));
                 }
+                positions.sort();
+                positions.dedup();
             }
             _ => {}
         }
         positions
+    }
+}
+
+fn matches_constraint_at_position(
+    constraint: &crate::compiler::ast::Constraint,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    pos: usize
+) -> bool {
+    use crate::compiler::ast::Constraint;
+    
+    match constraint {
+        Constraint::Wildcard => true,
+        Constraint::Field { name, matcher } => {
+            if let Some(tokens) = field_cache.get(name) {
+                if pos < tokens.len() {
+                    matcher.matches(&tokens[pos])
+                } else {
+                    false
+                }
+            } else {
+                // Try fallback for 'tag' -> 'pos'
+                if name == "tag" {
+                    if let Some(tokens) = field_cache.get("pos") {
+                        if pos < tokens.len() {
+                            return matcher.matches(&tokens[pos]);
+                        }
+                    }
+                }
+                false
+            }
+        }
+        Constraint::Fuzzy { name, matcher } => {
+            if let Some(tokens) = field_cache.get(name) {
+                if pos < tokens.len() {
+                    tokens[pos].to_lowercase().contains(&matcher.to_lowercase())
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        Constraint::Negated(inner) => !matches_constraint_at_position(inner, field_cache, pos),
+        Constraint::Conjunctive(constraints) => {
+            constraints.iter().all(|c| matches_constraint_at_position(c, field_cache, pos))
+        }
+        Constraint::Disjunctive(constraints) => {
+            constraints.iter().any(|c| matches_constraint_at_position(c, field_cache, pos))
+        }
     }
 }
