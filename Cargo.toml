@@ -22,6 +22,7 @@ clap = { version = "4.0", features = ["derive"] }
 tempfile = "3.8"
 indicatif = "0.17"
 rand = "0.8"
+rayon = "1.10"
 pest = "2.7"
 pest_derive = "2.7"
 utoipa = { version = "4", features = ["actix_extras"] }

@@ -27,6 +27,7 @@
 # === OS Files ===
 .DS_Store
 Thumbs.db
+*.db
 
 # === Logs and Debug ===
 *.log
@@ -37,3 +38,4 @@ test_api_index
 test_index
 PROFILING.md
 profile.json.gz
+optimization.txt

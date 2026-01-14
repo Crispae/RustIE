@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 // Import from tantivy
 use tantivy::{
     doc, Index, IndexReader, IndexWriter,
@@ -14,6 +15,7 @@ use tantivy::{
 };
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
+use rayon::prelude::*;
 
 // Field name constants for consistency across the codebase
 pub const FIELD_WORD: &str = "word";
@@ -279,11 +281,12 @@ impl ExtractorEngine {
     }
 
     /// Execute graph traversal queries using dependency graph edges
-    /// OPTIMIZED: Single-pass collection instead of re-traversing for each result
+    /// OPTIMIZED: Parallel segment processing + Single-pass collection
     fn execute_graph_traversal(&self, query: &dyn Query, limit: usize, _pattern: &crate::compiler::ast::Pattern) -> Result<RustIeResult> {
-        log::debug!("Using GRAPH TRAVERSAL mechanism (OPTIMIZED SINGLE-PASS)");
+        log::debug!("Using GRAPH TRAVERSAL mechanism (PARALLEL + SINGLE-PASS)");
 
         let searcher = self.reader.searcher();
+        let num_segments = searcher.segment_readers().len();
 
         // Downcast to graph query once
         let graph_query = match query
@@ -302,69 +305,89 @@ impl ExtractorEngine {
             }
         };
 
-        let mut sentence_results = Vec::new();
-        let mut max_score: Option<Score> = None;
-        let mut count = 0;
+        // PARALLEL: Process all segments concurrently using Rayon
+        // Each segment is processed independently, results are merged at the end
+        let segment_results: Vec<(Vec<(SentenceResult, Score)>, u32)> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-        // OPTIMIZED: Single pass through all segments
-        // Instead of using TopDocs and re-traversing, iterate scorer directly
-        for segment_ord in 0..searcher.segment_readers().len() {
-            if count >= limit {
-                break;
-            }
-
-            let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-            // Create weight and scorer ONCE per segment
-            let weight = graph_query.weight(tantivy::query::EnableScoring::Enabled {
-                searcher: &searcher,
-                statistics_provider: &searcher
-            })?;
-
-            let mut scorer = weight.scorer(segment_reader, 1.0)?;
-
-            // Iterate through all matching documents in this segment
-            loop {
-                let doc_id = scorer.doc();
-                if doc_id == tantivy::TERMINATED {
-                    break;
-                }
-
-                if count >= limit {
-                    break;
-                }
-
-                let score = scorer.score();
-                let doc_address = DocAddress::new(segment_ord as u32, doc_id);
-
-                // Get matches from scorer (already computed during advance)
-                let matches = if let Some(graph_scorer) = scorer
-                    .as_any()
-                    .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>()
-                {
-                    graph_scorer.get_current_doc_matches().to_vec()
-                } else {
-                    Vec::new()
+                // Create weight and scorer for this segment
+                let weight = match graph_query.weight(tantivy::query::EnableScoring::Enabled {
+                    searcher: &searcher,
+                    statistics_provider: &searcher
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::warn!("Failed to create weight for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
                 };
 
-                // Extract sentence result
-                if let Ok(doc) = self.doc(doc_address) {
-                    let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                    sentence_result.matches = matches;
-                    sentence_results.push(sentence_result);
-                    count += 1;
+                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to create scorer for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-                    max_score = max_score.map(|s| s.max(score)).or(Some(score));
+                let mut segment_sentence_results = Vec::new();
+
+                // Iterate through all matching documents in this segment
+                loop {
+                    let doc_id = scorer.doc();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    // Get matches from scorer (already computed during advance)
+                    let matches = if let Some(graph_scorer) = scorer
+                        .as_any()
+                        .downcast_ref::<crate::tantivy_integration::graph_traversal::OptimizedGraphTraversalScorer>()
+                    {
+                        graph_scorer.get_current_doc_matches().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract sentence result - need to get doc from searcher
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
+                            sentence_result.matches = matches;
+                            segment_sentence_results.push((sentence_result, score));
+                        }
+                    }
+
+                    // Advance to next matching document
+                    if scorer.advance() == tantivy::TERMINATED {
+                        break;
+                    }
                 }
 
-                // Advance to next matching document
-                if scorer.advance() == tantivy::TERMINATED {
-                    break;
-                }
-            }
-        }
+                Some((segment_sentence_results, segment_ord as u32))
+            })
+            .collect();
 
-        log::debug!("Graph traversal found {} results in single pass", sentence_results.len());
+        // MERGE: Combine results from all segments, sort by score, apply limit
+        let mut all_results: Vec<(SentenceResult, Score)> = segment_results
+            .into_iter()
+            .flat_map(|(results, _)| results)
+            .collect();
+
+        // Sort by score descending (highest scores first)
+        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply limit
+        all_results.truncate(limit);
+
+        let max_score = all_results.first().map(|(_, score)| *score);
+        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+
+        log::debug!("Graph traversal found {} results using parallel segments", sentence_results.len());
 
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
@@ -443,70 +466,91 @@ impl ExtractorEngine {
     }
 
     /// Execute optimized pattern matching queries using custom scorer
+    /// OPTIMIZED: Parallel segment processing
     fn execute_optimized_pattern_matching(&self, pattern_query: &crate::tantivy_integration::concat_query::RustieConcatQuery, limit: usize) -> Result<RustIeResult> {
-        log::debug!("=== OPTIMIZED PATTERN MATCHING EXECUTION PATH ===");
+        log::debug!("=== OPTIMIZED PATTERN MATCHING (PARALLEL) ===");
 
         let searcher = self.reader.searcher();
-        let mut sentence_results = Vec::new();
-        let mut max_score: Option<Score> = None;
-        let mut count = 0;
+        let num_segments = searcher.segment_readers().len();
 
-        // Manually iterate through segments and advance the scorer (like execute_graph_traversal)
-        // This ensures the scorer is properly initialized and advanced
-        for segment_ord in 0..searcher.segment_readers().len() {
-            if count >= limit {
-                break;
-            }
+        // PARALLEL: Process all segments concurrently using Rayon
+        let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-            let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-            // Create weight and scorer ONCE per segment
-            let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled {
-                searcher: &searcher,
-                statistics_provider: &searcher
-            })?;
-
-            let mut scorer = weight.scorer(segment_reader, 1.0)?;
-
-            // Iterate through all matching documents in this segment
-            // The scorer starts uninitialized, so we must call advance() first
-            loop {
-                let doc_id = scorer.advance();
-                if doc_id == tantivy::TERMINATED {
-                    break;
-                }
-
-                if count >= limit {
-                    break;
-                }
-
-                let score = scorer.score();
-                let doc_address = DocAddress::new(segment_ord as u32, doc_id);
-
-                // Get matches from scorer (already computed during advance/pattern matching)
-                let matches = if let Some(pattern_scorer) = scorer
-                    .as_any()
-                    .downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>()
-                {
-                    pattern_scorer.get_current_doc_matches().to_vec()
-                } else {
-                    Vec::new()
+                // Create weight and scorer for this segment
+                let weight = match pattern_query.weight(tantivy::query::EnableScoring::Enabled {
+                    searcher: &searcher,
+                    statistics_provider: &searcher
+                }) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::warn!("Failed to create weight for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
                 };
 
-                // Extract sentence result
-                if let Ok(doc) = self.doc(doc_address) {
-                    let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                    sentence_result.matches = matches;
-                    sentence_results.push(sentence_result);
-                    count += 1;
+                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("Failed to create scorer for segment {}: {}", segment_ord, e);
+                        return None;
+                    }
+                };
 
-                    max_score = max_score.map(|s| s.max(score)).or(Some(score));
+                let mut segment_sentence_results = Vec::new();
+
+                // Iterate through all matching documents in this segment
+                loop {
+                    let doc_id = scorer.advance();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    // Get matches from scorer (already computed during advance/pattern matching)
+                    let matches = if let Some(pattern_scorer) = scorer
+                        .as_any()
+                        .downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>()
+                    {
+                        pattern_scorer.get_current_doc_matches().to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Extract sentence result
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
+                            sentence_result.matches = matches;
+                            segment_sentence_results.push((sentence_result, score));
+                        }
+                    }
                 }
-            }
-        }
 
-        log::debug!("Optimized pattern matching found {} results", sentence_results.len());
-        
+                Some(segment_sentence_results)
+            })
+            .collect();
+
+        // MERGE: Combine results from all segments, sort by score, apply limit
+        let mut all_results: Vec<(SentenceResult, Score)> = segment_results
+            .into_iter()
+            .flatten()
+            .collect();
+
+        // Sort by score descending (highest scores first)
+        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Apply limit
+        all_results.truncate(limit);
+
+        let max_score = all_results.first().map(|(_, score)| *score);
+        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+
+        log::debug!("Optimized pattern matching found {} results using parallel segments", sentence_results.len());
+
         Ok(RustIeResult {
             total_hits: sentence_results.len(),
             score_docs: Vec::new(),
