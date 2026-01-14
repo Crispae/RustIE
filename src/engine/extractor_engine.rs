@@ -447,46 +447,65 @@ impl ExtractorEngine {
         log::debug!("=== OPTIMIZED PATTERN MATCHING EXECUTION PATH ===");
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher.search(pattern_query, &TopDocs::with_limit(limit)).map_err(anyhow::Error::from)?;
-        log::debug!("top_docs = {:?}", top_docs);
-
         let mut sentence_results = Vec::new();
-        let mut max_score = None;
+        let mut max_score: Option<Score> = None;
+        let mut count = 0;
 
-        for (score, doc_address) in top_docs {
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-
-                // Get the segment order and document ID
-                let (segment_ord, _doc_id) = (doc_address.segment_ord, doc_address.doc_id);
-                let segment_reader = searcher.segment_reader(segment_ord);
-
-                log::debug!("Creating weight for optimized pattern matching query");
-                let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled {
-                    searcher: &searcher,
-                    statistics_provider: &searcher
-                })?;
-
-                log::debug!("Creating scorer from weight");
-                let scorer = weight.scorer(segment_reader, 1.0)?;
-                log::debug!("Optimized pattern matching scorer type = {:?}", std::any::type_name_of_val(&*scorer));
-                log::debug!("Using custom pattern matching scorer");
-
-                // Get matches from the custom scorer
-                if let Some(pattern_scorer) = scorer.as_any().downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>() {
-                    let matches = pattern_scorer.get_current_doc_matches();
-                    log::debug!("Custom pattern matching matches = {:?}", matches);
-                    sentence_result.matches = matches.to_vec();
-                } else {
-                    log::debug!("Could not downcast to OptimizedPatternMatchingScorer");
-                    sentence_result.matches = Vec::new();
-                }
-
-                sentence_results.push(sentence_result);
+        // Manually iterate through segments and advance the scorer (like execute_graph_traversal)
+        // This ensures the scorer is properly initialized and advanced
+        for segment_ord in 0..searcher.segment_readers().len() {
+            if count >= limit {
+                break;
             }
 
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
+            let segment_reader = searcher.segment_reader(segment_ord as u32);
+
+            // Create weight and scorer ONCE per segment
+            let weight = pattern_query.weight(tantivy::query::EnableScoring::Enabled {
+                searcher: &searcher,
+                statistics_provider: &searcher
+            })?;
+
+            let mut scorer = weight.scorer(segment_reader, 1.0)?;
+
+            // Iterate through all matching documents in this segment
+            // The scorer starts uninitialized, so we must call advance() first
+            loop {
+                let doc_id = scorer.advance();
+                if doc_id == tantivy::TERMINATED {
+                    break;
+                }
+
+                if count >= limit {
+                    break;
+                }
+
+                let score = scorer.score();
+                let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                // Get matches from scorer (already computed during advance/pattern matching)
+                let matches = if let Some(pattern_scorer) = scorer
+                    .as_any()
+                    .downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>()
+                {
+                    pattern_scorer.get_current_doc_matches().to_vec()
+                } else {
+                    Vec::new()
+                };
+
+                // Extract sentence result
+                if let Ok(doc) = self.doc(doc_address) {
+                    let mut sentence_result = self.extract_sentence_result(&doc, score)?;
+                    sentence_result.matches = matches;
+                    sentence_results.push(sentence_result);
+                    count += 1;
+
+                    max_score = max_score.map(|s| s.max(score)).or(Some(score));
+                }
+            }
         }
+
+        log::debug!("Optimized pattern matching found {} results", sentence_results.len());
         
         Ok(RustIeResult {
             total_hits: sentence_results.len(),

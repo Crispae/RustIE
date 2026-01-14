@@ -123,12 +123,16 @@ impl BasicCompiler {
 
         match matcher {
             Matcher::String(s) => {
-                // Use Term::from_field_text which will use the field's tokenizer
-                // For position-aware tokenizer, this should work correctly:
-                // - Input "The" gets tokenized by position-aware tokenizer
-                // - Tokenizer splits on |, so "The" becomes ["The"]
-                // - Term is created for "The" which should match indexed terms
+                // For position-aware tokenizer fields, we need to create the term correctly
+                // The tokenizer splits on |, so when we index "DT|NN|VBZ", it creates terms "DT", "NN", "VBZ"
+                // When querying, we need to match these exact terms
+                // Term::from_field_text will tokenize the input, so "DT" becomes ["DT"] which should work
+                // But let's also try creating the term directly to ensure it matches
                 let term = Term::from_field_text(field, s);
+                
+                // Debug: Print the term to verify it's created correctly
+                log::debug!("Created TermQuery for field '{}' with term text '{}', term={:?}", field_name, s, term);
+                
                 // Use WithFreqsAndPositions to match the indexing option
                 // This ensures we can match terms that were indexed with positions
                 Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions)))

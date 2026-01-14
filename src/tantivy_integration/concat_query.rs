@@ -4,7 +4,6 @@ use tantivy::schema::{Field, Value};
 use crate::compiler::ast::Pattern;
 
 #[derive(Debug)]
-
 pub struct RustieConcatQuery {
     pub default_field: Field,
     pub pattern: Pattern,
@@ -58,12 +57,32 @@ struct RustieConcatWeight {
 
 impl Weight for RustieConcatWeight {
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+        let num_sub_weights = self.sub_weights.len();
         let sub_scorers: Vec<Box<dyn Scorer>> = self.sub_weights
             .iter()
-            .map(|w| w.scorer(reader, boost))
+            .enumerate()
+            .map(|(i, w)| {
+                let scorer = w.scorer(reader, boost)?;
+                // Check if scorer has any documents immediately (before advance)
+                let initial_doc = scorer.doc();
+                if num_sub_weights == 2 {
+                    println!("DEBUG: Created sub_scorer[{}] for segment {}, initial doc={} (before advance)", 
+                             i, reader.segment_id(), initial_doc);
+                    // Try to see if we can get more info about the scorer
+                    if initial_doc != tantivy::TERMINATED {
+                        println!("DEBUG: Sub_scorer[{}] already positioned at doc {}", i, initial_doc);
+                    }
+                }
+                Ok(scorer)
+            })
             .collect::<TantivyResult<Vec<_>>>()?;
 
-        let mut scorer = RustieConcatScorer {
+        let is_simple = sub_scorers.len() == 2;
+        if is_simple {
+            println!("DEBUG: Creating RustieConcatScorer with {} sub_scorers, pattern={:?}", sub_scorers.len(), self.pattern);
+        }
+
+        let scorer = RustieConcatScorer {
             sub_scorers,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
@@ -72,9 +91,9 @@ impl Weight for RustieConcatWeight {
             current_matches: Vec::new(),
             match_index: 0,
             current_doc_matches: Vec::new(),
-            boost, // Pass boost for Odinson-style scoring
+            boost,
+            started: false, // Explicitly track initialization state
         };
-        let _ = scorer.advance();
         Ok(Box::new(scorer))
     }
 
@@ -92,41 +111,26 @@ pub struct RustieConcatScorer {
     current_matches: Vec<(DocId, Score)>,
     match_index: usize,
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
-    /// Boost factor from weight creation
     boost: Score,
+    started: bool,
 }
 
 impl RustieConcatScorer {
-    /// Compute sloppy frequency factor based on span width (Odinson-style)
-    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
-    /// Shorter spans get higher scores
     fn compute_slop_factor(span_width: usize) -> Score {
         1.0 / (1.0 + span_width as f32)
     }
 
-    /// Compute Odinson-style score for the current document
-    /// Accumulates sloppy frequency for all matches, similar to Lucene/Odinson
     fn compute_odinson_score(&self) -> Score {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
-
-        // Accumulate sloppy frequency for all matches (Odinson approach)
         let mut acc_sloppy_freq: Score = 0.0;
-
         for span_match in &self.current_doc_matches {
             let span_width = span_match.span.end.saturating_sub(span_match.span.start);
             acc_sloppy_freq += Self::compute_slop_factor(span_width);
         }
-
-        // Base score from pattern matching
         let base_score = 1.0;
-
-        // Final score: base_score * accumulated_sloppy_freq * boost
-        // This follows Odinson's: docScorer.score(docID(), accSloppyFreq)
         let final_score = base_score * acc_sloppy_freq * self.boost;
-
-        // Ensure minimum score of 1.0 for any match (normalized)
         final_score.max(1.0)
     }
 }
@@ -143,48 +147,114 @@ impl Scorer for RustieConcatScorer {
 
 impl DocSet for RustieConcatScorer {
     fn advance(&mut self) -> DocId {
+        eprintln!("DEBUG: advance() ENTRY - sub_scorers.len()={}, started={}", self.sub_scorers.len(), self.started);
+        
         if self.sub_scorers.is_empty() {
+            eprintln!("DEBUG: advance() - sub_scorers is empty, returning TERMINATED");
             self.current_doc = None;
             return tantivy::TERMINATED;
         }
-        loop {
+
+        // Phase 1: Ensure scorers are positioned correctly
+        if !self.started {
+            self.started = true;
+            for (i, scorer) in self.sub_scorers.iter_mut().enumerate() {
+                // BUG FIX: The scorer might already be pointing at Doc 0 upon creation.
+                // We only advance if it is currently TERMINATED (uninitialized).
+                if scorer.doc() == tantivy::TERMINATED {
+                    let doc = scorer.advance();
+                    println!("DEBUG: Init Scorer[{}] was TERMINATED, advanced to {}", i, doc);
+                    if doc == tantivy::TERMINATED {
+                        self.current_doc = None;
+                        return tantivy::TERMINATED;
+                    }
+                } else {
+                    println!("DEBUG: Init Scorer[{}] started at valid doc {}, skipping initial advance", i, scorer.doc());
+                }
+            }
+        } else {
+            // Subsequent calls: Advance the LEADER (scorer 0)
             let doc = self.sub_scorers[0].advance();
+            println!("DEBUG: Leader Scorer[0] advanced to {}", doc);
             if doc == tantivy::TERMINATED {
                 self.current_doc = None;
                 return tantivy::TERMINATED;
             }
-            // Check if all sub-scorers are on the same doc
+        }
+
+        // Phase 2: Zig-Zag Intersection
+        loop {
+            let candidate = self.sub_scorers[0].doc();
+            println!("DEBUG: Loop start. Candidate (Leader) = {}", candidate);
+            
             let mut all_match = true;
-            for scorer in &mut self.sub_scorers[1..] {
-                while scorer.doc() < doc {
-                    let next = scorer.advance();
-                    if next == tantivy::TERMINATED {
-                        all_match = false;
-                        break;
-                    }
+            let mut next_target = candidate;
+
+            for (i, scorer) in self.sub_scorers.iter_mut().enumerate().skip(1) {
+                let mut s_doc = scorer.doc();
+                println!("DEBUG: Checking Scorer[{}] curr={}, target={}", i, s_doc, candidate);
+
+                // Handle case where follower is behind (uninitialized or lagging)
+                if s_doc == tantivy::TERMINATED {
+                     s_doc = scorer.advance();
                 }
-                if scorer.doc() != doc {
+
+                while s_doc < candidate {
+                    s_doc = scorer.advance();
+                    println!("DEBUG: Scorer[{}] catching up... now at {}", i, s_doc);
+                }
+
+                if s_doc == tantivy::TERMINATED {
+                    println!("DEBUG: Scorer[{}] terminated. Ending.", i);
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
+                }
+
+                if s_doc > candidate {
+                    println!("DEBUG: Scorer[{}] overshoot ({} > {}). Updating target.", i, s_doc, candidate);
+                    next_target = s_doc;
                     all_match = false;
                     break;
                 }
             }
+
             if all_match {
-                // Now check for valid sequence/position match in this doc
-                if self.check_pattern_matching(doc) {
-                    self.current_doc = Some(doc);
-                    // Compute Odinson-style score based on span widths and match count
+                println!("DEBUG: All scorers matched at {}. Checking pattern...", candidate);
+                if self.check_pattern_matching(candidate) {
+                    println!("DEBUG: Pattern matched at {}!", candidate);
+                    self.current_doc = Some(candidate);
                     let score = self.compute_odinson_score();
-                    self.current_matches.push((doc, score));
+                    self.current_matches.push((candidate, score));
                     self.match_index = self.current_matches.len() - 1;
-                    return doc;
+                    return candidate;
+                }
+                
+                println!("DEBUG: Pattern match failed at {}. Advancing leader.", candidate);
+                if self.sub_scorers[0].advance() == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
+                }
+            } else {
+                println!("DEBUG: Alignment failed. Advancing leader to target {}", next_target);
+                let mut s0 = self.sub_scorers[0].doc();
+                while s0 < next_target {
+                    s0 = self.sub_scorers[0].advance();
+                }
+                println!("DEBUG: Leader advanced to {}", s0);
+                if s0 == tantivy::TERMINATED {
+                     self.current_doc = None;
+                     return tantivy::TERMINATED;
                 }
             }
-            // Otherwise, continue advancing the first scorer
         }
     }
 
     fn doc(&self) -> DocId {
-        self.current_doc.unwrap_or(tantivy::TERMINATED)
+        let doc = self.current_doc.unwrap_or(tantivy::TERMINATED);
+        if self.sub_scorers.len() == 2 {
+            eprintln!("DEBUG: doc() called, returning doc={}, current_doc={:?}", doc, self.current_doc);
+        }
+        doc
     }
 
     fn size_hint(&self) -> u32 {
@@ -194,9 +264,10 @@ impl DocSet for RustieConcatScorer {
 
 impl RustieConcatScorer {
     fn check_pattern_matching(&mut self, doc_id: DocId) -> bool {
+        // Keeping debugging output to verify it works
         println!("DEBUG: check_pattern_matching called for doc_id={} with pattern={:?}", doc_id, self.pattern);
+        
         self.current_doc_matches.clear();
-        // Get document
         let store_reader = match self.reader.get_store_reader(1) {
             Ok(reader) => reader,
             Err(_) => return false,
@@ -206,7 +277,6 @@ impl RustieConcatScorer {
             Err(_) => return false,
         };
 
-        // Extract and split tokens for all potential fields mentioned in the pattern
         let mut field_cache = std::collections::HashMap::new();
         let field_names = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm"];
         for name in field_names {
