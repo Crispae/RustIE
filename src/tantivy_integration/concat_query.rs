@@ -1,13 +1,39 @@
 use tantivy::query::{Query, Weight, Scorer, EnableScoring};
-use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet};
-use tantivy::schema::{Field, Value};
-use crate::compiler::ast::Pattern;
+use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet, Term};
+use tantivy::schema::{Field, IndexRecordOption, Value};
+use tantivy::postings::Postings;
+use std::collections::HashMap;
+use crate::compiler::ast::{Pattern, Constraint, Matcher};
+
+/// Execution plan for anchor-based verification
+#[derive(Debug, Clone)]
+pub struct ExecutionPlan {
+    pub anchor_idx: usize,
+}
+
+/// Constraint source for position-based matching
+#[derive(Debug, Clone)]
+enum ConstraintSource {
+    Exact { field: Field, term: Term },
+    Regex { field: Field, pattern: String, terms: Vec<Term> },  // FST-expanded terms (capped)
+    Wildcard { field: Field },
+}
+
+/// Positions for a constraint - either a list or wildcard (any position)
+/// Using slices to avoid cloning (allocation-free)
+enum PosView<'a> {
+    Any,  // Wildcard: matches any position
+    List(&'a [u32]),  // Specific positions (slice into position_buffers)
+}
+
+const MAX_REGEX_EXPANSION: usize = 1024;  // Cap regex expansion for postings path (lower for performance)
 
 #[derive(Debug)]
 pub struct RustieConcatQuery {
     pub default_field: Field,
     pub pattern: Pattern,
     pub sub_queries: Vec<Box<dyn Query>>,
+    pub execution_plan: Option<ExecutionPlan>,
 }
 
 impl Clone for RustieConcatQuery {
@@ -16,6 +42,7 @@ impl Clone for RustieConcatQuery {
             default_field: self.default_field,
             pattern: self.pattern.clone(),
             sub_queries: self.sub_queries.iter().map(|q| q.box_clone()).collect(),
+            execution_plan: self.execution_plan.clone(),
         }
     }
 }
@@ -30,6 +57,7 @@ impl RustieConcatQuery {
             default_field,
             pattern,
             sub_queries,
+            execution_plan: None,
         }
     }
 }
@@ -53,6 +81,213 @@ struct RustieConcatWeight {
     sub_weights: Vec<Box<dyn Weight>>,
     pattern: Pattern,
     default_field: Field,
+}
+
+/// Helper to extract constraints from a Pattern
+fn extract_constraints_from_pattern(pattern: &Pattern) -> Vec<&Constraint> {
+    use crate::compiler::ast::Pattern;
+    let mut constraints = Vec::new();
+    
+    match pattern {
+        Pattern::Concatenated(patterns) => {
+            for pat in patterns {
+                if let Pattern::Constraint(c) = pat {
+                    constraints.push(c);
+                } else if let Pattern::NamedCapture { pattern: p, .. } = pat {
+                    if let Pattern::Constraint(c) = p.as_ref() {
+                        constraints.push(c);
+                    }
+                }
+            }
+        }
+        Pattern::Constraint(c) => {
+            constraints.push(c);
+        }
+        _ => {}
+    }
+    
+    constraints
+}
+
+/// Compile constraint sources from pattern for postings-based matching
+fn compile_constraint_sources(
+    pattern: &Pattern,
+    reader: &SegmentReader,
+    default_field: &Field,
+) -> TantivyResult<Vec<ConstraintSource>> {
+    use crate::compiler::ast::Pattern;
+    let mut sources = Vec::new();
+    let schema = reader.schema();
+    
+    // Segment-local regex cache (immutable, no mutex needed)
+    let mut regex_cache: HashMap<String, Vec<Term>> = HashMap::new();
+    
+    match pattern {
+        Pattern::Concatenated(patterns) => {
+            for pat in patterns {
+                let constraint = match pat {
+                    Pattern::Constraint(c) => c,
+                    Pattern::NamedCapture { pattern: p, .. } => {
+                        if let Pattern::Constraint(c) = p.as_ref() {
+                            c
+                        } else {
+                            continue;  // Skip non-constraint patterns for now
+                        }
+                    }
+                    _ => continue,
+                };
+                
+                let source = compile_constraint_to_source(constraint, reader, default_field, &mut regex_cache, schema)?;
+                sources.push(source);
+            }
+        }
+        Pattern::Constraint(c) => {
+            let source = compile_constraint_to_source(c, reader, default_field, &mut regex_cache, schema)?;
+            sources.push(source);
+        }
+        _ => {
+            // For non-constraint patterns, we'll fall back to stored-field path
+            return Ok(Vec::new());
+        }
+    }
+    
+    Ok(sources)
+}
+
+/// Compile a single constraint to ConstraintSource
+fn compile_constraint_to_source(
+    constraint: &Constraint,
+    reader: &SegmentReader,
+    default_field: &Field,
+    regex_cache: &mut HashMap<String, Vec<Term>>,
+    schema: &tantivy::schema::Schema,
+) -> TantivyResult<ConstraintSource> {
+    match constraint {
+        Constraint::Wildcard => {
+            // Use default field for wildcard
+            Ok(ConstraintSource::Wildcard { field: *default_field })
+        }
+        Constraint::Field { name, matcher } => {
+            let field = schema.get_field(name)
+                .map_err(|_| tantivy::TantivyError::SchemaError(format!("Field '{}' not found", name)))?;
+            
+            match matcher {
+                Matcher::String(s) => {
+                    let term = Term::from_field_text(field, s);
+                    Ok(ConstraintSource::Exact { field, term })
+                }
+                Matcher::Regex { pattern, .. } => {
+                    // Check cache first
+                    let cache_key = format!("{}:{}", name, pattern);
+                    let terms = if let Some(cached) = regex_cache.get(&cache_key) {
+                        cached.clone()
+                    } else {
+                        // Expand regex using FST
+                        let inverted_index = reader.inverted_index(field)
+                            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to get inverted index: {}", e)))?;
+                        let term_dict = inverted_index.terms();
+                        
+                        let automaton = tantivy_fst::Regex::new(pattern)
+                            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Invalid regex pattern '{}': {}", pattern, e)))?;
+                        
+                        let mut stream = term_dict.search(&automaton).into_stream()
+                            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to search term dict: {:?}", e)))?;
+                        
+                        let mut terms = Vec::new();
+                        let mut count = 0;
+                        
+                        while stream.advance() {
+                            if count >= MAX_REGEX_EXPANSION {
+                                log::warn!("Regex pattern '{}' exceeds expansion cap ({}), truncating", pattern, MAX_REGEX_EXPANSION);
+                                break;
+                            }
+                            
+                            let term_bytes = stream.key();
+                            let term = Term::from_field_bytes(field, term_bytes);
+                            terms.push(term);
+                            count += 1;
+                        }
+                        
+                        if terms.is_empty() {
+                            log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
+                        } else {
+                            log::debug!("Regex pattern '{}' expanded to {} terms", pattern, terms.len());
+                            regex_cache.insert(cache_key, terms.clone());
+                        }
+                        
+                        terms
+                    };
+                    
+                    Ok(ConstraintSource::Regex { field, pattern: pattern.clone(), terms })
+                }
+            }
+        }
+        _ => {
+            // For complex constraints (Negated, Conjunctive, Disjunctive), fall back to stored-field path
+            Err(tantivy::TantivyError::SchemaError("Complex constraints not yet supported in postings path".to_string()))
+        }
+    }
+}
+
+/// Compute execution plan for anchor-based verification
+fn compute_execution_plan(
+    constraint_sources: &[ConstraintSource],
+    reader: &SegmentReader,
+) -> Option<ExecutionPlan> {
+    if constraint_sources.is_empty() || constraint_sources.len() < 2 {
+        return None;
+    }
+    
+    // Estimate selectivity for each constraint
+    let mut selectivities: Vec<(usize, u32)> = Vec::new();
+    
+    for (idx, source) in constraint_sources.iter().enumerate() {
+        let estimated_df = match source {
+            ConstraintSource::Exact { field, term } => {
+                if let Ok(inv_idx) = reader.inverted_index(*field) {
+                    inv_idx.doc_freq(term).unwrap_or(0)
+                } else {
+                    u32::MAX  // Unknown, treat as least selective
+                }
+            }
+            ConstraintSource::Regex { field, terms, .. } => {
+                // Don't choose regex as anchor if expansion is large (expensive per-doc)
+                if terms.len() > 256 {
+                    u32::MAX  // Too many terms, don't choose as anchor
+                } else if let Ok(inv_idx) = reader.inverted_index(*field) {
+                    let mut total_df = 0u32;
+                    for term in terms {
+                        total_df = total_df.saturating_add(inv_idx.doc_freq(term).unwrap_or(0));
+                    }
+                    total_df
+                } else {
+                    u32::MAX
+                }
+            }
+            ConstraintSource::Wildcard { .. } => {
+                u32::MAX  // Wildcard is least selective
+            }
+        };
+        
+        selectivities.push((idx, estimated_df));
+    }
+    
+    // Find constraint with smallest doc_freq (most selective)
+    // Prefer exact terms over regex when costs are close
+    let anchor_idx = selectivities.iter()
+        .enumerate()
+        .min_by_key(|(_, (idx, df))| {
+            let source = &constraint_sources[*idx];
+            let bonus = match source {
+                ConstraintSource::Exact { .. } => 0,  // Prefer exact
+                ConstraintSource::Regex { .. } => 1000,  // Penalize regex slightly
+                ConstraintSource::Wildcard { .. } => 10000,  // Strongly penalize wildcard
+            };
+            (*df as u64, bonus)
+        })
+        .map(|(_, (idx, _))| *idx)?;
+    
+    Some(ExecutionPlan { anchor_idx })
 }
 
 impl Weight for RustieConcatWeight {
@@ -82,6 +317,18 @@ impl Weight for RustieConcatWeight {
             println!("DEBUG: Creating RustieConcatScorer with {} sub_scorers, pattern={:?}", sub_scorers.len(), self.pattern);
         }
 
+        // Compile constraint sources for postings-based Phase 2
+        let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field) {
+            Ok(sources) => sources,
+            Err(e) => {
+                log::warn!("Failed to compile constraint sources, falling back to stored-field path: {}", e);
+                Vec::new()  // Empty means fallback to stored-field path
+            }
+        };
+
+        // Compute execution plan (anchor-based verification)
+        let execution_plan = compute_execution_plan(&constraint_sources, reader);
+
         let scorer = RustieConcatScorer {
             sub_scorers,
             pattern: self.pattern.clone(),
@@ -93,6 +340,10 @@ impl Weight for RustieConcatWeight {
             current_doc_matches: Vec::new(),
             boost,
             started: false, // Explicitly track initialization state
+            constraint_sources,
+            execution_plan,
+            position_buffers: Vec::new(),
+            regex_tmp: Vec::with_capacity(16),
         };
         Ok(Box::new(scorer))
     }
@@ -113,6 +364,10 @@ pub struct RustieConcatScorer {
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
     boost: Score,
     started: bool,
+    constraint_sources: Vec<ConstraintSource>,
+    execution_plan: Option<ExecutionPlan>,
+    position_buffers: Vec<Vec<u32>>,  // Reusable buffers for position collection
+    regex_tmp: Vec<u32>,  // Reusable buffer for regex position collection
 }
 
 impl RustieConcatScorer {
@@ -147,10 +402,7 @@ impl Scorer for RustieConcatScorer {
 
 impl DocSet for RustieConcatScorer {
     fn advance(&mut self) -> DocId {
-        eprintln!("DEBUG: advance() ENTRY - sub_scorers.len()={}, started={}", self.sub_scorers.len(), self.started);
-        
         if self.sub_scorers.is_empty() {
-            eprintln!("DEBUG: advance() - sub_scorers is empty, returning TERMINATED");
             self.current_doc = None;
             return tantivy::TERMINATED;
         }
@@ -158,25 +410,16 @@ impl DocSet for RustieConcatScorer {
         // Phase 1: Ensure scorers are positioned correctly
         if !self.started {
             self.started = true;
-            for (i, scorer) in self.sub_scorers.iter_mut().enumerate() {
-                // BUG FIX: The scorer might already be pointing at Doc 0 upon creation.
-                // We only advance if it is currently TERMINATED (uninitialized).
-                if scorer.doc() == tantivy::TERMINATED {
-                    let doc = scorer.advance();
-                    println!("DEBUG: Init Scorer[{}] was TERMINATED, advanced to {}", i, doc);
-                    if doc == tantivy::TERMINATED {
-                        self.current_doc = None;
-                        return tantivy::TERMINATED;
-                    }
-                } else {
-                    println!("DEBUG: Init Scorer[{}] started at valid doc {}, skipping initial advance", i, scorer.doc());
+            // Always advance all scorers once to land on first match
+            for scorer in self.sub_scorers.iter_mut() {
+                if scorer.advance() == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
                 }
             }
         } else {
             // Subsequent calls: Advance the LEADER (scorer 0)
-            let doc = self.sub_scorers[0].advance();
-            println!("DEBUG: Leader Scorer[0] advanced to {}", doc);
-            if doc == tantivy::TERMINATED {
+            if self.sub_scorers[0].advance() == tantivy::TERMINATED {
                 self.current_doc = None;
                 return tantivy::TERMINATED;
             }
@@ -185,33 +428,23 @@ impl DocSet for RustieConcatScorer {
         // Phase 2: Zig-Zag Intersection
         loop {
             let candidate = self.sub_scorers[0].doc();
-            println!("DEBUG: Loop start. Candidate (Leader) = {}", candidate);
             
             let mut all_match = true;
             let mut next_target = candidate;
 
-            for (i, scorer) in self.sub_scorers.iter_mut().enumerate().skip(1) {
+            for scorer in self.sub_scorers.iter_mut().skip(1) {
                 let mut s_doc = scorer.doc();
-                println!("DEBUG: Checking Scorer[{}] curr={}, target={}", i, s_doc, candidate);
-
-                // Handle case where follower is behind (uninitialized or lagging)
-                if s_doc == tantivy::TERMINATED {
-                     s_doc = scorer.advance();
-                }
 
                 while s_doc < candidate {
                     s_doc = scorer.advance();
-                    println!("DEBUG: Scorer[{}] catching up... now at {}", i, s_doc);
                 }
 
                 if s_doc == tantivy::TERMINATED {
-                    println!("DEBUG: Scorer[{}] terminated. Ending.", i);
                     self.current_doc = None;
                     return tantivy::TERMINATED;
                 }
 
                 if s_doc > candidate {
-                    println!("DEBUG: Scorer[{}] overshoot ({} > {}). Updating target.", i, s_doc, candidate);
                     next_target = s_doc;
                     all_match = false;
                     break;
@@ -219,9 +452,7 @@ impl DocSet for RustieConcatScorer {
             }
 
             if all_match {
-                println!("DEBUG: All scorers matched at {}. Checking pattern...", candidate);
                 if self.check_pattern_matching(candidate) {
-                    println!("DEBUG: Pattern matched at {}!", candidate);
                     self.current_doc = Some(candidate);
                     let score = self.compute_odinson_score();
                     self.current_matches.push((candidate, score));
@@ -229,18 +460,15 @@ impl DocSet for RustieConcatScorer {
                     return candidate;
                 }
                 
-                println!("DEBUG: Pattern match failed at {}. Advancing leader.", candidate);
                 if self.sub_scorers[0].advance() == tantivy::TERMINATED {
                     self.current_doc = None;
                     return tantivy::TERMINATED;
                 }
             } else {
-                println!("DEBUG: Alignment failed. Advancing leader to target {}", next_target);
                 let mut s0 = self.sub_scorers[0].doc();
                 while s0 < next_target {
                     s0 = self.sub_scorers[0].advance();
                 }
-                println!("DEBUG: Leader advanced to {}", s0);
                 if s0 == tantivy::TERMINATED {
                      self.current_doc = None;
                      return tantivy::TERMINATED;
@@ -250,11 +478,7 @@ impl DocSet for RustieConcatScorer {
     }
 
     fn doc(&self) -> DocId {
-        let doc = self.current_doc.unwrap_or(tantivy::TERMINATED);
-        if self.sub_scorers.len() == 2 {
-            eprintln!("DEBUG: doc() called, returning doc={}, current_doc={:?}", doc, self.current_doc);
-        }
-        doc
+        self.current_doc.unwrap_or(tantivy::TERMINATED)
     }
 
     fn size_hint(&self) -> u32 {
@@ -264,10 +488,35 @@ impl DocSet for RustieConcatScorer {
 
 impl RustieConcatScorer {
     fn check_pattern_matching(&mut self, doc_id: DocId) -> bool {
-        // Keeping debugging output to verify it works
-        println!("DEBUG: check_pattern_matching called for doc_id={} with pattern={:?}", doc_id, self.pattern);
+        log::trace!("check_pattern_matching called for doc_id={} with pattern={:?}", doc_id, self.pattern);
         
         self.current_doc_matches.clear();
+        
+        // Try postings-based path first if constraint sources are available
+        if !self.constraint_sources.is_empty() {
+            // Get doc length and execution plan before mutable borrow
+            let doc_len = self.get_doc_length(doc_id, self.default_field).ok();
+            let execution_plan = self.execution_plan.clone();
+            
+            match self.get_constraint_positions(doc_id) {
+                Ok(positions_per_constraint) => {
+                    // Use position-based matching
+                    let all_spans = find_constraint_spans_from_positions(
+                        &positions_per_constraint,
+                        &execution_plan,
+                        doc_len,
+                    );
+                    self.current_doc_matches = all_spans;
+                    return !self.current_doc_matches.is_empty();
+                }
+                Err(e) => {
+                    log::debug!("Postings-based path failed for doc {}: {}, falling back to stored-field path", doc_id, e);
+                    // Fall through to stored-field path
+                }
+            }
+        }
+        
+        // Fallback to stored-field path
         let store_reader = match self.reader.get_store_reader(1) {
             Ok(reader) => reader,
             Err(_) => return false,
@@ -292,6 +541,153 @@ impl RustieConcatScorer {
         
         !self.current_doc_matches.is_empty()
     }
+    
+    /// Fill positions for exact term constraint
+    fn fill_positions_exact(
+        reader: &SegmentReader,
+        field: Field,
+        term: &Term,
+        doc_id: DocId,
+        buf: &mut Vec<u32>,
+    ) -> TantivyResult<()> {
+        let inverted_index = reader.inverted_index(field)?;
+        let Some(mut postings) = inverted_index
+            .read_postings(term, IndexRecordOption::WithFreqsAndPositions)? else {
+            return Ok(());  // Term not in this segment, not an error
+        };
+        
+        // Only seek if current doc is less than target (seek requires forward movement)
+        let current_doc = postings.doc();
+        if current_doc < doc_id {
+            postings.seek(doc_id);
+        } else if current_doc > doc_id {
+            // Already past target - term not in this doc
+            return Ok(());
+        }
+        
+        // Now check if we're at the right document
+        if postings.doc() == doc_id {
+            buf.clear();
+            postings.positions(buf);  // Fill buffer, returns ()
+        }
+        Ok(())
+    }
+    
+    /// Fill positions for regex constraint (union of all expanded terms)
+    fn fill_positions_regex_union(
+        reader: &SegmentReader,
+        field: Field,
+        terms: &[Term],
+        doc_id: DocId,
+        buf: &mut Vec<u32>,
+        temp_buf: &mut Vec<u32>,  // Reusable temp buffer
+    ) -> TantivyResult<()> {
+        let inverted_index = reader.inverted_index(field)?;
+        
+        for term in terms {
+            if let Ok(Some(mut postings)) = inverted_index.read_postings(term, IndexRecordOption::WithFreqsAndPositions) {
+                // Only seek if current doc is less than target (seek requires forward movement)
+                let current_doc = postings.doc();
+                if current_doc < doc_id {
+                    postings.seek(doc_id);
+                } else if current_doc > doc_id {
+                    // Already past target - term not in this doc, skip
+                    continue;
+                }
+                
+                // Now check if we're at the right document
+                if postings.doc() == doc_id {
+                    temp_buf.clear();
+                    postings.positions(temp_buf);  // Fill buffer, returns ()
+                    buf.extend_from_slice(temp_buf);
+                }
+            }
+        }
+        
+        // Sort and dedup merged positions
+        buf.sort_unstable();
+        buf.dedup();
+        Ok(())
+    }
+    
+    /// Get positions for each constraint in the document using postings
+    /// Returns slices into position_buffers (allocation-free, no cloning)
+    fn get_constraint_positions<'a>(&'a mut self, doc_id: DocId) -> TantivyResult<Vec<PosView<'a>>> {
+        // Ensure we have enough buffers
+        if self.position_buffers.len() < self.constraint_sources.len() {
+            self.position_buffers.resize_with(self.constraint_sources.len(), || Vec::with_capacity(32));
+        }
+        
+        // Fill all buffers first
+        for (idx, source) in self.constraint_sources.iter().enumerate() {
+            self.position_buffers[idx].clear();
+            
+            match source {
+                ConstraintSource::Exact { field, term } => {
+                    Self::fill_positions_exact(&self.reader, *field, term, doc_id, &mut self.position_buffers[idx])?;
+                }
+                ConstraintSource::Regex { field, terms, .. } => {
+                    Self::fill_positions_regex_union(&self.reader, *field, terms, doc_id, &mut self.position_buffers[idx], &mut self.regex_tmp)?;
+                }
+                ConstraintSource::Wildcard { .. } => {
+                    // Do NOT materialize 0..doc_len - leave buffer empty
+                }
+            }
+        }
+        
+        // Now create views (slices) into the filled buffers
+        Ok(self.constraint_sources.iter().enumerate().map(|(i, src)| {
+            match src {
+                ConstraintSource::Wildcard { .. } => PosView::Any,
+                _ => PosView::List(self.position_buffers[i].as_slice()),
+            }
+        }).collect())
+    }
+    
+    /// Get document length (number of tokens) - requires fast field
+    /// Uses Tantivy 0.24 columnar fast field API
+    fn get_doc_length(&self, doc_id: DocId, _field: Field) -> TantivyResult<u32> {
+        // Require fast field - this is mandatory for postings path
+        // In Tantivy 0.24, u64() expects &str (field name), returns Column
+        let col = self.reader
+            .fast_fields()
+            .u64("sentence_length")
+            .map_err(|_| tantivy::TantivyError::SchemaError(
+                "sentence_length fast field required for postings path".to_string()
+            ))?;
+        
+        // Get value using col.values.get_val() method (Tantivy 0.24 columnar API)
+        let len = col.values.get_val(doc_id) as u32;
+        
+        if len > 0 {
+            Ok(len)
+        } else {
+            // Fallback to stored field if fast field returns 0
+            self.get_doc_length_from_stored(doc_id)
+        }
+    }
+    
+    /// Get doc length from stored field (fallback)
+    fn get_doc_length_from_stored(&self, doc_id: DocId) -> TantivyResult<u32> {
+        let store_reader = self.reader.get_store_reader(1)?;
+        let doc: tantivy::schema::TantivyDocument = store_reader.get(doc_id)?;
+        
+        if let Ok(field) = self.reader.schema().get_field("sentence_length") {
+            if let Some(value) = doc.get_first(field) {
+                if let Some(u64_val) = value.as_u64() {
+                    return Ok(u64_val as u32);
+                }
+            }
+        }
+        
+        // Last resort: infer from word field length
+        let tokens = crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), &doc, "word");
+        if !tokens.is_empty() {
+            return Ok(tokens.len() as u32);
+        }
+        
+        Err(tantivy::TantivyError::SchemaError("Cannot determine doc length".to_string()))
+    }
 
     fn extract_tokens_from_field(&self, _doc: &tantivy::schema::TantivyDocument, _field_name: &str) -> Vec<String> {
         // Deprecated: field extraction now happens in check_pattern_matching using the cache
@@ -303,6 +699,358 @@ impl RustieConcatScorer {
     }
 }
 
+/// Position-based matching using postings positions
+fn find_constraint_spans_from_positions<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    execution_plan: &Option<ExecutionPlan>,
+    doc_len: Option<u32>,
+) -> Vec<crate::types::SpanWithCaptures> {
+    let k = positions_per_constraint.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    
+    // Use anchor-based verification if plan exists
+    if let Some(plan) = execution_plan {
+        return find_spans_with_anchor(positions_per_constraint, plan, doc_len);
+    }
+    
+    // Fallback: scan all start positions
+    // For k=2, use two-pointer intersection
+    if k == 2 {
+        return find_spans_two_pointer(positions_per_constraint, doc_len);
+    }
+    
+    // For k>=3, check if bitset path is appropriate
+    let doc_len = doc_len.unwrap_or(0) as usize;
+    if doc_len == 0 {
+        return Vec::new();
+    }
+    
+    let total_positions: usize = positions_per_constraint.iter()
+        .map(|p| match p {
+            PosView::Any => doc_len,
+            PosView::List(list) => list.len(),
+        })
+        .sum();
+    
+    // Use bitset if constraints are dense and doc is not too long
+    if k >= 3 && doc_len < 10000 && total_positions > k * 10 {
+        return find_spans_bitset(positions_per_constraint, doc_len);
+    }
+    
+    // Default: scan with binary search
+    find_spans_scan(positions_per_constraint, doc_len)
+}
+
+/// Anchor-based verification: enumerate anchor positions, verify others
+fn find_spans_with_anchor<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    plan: &ExecutionPlan,
+    doc_len: Option<u32>,
+) -> Vec<crate::types::SpanWithCaptures> {
+    let anchor_positions = match &positions_per_constraint[plan.anchor_idx] {
+        PosView::Any => {
+            // Anchor is wildcard - fallback to scan
+            let doc_len = doc_len.unwrap_or(0) as usize;
+            return find_spans_scan(positions_per_constraint, doc_len);
+        }
+        PosView::List(list) => *list,
+    };
+    
+    let k = positions_per_constraint.len();
+    let mut results = Vec::new();
+    
+    for &anchor_pos in anchor_positions.iter() {
+        // Compute sequence start: anchor_pos - anchor_idx
+        let seq_start = anchor_pos as isize - plan.anchor_idx as isize;
+        if seq_start < 0 {
+            continue;  // Start would be before document start
+        }
+        
+        let mut matched = true;
+        
+        for (j, constraint_pos) in positions_per_constraint.iter().enumerate() {
+            // For concatenation, wanted position is seq_start + j
+            let wanted = seq_start + j as isize;
+            let wanted = match u32::try_from(wanted) {
+                Ok(v) => v,
+                Err(_) => {
+                    matched = false;
+                    break;
+                }
+            };
+            
+            // Check if wanted position matches this constraint
+            match constraint_pos {
+                PosView::Any => {
+                    // Wildcard: always matches
+                }
+                PosView::List(list) => {
+                    if list.binary_search(&wanted).is_err() {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if matched {
+            let start = seq_start as usize;
+            if let Some(dl) = doc_len {
+                if start + k > dl as usize {
+                    continue;
+                }
+            }
+            results.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end: start + k }));
+        }
+    }
+    
+    results
+}
+
+/// Two-pointer intersection for k=2 (faster than binary search)
+fn find_spans_two_pointer<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    doc_len: Option<u32>,
+) -> Vec<crate::types::SpanWithCaptures> {
+    if positions_per_constraint.len() != 2 {
+        return Vec::new();
+    }
+    
+    let (pos0, pos1) = match (&positions_per_constraint[0], &positions_per_constraint[1]) {
+        (PosView::Any, PosView::Any) => {
+            // Both wildcards - all positions match
+            let dl = doc_len.unwrap_or(u32::MAX) as usize;
+            return (0..dl.saturating_sub(1))
+                .filter_map(|start| {
+                    let end = start + 2;
+                    if end <= dl {
+                        Some(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        (PosView::Any, PosView::List(p1)) => {
+            // First is wildcard - check second at offset 1
+            let dl = doc_len.unwrap_or(u32::MAX) as usize;
+            return p1.iter()
+                .filter_map(|&p1_pos| {
+                    if p1_pos > 0 {
+                        let start = (p1_pos - 1) as usize;
+                        let end = (p1_pos + 1) as usize;
+                        if end <= dl {
+                            Some(crate::types::SpanWithCaptures::new(crate::types::Span {
+                                start,
+                                end,
+                            }))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        (PosView::List(p0), PosView::Any) => {
+            // Second is wildcard - check first
+            let dl = doc_len.unwrap_or(u32::MAX) as usize;
+            return p0.iter()
+                .filter_map(|&p0_pos| {
+                    let start = p0_pos as usize;
+                    let end = (p0_pos + 2) as usize;
+                    if end <= dl {
+                        Some(crate::types::SpanWithCaptures::new(crate::types::Span {
+                            start,
+                            end,
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        (PosView::List(p0), PosView::List(p1)) => (*p0, *p1),
+    };
+    
+    let mut results = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    
+    while i < pos0.len() && j < pos1.len() {
+        let p0 = pos0[i];
+        let p1_target = p0 + 1;  // Adjacent position
+        
+        // Advance j to find p1_target or beyond
+        while j < pos1.len() && pos1[j] < p1_target {
+            j += 1;
+        }
+        
+        if j < pos1.len() && pos1[j] == p1_target {
+            // Found match: pos0[i] and pos1[j] are adjacent
+            let span = crate::types::Span { 
+                start: p0 as usize, 
+                end: (p1_target + 1) as usize 
+            };
+            results.push(crate::types::SpanWithCaptures::new(span));
+        }
+        
+        i += 1;
+    }
+    
+    results
+}
+
+/// Bitset-based matching for k>=3 using fast shift-and algorithm
+fn find_spans_bitset<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    doc_len: usize,
+) -> Vec<crate::types::SpanWithCaptures> {
+    if doc_len == 0 {
+        return Vec::new();
+    }
+    
+    let k = positions_per_constraint.len();
+    let bitset_len = (doc_len + 63) / 64;  // Round up to u64 chunks
+    let mut bitsets: Vec<Vec<u64>> = Vec::new();
+    
+    // Build bitsets: B[j][i] = 1 if constraint j matches at position i
+    for constraint_pos in positions_per_constraint {
+        let mut bitset = vec![0u64; bitset_len];
+        match constraint_pos {
+            PosView::Any => {
+                // Wildcard: set all bits
+                for chunk in &mut bitset {
+                    *chunk = u64::MAX;
+                }
+                // Clear bits beyond doc_len
+                let last_chunk = (doc_len - 1) / 64;
+                let last_bit = (doc_len - 1) % 64;
+                if last_chunk < bitset.len() {
+                    bitset[last_chunk] &= (1u64 << (last_bit + 1)) - 1;
+                }
+            }
+            PosView::List(positions) => {
+                for &pos in positions.iter() {
+                    let idx = pos as usize;
+                    if idx < doc_len {
+                        let chunk = idx / 64;
+                        let bit = idx % 64;
+                        if chunk < bitset.len() {
+                            bitset[chunk] |= 1u64 << bit;
+                        }
+                    }
+                }
+            }
+        }
+        bitsets.push(bitset);
+    }
+    
+    // Fast shift-and: S = B[0] & (B[1] >> 1) & (B[2] >> 2) & ...
+    // Shift each bitset by its offset, then AND them all together
+    let mut shifted_bitsets = Vec::new();
+    
+    for (offset, bitset) in bitsets.iter().enumerate() {
+        let mut shifted = vec![0u64; bitset_len];
+        
+        if offset == 0 {
+            // No shift needed for first bitset
+            shifted.copy_from_slice(bitset);
+        } else {
+            // Shift right by offset positions
+            let shift_chunks = offset / 64;
+            let shift_bits = offset % 64;
+            
+            for (dst_idx, dst_chunk) in shifted.iter_mut().enumerate() {
+                let src_idx = dst_idx + shift_chunks;
+                
+                if src_idx < bitset.len() {
+                    *dst_chunk = bitset[src_idx] >> shift_bits;
+                    // Carry bits from next chunk if needed
+                    if shift_bits > 0 && src_idx + 1 < bitset.len() {
+                        *dst_chunk |= bitset[src_idx + 1] << (64 - shift_bits);
+                    }
+                }
+            }
+        }
+        
+        shifted_bitsets.push(shifted);
+    }
+    
+    // AND all shifted bitsets together
+    let mut result_bitset = shifted_bitsets[0].clone();
+    for shifted in shifted_bitsets.iter().skip(1) {
+        for (result_chunk, shifted_chunk) in result_bitset.iter_mut().zip(shifted.iter()) {
+            *result_chunk &= *shifted_chunk;
+        }
+    }
+    
+    // Enumerate set bits in result_bitset as starts
+    let mut results = Vec::new();
+    for (chunk_idx, chunk) in result_bitset.iter().enumerate() {
+        let mut bits = *chunk;
+        let base_pos = chunk_idx * 64;
+        
+        while bits != 0 {
+            let bit_pos = bits.trailing_zeros() as usize;
+            let start = base_pos + bit_pos;
+            if start + k <= doc_len {
+                let span = crate::types::Span { start, end: start + k };
+                results.push(crate::types::SpanWithCaptures::new(span));
+            }
+            bits &= bits - 1;  // Clear lowest set bit
+        }
+    }
+    
+    results
+}
+
+/// Scan-based matching with binary search (fallback)
+fn find_spans_scan<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    doc_len: usize,
+) -> Vec<crate::types::SpanWithCaptures> {
+    if positions_per_constraint.is_empty() || doc_len == 0 {
+        return Vec::new();
+    }
+    
+    let k = positions_per_constraint.len();
+    let mut results = Vec::new();
+    
+    // Scan all possible start positions
+    for start in 0..=doc_len.saturating_sub(k) {
+        let mut matched = true;
+        
+        for (offset, constraint_pos) in positions_per_constraint.iter().enumerate() {
+            let check_pos = (start + offset) as u32;
+            
+            match constraint_pos {
+                PosView::Any => {
+                    // Wildcard: always matches
+                }
+                PosView::List(list) => {
+                    // Binary search for position
+                    if list.binary_search(&check_pos).is_err() {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        if matched {
+            let span = crate::types::Span { start, end: start + k };
+            results.push(crate::types::SpanWithCaptures::new(span));
+        }
+    }
+    
+    results
+}
+
+/// Original stored-field based matching (fallback)
 pub fn find_constraint_spans_in_sequence(
     pattern: &crate::compiler::ast::Pattern, 
     field_cache: &std::collections::HashMap<String, Vec<String>>
@@ -360,7 +1108,7 @@ fn matches_pattern_at_position(
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize
 ) -> Option<crate::types::SpanWithCaptures> {
-    use crate::compiler::ast::{Pattern, Constraint};
+    use crate::compiler::ast::Pattern;
     
     match pattern {
         Pattern::Constraint(constraint) => {

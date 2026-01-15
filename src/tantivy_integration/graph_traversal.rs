@@ -27,6 +27,7 @@ static PREFILTER_DOCS: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_KILLED: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_ALLOWED_POS_SUM: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_ALLOWED_POS_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 // Odinson-style collapsed query metrics
 static SRC_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
 static DST_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
