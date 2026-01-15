@@ -32,6 +32,9 @@ static DST_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
 static DRIVER_ALIGNMENT_DOCS: AtomicUsize = AtomicUsize::new(0);
 static DRIVER_INTERSECTION_SUM: AtomicUsize = AtomicUsize::new(0);
 static DRIVER_INTERSECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
+// Optimization: Skip prefilter when all constraints are collapsed (2-constraint patterns)
+static PREFILTER_SKIPPED_ALL_COLLAPSED: AtomicUsize = AtomicUsize::new(0);
+static TOKEN_EXTRACTION_SKIPPED: AtomicUsize = AtomicUsize::new(0);
 
 /// Edge term requirement for position prefiltering
 #[derive(Clone, Debug)]
@@ -699,6 +702,9 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                         0.0
                     };
                     
+                    let prefilter_skipped_collapsed = PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed);
+                    let token_extraction_skipped = TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed);
+                    
                     log::info!(
                         "FINAL Graph traversal stats: {} candidates checked, {} graphs deserialized ({} skipped, {:.1}% skip rate)",
                         call_num, deser_count, skipped_count, skip_rate
@@ -706,6 +712,10 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                     log::info!(
                         "FINAL Prefilter stats: {} docs checked, {} killed by prefilter ({:.1}% kill rate), avg allowed positions per constraint: {:.1}",
                         prefilter_docs, prefilter_killed, prefilter_kill_rate, avg_allowed_pos
+                    );
+                    log::info!(
+                        "FINAL Optimization: {} prefilter calls skipped (all-collapsed), {} token extractions skipped",
+                        prefilter_skipped_collapsed, token_extraction_skipped
                     );
                     log::info!(
                         "FINAL Odinson driver stats: src_driver={} docs, dst_driver={} docs, aligned={} docs, avg intersection size={:.1}",
@@ -971,19 +981,46 @@ impl OptimizedGraphTraversalScorer {
             log::debug!("Using dst_driver positions for last constraint (Odinson position handoff)");
         }
 
+        // OPTIMIZATION: Detect if ALL constraints are collapsed (2-constraint pattern)
+        // When both src and dst are collapsed, compute_allowed_positions is redundant
+        // because driver positions already contain filtered constraint+edge intersections
+        let num_constraints = self.prefilter_plan.num_constraints;
+        let all_collapsed = num_constraints == 2 
+            && self.src_collapse.is_some() 
+            && self.dst_collapse.is_some()
+            && src_driver_positions.is_some()
+            && dst_driver_positions.is_some();
+
         // Phase 0: Postings prefilter (before any store access)
-        // Pass driver positions to avoid duplicate work for collapsed constraints
+        // Skip entirely for all-collapsed patterns (positions already computed by drivers)
         PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
-        let allowed_positions = match self.compute_allowed_positions(
-            doc_id,
-            src_driver_positions.as_deref(),
-            dst_driver_positions.as_deref(),
-        ) {
-            Some(ap) => ap,
-            None => {
-                PREFILTER_KILLED.fetch_add(1, Ordering::Relaxed);
-                GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                return false;
+        let allowed_positions = if all_collapsed {
+            // OPTIMIZATION: Skip compute_allowed_positions entirely
+            // Driver positions are already filtered for constraint+edge intersection
+            PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
+            log::debug!("Skipping prefilter: all {} constraints collapsed", num_constraints);
+            
+            let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
+            if let Some(ref positions) = src_driver_positions {
+                allowed[0] = Some(positions.clone());
+            }
+            if let Some(ref positions) = dst_driver_positions {
+                allowed[num_constraints - 1] = Some(positions.clone());
+            }
+            allowed
+        } else {
+            // Standard path: use prefilter for middle constraints or non-collapsed patterns
+            match self.compute_allowed_positions(
+                doc_id,
+                src_driver_positions.as_deref(),
+                dst_driver_positions.as_deref(),
+            ) {
+                Some(ap) => ap,
+                None => {
+                    PREFILTER_KILLED.fetch_add(1, Ordering::Relaxed);
+                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
             }
         };
 
@@ -1022,9 +1059,11 @@ impl OptimizedGraphTraversalScorer {
             Err(_) => return false,
         };
 
-        // Phase 2: Extract tokens ONLY for constraint fields that need regex checking
-        // Skip extraction if allowed_positions is tiny and we can use it directly
-        // Note: We reuse self.constraint_field_names directly instead of cloning field names
+        // Phase 2: Extract tokens for ALL constraint fields
+        // NOTE: We CANNOT skip token extraction for collapsed constraints because
+        // automaton_query_paths() needs tokens to verify matches during graph traversal.
+        // The driver positions tell us WHERE to start, but traversal still needs tokens
+        // to validate that graph nodes match the constraint patterns.
         let mut constraint_tokens: Vec<Vec<String>> =
             Vec::with_capacity(self.constraint_field_names.len());
 
@@ -1124,13 +1163,16 @@ impl OptimizedGraphTraversalScorer {
             let pf_killed = PREFILTER_KILLED.load(Ordering::Relaxed);
             let pos_sum = PREFILTER_ALLOWED_POS_SUM.load(Ordering::Relaxed);
             let pos_count = PREFILTER_ALLOWED_POS_COUNT.load(Ordering::Relaxed);
+            let pf_skip_collapsed = PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed);
+            let token_skip = TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed);
             
             log::info!(
-                "Stats: calls={} deser={} skipped={} prefilter_killed={}/{} ({:.1}%) avg_positions={:.1}",
+                "Stats: calls={} deser={} skipped={} prefilter_killed={}/{} ({:.1}%) avg_positions={:.1} collapsed_skip={} token_skip={}",
                 call_num, deser, skipped,
                 pf_killed, pf_docs,
                 if pf_docs > 0 { pf_killed as f64 / pf_docs as f64 * 100.0 } else { 0.0 },
-                if pos_count > 0 { pos_sum as f64 / pos_count as f64 } else { 0.0 }
+                if pos_count > 0 { pos_sum as f64 / pos_count as f64 } else { 0.0 },
+                pf_skip_collapsed, token_skip
             );
         }
 
