@@ -3,7 +3,7 @@ use tantivy::{
     schema::{Term, Schema},
 };
 use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
-use crate::tantivy_integration::concat_query::{RustieConcatQuery, GapPlan};
+use crate::tantivy_integration::concat_query::{RustieConcatQuery, ConcatPlan, ConcatStep};
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
 use crate::tantivy_integration::assertion_query::LookaheadQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
@@ -136,9 +136,23 @@ impl BasicCompiler {
                 Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions)))
             }
             Matcher::Regex { pattern, regex } => {
-                let regex_query = RegexQuery::from_pattern(pattern, field)
-                    .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
-                Ok(Box::new(regex_query))
+                // Strip /.../ delimiters before processing
+                let clean_pattern = pattern.trim_start_matches('/').trim_end_matches('/');
+                
+                // Optimization: If the regex pattern is a simple literal (no special regex chars),
+                // use TermQuery instead of RegexQuery for better performance and reliability
+                // This handles cases like /ago/ which should match the literal "ago"
+                if Self::is_simple_literal_regex(pattern) {
+                    // Extract the literal string (remove leading/trailing /)
+                    let literal = clean_pattern;
+                    let term = Term::from_field_text(field, literal);
+                    log::debug!("Optimizing regex pattern '{}' to TermQuery for literal '{}'", pattern, literal);
+                    Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions)))
+                } else {
+                    let regex_query = RegexQuery::from_pattern(clean_pattern, field)
+                        .map_err(|e| anyhow!("Invalid regex pattern '{}': {}", pattern, e))?;
+                    Ok(Box::new(regex_query))
+                }
             }
         }
     }
@@ -194,36 +208,28 @@ impl BasicCompiler {
     }
 
     fn compile_concatenated(&self, patterns: &[Pattern]) -> Result<Box<dyn Query>> {
-        // Check for gap pattern: Constraint A + Repetition(Wildcard) + Constraint B
-        let gap_plan = Self::detect_gap_pattern(patterns);
+        // Build concat plan for postings-based execution
+        let concat_plan = Self::build_concat_plan(patterns);
         
         let mut sub_queries = Vec::new();
 
-        if gap_plan.is_some() {
-            // Phase 1 optimization for gap queries:
-            // only compile A and B as candidate generators; skip the wildcard repetition entirely.
-            //
-            // We purposely use indices in the original `patterns` array:
-            //   patterns[0] = A
-            //   patterns[1] = Repetition(Wildcard,...)
-            //   patterns[2] = B
-            //
-            // GapPlan indices (0,1) refer to the filtered constraint list used in Phase 2.
-            //
-            // NOTE: Hardcoding [0, 2] is acceptable given the current strict detection
-            // (patterns.len() == 3). If gap detection is broadened later (e.g., to support
-            // captures/wrappers or variable-length patterns), this should be generalized.
-            for &idx in &[0usize, 2usize] {
-                if let Some(pat) = patterns.get(idx) {
-                    // Only compile if it's actually a constraint or capture-wrapped constraint.
-                    // (Avoid compiling something unexpected as a safety measure.)
-                    if Self::as_constraint(pat).is_some() {
-                        sub_queries.push(self.compile_pattern(pat)?);
+        if concat_plan.is_some() {
+            // Phase 1 optimization for concat queries:
+            // only compile atom constraints as candidate generators; skip gap repetitions entirely.
+            for pattern in patterns {
+                // Only compile if it's actually a constraint or capture-wrapped constraint.
+                // (Avoid compiling gap repetitions or other non-constraints.)
+                if Self::as_constraint(pattern).is_some() {
+                    // Reject wildcard as atom (shouldn't happen if build_concat_plan succeeded, but defensive)
+                    if let Some(c) = Self::as_constraint(pattern) {
+                        if !matches!(c, Constraint::Wildcard) {
+                            sub_queries.push(self.compile_pattern(pattern)?);
+                        }
                     }
                 }
             }
         } else {
-            // Original behavior for non-gap patterns:
+            // Original behavior for non-concat-plan patterns:
             // include mandatory patterns only (to avoid over-filtering).
             for pattern in patterns {
                 if self.is_mandatory_pattern(pattern) {
@@ -256,9 +262,9 @@ impl BasicCompiler {
             sub_queries,
         );
         
-        // Set gap plan if detected
-        if let Some(gap) = gap_plan {
-            pattern_query.gap_plan = Some(gap);
+        // Set concat plan if detected
+        if let Some(plan) = concat_plan {
+            pattern_query.concat_plan = Some(plan);
         }
         
         Ok(Box::new(pattern_query))
@@ -279,40 +285,90 @@ impl BasicCompiler {
         }
     }
 
-    /// Detect gap pattern: Constraint A + Repetition(Wildcard, min, max, kind) + Constraint B
-    fn detect_gap_pattern(patterns: &[Pattern]) -> Option<GapPlan> {
-        if patterns.len() != 3 {
+    /// Check if a regex pattern is a simple literal (no special regex characters)
+    fn is_simple_literal_regex(pattern: &str) -> bool {
+        // Remove leading/trailing slashes
+        let trimmed = pattern.trim_start_matches('/').trim_end_matches('/');
+        // Check if it contains only alphanumeric characters and common word characters
+        // (no regex special chars like ^, $, ., *, +, ?, |, [, ], {, }, (, ))
+        trimmed.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    }
+
+    /// Helper to detect gap repetition (Repetition(Wildcard))
+    fn as_gap(p: &Pattern) -> Option<(usize, Option<usize>, bool)> {
+        match p {
+            Pattern::Repetition { pattern, min, max, kind } => {
+                if matches!(pattern.as_ref(), Pattern::Constraint(Constraint::Wildcard)) {
+                    Some((*min, *max, *kind == QuantifierKind::Lazy))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Build a ConcatPlan from patterns array.
+    /// Returns None if the pattern cannot be represented as a postings plan
+    /// (e.g., contains assertions, nested concats, or wildcard as atom).
+    fn build_concat_plan(patterns: &[Pattern]) -> Option<ConcatPlan> {
+        let mut steps = Vec::new();
+        let mut next_cidx = 0usize;
+        let mut prev_was_atom = false;
+
+        for p in patterns {
+            if let Some(c) = Self::as_constraint(p) {
+                // Reject wildcard as atom for v1 (only allow in gaps)
+                if matches!(c, Constraint::Wildcard) {
+                    return None;
+                }
+                // Atom
+                if prev_was_atom {
+                    // Insert adjacency gap between consecutive atoms
+                    steps.push(ConcatStep::Gap { min: 0, max: Some(0), lazy: false });
+                }
+                steps.push(ConcatStep::Atom { constraint_idx: next_cidx });
+                next_cidx += 1;
+                prev_was_atom = true;
+                continue;
+            }
+
+            if let Some((min, max, lazy)) = Self::as_gap(p) {
+                // Gap must come after an Atom, and must be followed by an Atom to be usable.
+                // We can still record it now; validation later.
+                steps.push(ConcatStep::Gap { min, max, lazy });
+                prev_was_atom = false;
+                continue;
+            }
+
+            // Anything else: assertions, nested concats, repetition of non-wildcard, etc.
+            // Not supported in postings plan -> return None so you fall back.
             return None;
         }
-        
-        // Check if pattern is: Constraint + Repetition(Wildcard) + Constraint
-        // Use as_constraint to support NamedCapture wrappers
-        let _a = Self::as_constraint(&patterns[0])?;  // Returns None if not a constraint
-        let _b = Self::as_constraint(&patterns[2])?;  // Returns None if not a constraint
-        
-        // Keep repetition check strict - only accept Pattern::Repetition with Constraint(Wildcard)
-        let repetition_wildcard = match &patterns[1] {
-            Pattern::Repetition { pattern, .. } => {
-                matches!(pattern.as_ref(), Pattern::Constraint(Constraint::Wildcard))
-            }
-            _ => false,
-        };
-        
-        if repetition_wildcard {
-            if let Pattern::Repetition { min, max, kind, .. } = &patterns[1] {
-                // Note: compile_constraint_sources skips non-constraint patterns (like Repetition),
-                // so positions_per_constraint will be [A, B] (indices 0, 1), not [A, Wildcard, B]
-                return Some(GapPlan {
-                    constraint_a_idx: 0,
-                    constraint_b_idx: 1,  // Fixed: was 2, should be 1 since wildcard is skipped
-                    min_gap: *min,
-                    max_gap: *max,
-                    lazy: *kind == QuantifierKind::Lazy,
-                });
+
+        // Validate form: must start with Atom, end with Atom, and alternate Atom/Gaps properly
+        if steps.is_empty() {
+            return None;
+        }
+        if !matches!(steps.first().unwrap(), ConcatStep::Atom { .. }) {
+            return None;
+        }
+        if !matches!(steps.last().unwrap(), ConcatStep::Atom { .. }) {
+            return None;
+        }
+
+        // Also reject "Gap Gap" or "Atom Atom" sequences (after normalization)
+        for w in steps.windows(2) {
+            match (&w[0], &w[1]) {
+                (ConcatStep::Atom { .. }, ConcatStep::Gap { .. }) => {}
+                (ConcatStep::Gap { .. }, ConcatStep::Atom { .. }) => {}
+                _ => {
+                    return None;
+                }
             }
         }
-        
-        None
+
+        Some(ConcatPlan { steps })
     }
 
     fn compile_repetition(&self, pattern: &Pattern, min: usize, max: Option<usize>, _kind: QuantifierKind) -> Result<Box<dyn Query>> {

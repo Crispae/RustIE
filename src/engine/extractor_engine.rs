@@ -381,18 +381,38 @@ impl ExtractorEngine {
         // Sort by score descending (highest scores first)
         all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply limit
-        all_results.truncate(limit);
+        // DEDUPLICATE: Remove duplicates based on (document_id, sentence_id), keeping highest score
+        let mut seen: std::collections::HashMap<String, SentenceResult> = std::collections::HashMap::new();
+        for (result, score) in all_results {
+            let key = format!("{}:{}", result.document_id, result.sentence_id);
+            match seen.get(&key) {
+                Some(existing) => {
+                    // Keep the one with higher score
+                    if score > existing.score {
+                        seen.insert(key, result);
+                    }
+                }
+                None => {
+                    seen.insert(key, result);
+                }
+            }
+        }
+        
+        // Build deduplicated results, sorted by score (already sorted from HashMap iteration, but ensure order)
+        let mut deduplicated: Vec<SentenceResult> = seen.into_values().collect();
+        deduplicated.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Apply limit after deduplication
+        deduplicated.truncate(limit);
 
-        let max_score = all_results.first().map(|(_, score)| *score);
-        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+        let max_score = deduplicated.first().map(|r| r.score);
 
-        log::debug!("Graph traversal found {} results using parallel segments", sentence_results.len());
+        log::debug!("Graph traversal found {} results using parallel segments", deduplicated.len());
 
         Ok(RustIeResult {
-            total_hits: sentence_results.len(),
+            total_hits: deduplicated.len(),
             score_docs: Vec::new(),
-            sentence_results,
+            sentence_results: deduplicated,
             max_score,
         })
     }
@@ -457,10 +477,39 @@ impl ExtractorEngine {
             max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
         }
         
+        // DEDUPLICATE: Remove duplicates based on (document_id, sentence_id), keeping highest score
+        let mut seen: std::collections::HashMap<String, (usize, Score)> = std::collections::HashMap::new();
+        for (idx, result) in sentence_results.iter().enumerate() {
+            let key = format!("{}:{}", result.document_id, result.sentence_id);
+            match seen.get(&key) {
+                Some(&(existing_idx, existing_score)) => {
+                    // Keep the one with higher score
+                    if result.score > existing_score {
+                        seen.insert(key, (idx, result.score));
+                    }
+                }
+                None => {
+                    seen.insert(key, (idx, result.score));
+                }
+            }
+        }
+        
+        // Build deduplicated results, preserving order by score (highest first)
+        let mut deduplicated: Vec<SentenceResult> = seen
+            .into_iter()
+            .map(|(_, (idx, _))| sentence_results[idx].clone())
+            .collect();
+        
+        // Sort by score descending to maintain order
+        deduplicated.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Apply limit after deduplication
+        deduplicated.truncate(limit);
+        
         Ok(RustIeResult {
-            total_hits: sentence_results.len(),
+            total_hits: deduplicated.len(),
             score_docs,
-            sentence_results,
+            sentence_results: deduplicated,
             max_score,
         })
     }
@@ -543,18 +592,38 @@ impl ExtractorEngine {
         // Sort by score descending (highest scores first)
         all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Apply limit
-        all_results.truncate(limit);
+        // DEDUPLICATE: Remove duplicates based on (document_id, sentence_id), keeping highest score
+        let mut seen: std::collections::HashMap<String, SentenceResult> = std::collections::HashMap::new();
+        for (result, score) in all_results {
+            let key = format!("{}:{}", result.document_id, result.sentence_id);
+            match seen.get(&key) {
+                Some(existing) => {
+                    // Keep the one with higher score
+                    if score > existing.score {
+                        seen.insert(key, result);
+                    }
+                }
+                None => {
+                    seen.insert(key, result);
+                }
+            }
+        }
+        
+        // Build deduplicated results, sorted by score
+        let mut deduplicated: Vec<SentenceResult> = seen.into_values().collect();
+        deduplicated.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Apply limit after deduplication
+        deduplicated.truncate(limit);
 
-        let max_score = all_results.first().map(|(_, score)| *score);
-        let sentence_results: Vec<SentenceResult> = all_results.into_iter().map(|(r, _)| r).collect();
+        let max_score = deduplicated.first().map(|r| r.score);
 
-        log::debug!("Optimized pattern matching found {} results using parallel segments", sentence_results.len());
+        log::debug!("Optimized pattern matching found {} results using parallel segments", deduplicated.len());
 
         Ok(RustIeResult {
-            total_hits: sentence_results.len(),
+            total_hits: deduplicated.len(),
             score_docs: Vec::new(),
-            sentence_results,
+            sentence_results: deduplicated,
             max_score,
         })
     }
@@ -603,10 +672,37 @@ impl ExtractorEngine {
             max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
         }
         
+        // DEDUPLICATE: Remove duplicates based on (document_id, sentence_id), keeping highest score
+        let mut seen: std::collections::HashMap<String, SentenceResult> = std::collections::HashMap::new();
+        for result in sentence_results {
+            let key = format!("{}:{}", result.document_id, result.sentence_id);
+            match seen.get(&key) {
+                Some(existing) => {
+                    // Keep the one with higher score
+                    if result.score > existing.score {
+                        seen.insert(key, result);
+                    }
+                }
+                None => {
+                    seen.insert(key, result);
+                }
+            }
+        }
+        
+        // Build deduplicated results, sorted by score
+        let mut deduplicated: Vec<SentenceResult> = seen.into_values().collect();
+        deduplicated.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        
+        // Apply limit after deduplication
+        deduplicated.truncate(limit);
+        
+        // Update max_score from deduplicated results
+        let max_score = deduplicated.first().map(|r| r.score).or(max_score);
+        
         Ok(RustIeResult {
-            total_hits: sentence_results.len(),
+            total_hits: deduplicated.len(),
             score_docs: Vec::new(),
-            sentence_results,
+            sentence_results: deduplicated,
             max_score,
         })
     }

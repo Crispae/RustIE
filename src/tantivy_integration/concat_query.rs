@@ -11,14 +11,21 @@ pub struct ExecutionPlan {
     pub anchor_idx: usize,
 }
 
-/// Gap plan for gap-based matching (Constraint A + Repetition(Wildcard) + Constraint B)
+/// Step in a concatenation execution plan
 #[derive(Debug, Clone)]
-pub struct GapPlan {
-    pub constraint_a_idx: usize,
-    pub constraint_b_idx: usize,
-    pub min_gap: usize,
-    pub max_gap: Option<usize>,
-    pub lazy: bool,
+pub enum ConcatStep {
+    /// A single-token constraint (positions come from positions_per_constraint[constraint_idx])
+    Atom { constraint_idx: usize },
+
+    /// A variable-width gap of wildcard tokens between atoms.
+    /// Gap is measured as number of tokens *between* the two atoms.
+    Gap { min: usize, max: Option<usize>, lazy: bool },
+}
+
+/// Execution plan for concatenation patterns with gaps
+#[derive(Debug, Clone)]
+pub struct ConcatPlan {
+    pub steps: Vec<ConcatStep>,
 }
 
 /// Constraint source for position-based matching
@@ -44,7 +51,7 @@ pub struct RustieConcatQuery {
     pub pattern: Pattern,
     pub sub_queries: Vec<Box<dyn Query>>,
     pub execution_plan: Option<ExecutionPlan>,
-    pub gap_plan: Option<GapPlan>,
+    pub concat_plan: Option<ConcatPlan>,
 }
 
 impl Clone for RustieConcatQuery {
@@ -54,7 +61,7 @@ impl Clone for RustieConcatQuery {
             pattern: self.pattern.clone(),
             sub_queries: self.sub_queries.iter().map(|q| q.box_clone()).collect(),
             execution_plan: self.execution_plan.clone(),
-            gap_plan: self.gap_plan.clone(),
+            concat_plan: self.concat_plan.clone(),
         }
     }
 }
@@ -70,7 +77,7 @@ impl RustieConcatQuery {
             pattern,
             sub_queries,
             execution_plan: None,
-            gap_plan: None,
+            concat_plan: None,
         }
     }
 }
@@ -86,7 +93,7 @@ impl Query for RustieConcatQuery {
             sub_weights,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
-            gap_plan: self.gap_plan.clone(),
+            concat_plan: self.concat_plan.clone(),
         }))
     }
 }
@@ -95,7 +102,7 @@ struct RustieConcatWeight {
     sub_weights: Vec<Box<dyn Weight>>,
     pattern: Pattern,
     default_field: Field,
-    gap_plan: Option<GapPlan>,
+    concat_plan: Option<ConcatPlan>,
 }
 
 /// Helper to extract constraints from a Pattern
@@ -139,6 +146,29 @@ fn compile_constraint_sources(
     
     match pattern {
         Pattern::Concatenated(patterns) => {
+            // ═══════════════════════════════════════════════════════════════
+            // NEW: Check if pattern contains Repetition elements
+            // If so, fall back to stored-field path which has proper backtracking
+            // ═══════════════════════════════════════════════════════════════
+            for pat in patterns {
+                if matches!(pat, Pattern::Repetition { .. }) {
+                    log::debug!(
+                        "Pattern contains Repetition element, falling back to stored-field path for proper backtracking"
+                    );
+                    return Ok(Vec::new());  // Empty = fallback to stored-field path
+                }
+                // Also check inside NamedCapture
+                if let Pattern::NamedCapture { pattern: inner, .. } = pat {
+                    if matches!(inner.as_ref(), Pattern::Repetition { .. }) {
+                        log::debug!(
+                            "Pattern contains Repetition inside NamedCapture, falling back to stored-field path"
+                        );
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+            // ═══════════════════════════════════════════════════════════════
+            
             for pat in patterns {
                 let constraint = match pat {
                     Pattern::Constraint(c) => c,
@@ -192,6 +222,9 @@ fn compile_constraint_to_source(
                     Ok(ConstraintSource::Exact { field, term })
                 }
                 Matcher::Regex { pattern, .. } => {
+                    // Strip /.../ delimiters before FST expansion
+                    let clean_pattern = pattern.trim_start_matches('/').trim_end_matches('/');
+                    
                     // Check cache first
                     let cache_key = format!("{}:{}", name, pattern);
                     let terms = if let Some(cached) = regex_cache.get(&cache_key) {
@@ -202,7 +235,7 @@ fn compile_constraint_to_source(
                             .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to get inverted index: {}", e)))?;
                         let term_dict = inverted_index.terms();
                         
-                        let automaton = tantivy_fst::Regex::new(pattern)
+                        let automaton = tantivy_fst::Regex::new(clean_pattern)
                             .map_err(|e| tantivy::TantivyError::SchemaError(format!("Invalid regex pattern '{}': {}", pattern, e)))?;
                         
                         let mut stream = term_dict.search(&automaton).into_stream()
@@ -344,8 +377,8 @@ impl Weight for RustieConcatWeight {
         // Compute execution plan (anchor-based verification)
         let execution_plan = compute_execution_plan(&constraint_sources, reader);
         
-        // Get gap plan from query
-        let gap_plan = self.gap_plan.clone();
+        // Get concat plan from query
+        let concat_plan = self.concat_plan.clone();
 
         let scorer = RustieConcatScorer {
             sub_scorers,
@@ -360,7 +393,7 @@ impl Weight for RustieConcatWeight {
             started: false, // Explicitly track initialization state
             constraint_sources,
             execution_plan,
-            gap_plan,
+            concat_plan,
             position_buffers: Vec::new(),
             regex_tmp: Vec::with_capacity(16),
         };
@@ -385,7 +418,7 @@ pub struct RustieConcatScorer {
     started: bool,
     constraint_sources: Vec<ConstraintSource>,
     execution_plan: Option<ExecutionPlan>,
-    gap_plan: Option<GapPlan>,
+    concat_plan: Option<ConcatPlan>,
     position_buffers: Vec<Vec<u32>>,  // Reusable buffers for position collection
     regex_tmp: Vec<u32>,  // Reusable buffer for regex position collection
 }
@@ -431,8 +464,9 @@ impl DocSet for RustieConcatScorer {
         if !self.started {
             self.started = true;
             // Always advance all scorers once to land on first match
-            for scorer in self.sub_scorers.iter_mut() {
-                if scorer.advance() == tantivy::TERMINATED {
+            for (i, scorer) in self.sub_scorers.iter_mut().enumerate() {
+                let doc = scorer.advance();
+                if doc == tantivy::TERMINATED {
                     self.current_doc = None;
                     return tantivy::TERMINATED;
                 }
@@ -452,7 +486,7 @@ impl DocSet for RustieConcatScorer {
             let mut all_match = true;
             let mut next_target = candidate;
 
-            for scorer in self.sub_scorers.iter_mut().skip(1) {
+            for (scorer_idx, scorer) in self.sub_scorers.iter_mut().skip(1).enumerate() {
                 let mut s_doc = scorer.doc();
 
                 while s_doc < candidate {
@@ -517,7 +551,7 @@ impl RustieConcatScorer {
             // Get doc length and execution plan before mutable borrow
             let doc_len = self.get_doc_length(doc_id, self.default_field).ok();
             let execution_plan = self.execution_plan.clone();
-            let gap_plan = self.gap_plan.clone();
+            let concat_plan = self.concat_plan.clone();
             
             match self.get_constraint_positions(doc_id) {
                 Ok(positions_per_constraint) => {
@@ -525,9 +559,10 @@ impl RustieConcatScorer {
                     let all_spans = find_constraint_spans_from_positions(
                         &positions_per_constraint,
                         &execution_plan,
-                        &gap_plan,
+                        &concat_plan,
                         doc_len,
                     );
+                    
                     self.current_doc_matches = all_spans;
                     return !self.current_doc_matches.is_empty();
                 }
@@ -725,7 +760,7 @@ impl RustieConcatScorer {
 fn find_constraint_spans_from_positions<'a>(
     positions_per_constraint: &[PosView<'a>],
     execution_plan: &Option<ExecutionPlan>,
-    gap_plan: &Option<GapPlan>,
+    concat_plan: &Option<ConcatPlan>,
     doc_len: Option<u32>,
 ) -> Vec<crate::types::SpanWithCaptures> {
     let k = positions_per_constraint.len();
@@ -733,20 +768,9 @@ fn find_constraint_spans_from_positions<'a>(
         return Vec::new();
     }
     
-    // Use gap-based matching if gap plan exists (takes priority over anchor)
-    if let Some(gap) = gap_plan {
-        #[cfg(debug_assertions)]
-        {
-            assert!(
-                gap.constraint_a_idx < positions_per_constraint.len(),
-                "GapPlan constraint_a_idx out of bounds"
-            );
-            assert!(
-                gap.constraint_b_idx < positions_per_constraint.len(),
-                "GapPlan constraint_b_idx out of bounds"
-            );
-        }
-        return find_spans_with_gap(positions_per_constraint, gap, doc_len);
+    // Use concat plan if it exists (takes priority over anchor and gap)
+    if let Some(plan) = concat_plan {
+        return find_spans_with_plan(positions_per_constraint, plan, doc_len);
     }
     
     // Use anchor-based verification if plan exists
@@ -943,122 +967,284 @@ fn find_spans_two_pointer<'a>(
     results
 }
 
-/// Gap-based matching for Constraint A + Repetition(Wildcard) + Constraint B
-/// Lazy: O(|A| + |B|) using two-pointer
-/// Greedy: O(|A| log |B|) using binary search
-fn find_spans_with_gap<'a>(
+/// Partial match state during plan execution
+#[derive(Debug, Clone)]
+struct Partial {
+    start: u32,  // position of first atom
+    last: u32,   // position of most recent atom
+}
+
+/// Helper: lower_bound (first index where arr[i] >= target)
+fn lower_bound(arr: &[u32], target: u32) -> usize {
+    arr.binary_search(&target).unwrap_or_else(|i| i)
+}
+
+/// Execute a ConcatPlan in postings-position space.
+/// Semantics: produces at most one continuation per partial per step:
+/// - lazy gap: choose nearest valid next atom
+/// - greedy gap: choose farthest valid next atom
+fn find_spans_with_plan<'a>(
     positions_per_constraint: &[PosView<'a>],
-    gap: &GapPlan,
+    plan: &ConcatPlan,
     doc_len: Option<u32>,
 ) -> Vec<crate::types::SpanWithCaptures> {
-    // Defensive bounds checking
-    if gap.constraint_a_idx >= positions_per_constraint.len()
-        || gap.constraint_b_idx >= positions_per_constraint.len()
+    if plan.steps.is_empty() {
+        return Vec::new();
+    }
+
+    // Validate alternating structure (defensive; compiler should guarantee)
+    if !matches!(plan.steps.first().unwrap(), ConcatStep::Atom { .. })
+        || !matches!(plan.steps.last().unwrap(), ConcatStep::Atom { .. })
     {
         return Vec::new();
     }
+    for w in plan.steps.windows(2) {
+        match (&w[0], &w[1]) {
+            (ConcatStep::Atom { .. }, ConcatStep::Gap { .. }) => {}
+            (ConcatStep::Gap { .. }, ConcatStep::Atom { .. }) => {}
+            _ => return Vec::new(),
+        }
+    }
 
-    // Extract positions for constraint A and B
-    let positions_a = match &positions_per_constraint[gap.constraint_a_idx] {
-        PosView::Any => return Vec::new(), // shouldn't happen for gap patterns
-        PosView::List(list) => *list,
+    // Initialize partials from first atom
+    let first_cidx = match plan.steps[0] {
+        ConcatStep::Atom { constraint_idx } => constraint_idx,
+        _ => unreachable!(),
     };
 
-    let positions_b = match &positions_per_constraint[gap.constraint_b_idx] {
-        PosView::Any => return Vec::new(), // shouldn't happen for gap patterns
-        PosView::List(list) => *list,
+    let first_positions = match positions_per_constraint.get(first_cidx) {
+        Some(p) => p,
+        None => return Vec::new(),
     };
 
-    if positions_a.is_empty() || positions_b.is_empty() {
+    let mut partials: Vec<Partial> = match first_positions {
+        PosView::List(pos) => pos.iter().map(|&p| Partial { start: p, last: p }).collect(),
+        PosView::Any => {
+            let dl = match doc_len {
+                Some(dl) if dl > 0 => dl,
+                _ => return Vec::new(), // cannot expand Any without doc_len
+            };
+            (0..dl).map(|p| Partial { start: p, last: p }).collect()
+        }
+    };
+
+    if partials.is_empty() {
         return Vec::new();
     }
 
-    // Helper: lower bound (first index where arr[i] >= target)
-    let lower_bound = |arr: &[u32], target: u32| -> usize {
-        arr.binary_search(&target).unwrap_or_else(|i| i)
-    };
+    // Process (Gap, Atom) pairs
+    let mut step_idx = 1;
+    while step_idx + 1 < plan.steps.len() {
+        let gap_step = &plan.steps[step_idx];
+        let atom_step = &plan.steps[step_idx + 1];
 
-    // Convert max-gap to an exclusive high bound for b:
-    // b_pos < a_pos + 1 + max_gap + 1
-    let compute_bounds = |a_pos: u32| -> (u32, u32) {
-        let min_b = a_pos
-            .saturating_add(1)
-            .saturating_add(gap.min_gap as u32);
-
-        let max_b_exclusive = if let Some(max_gap) = gap.max_gap {
-            a_pos
-                .saturating_add(1)
-                .saturating_add(max_gap as u32)
-                .saturating_add(1)
-        } else {
-            // Unbounded: use doc_len if available, otherwise u32::MAX
-            doc_len.unwrap_or(u32::MAX)
+        let (min_gap, max_gap, lazy) = match gap_step {
+            ConcatStep::Gap { min, max, lazy } => (*min, *max, *lazy),
+            _ => return Vec::new(),
         };
 
-        (min_b, max_b_exclusive)
-    };
+        let next_cidx = match atom_step {
+            ConcatStep::Atom { constraint_idx } => *constraint_idx,
+            _ => return Vec::new(),
+        };
 
-    let mut results = Vec::new();
+        let next_positions = match positions_per_constraint.get(next_cidx) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
 
-    if gap.lazy {
-        // --- Lazy: two-pointer O(|A| + |B|) ---
-        let mut j = 0usize;
+        partials = if lazy {
+            join_lazy(partials, next_positions, min_gap, max_gap, doc_len)
+        } else {
+            join_greedy(partials, next_positions, min_gap, max_gap, doc_len)
+        };
 
-        for &a_pos in positions_a.iter() {
-            let (min_b, max_b_exclusive) = compute_bounds(a_pos);
-
-            // Advance j to the first b >= min_b
-            while j < positions_b.len() && positions_b[j] < min_b {
-                j += 1;
-            }
-            if j >= positions_b.len() {
-                break; // no more B positions at all
-            }
-
-            let b_pos = positions_b[j];
-
-            // Must satisfy exclusive upper bound as well
-            if b_pos < max_b_exclusive {
-                let start = a_pos as usize;
-                let end = (b_pos + 1) as usize;
-
-                if let Some(dl) = doc_len {
-                    if end > dl as usize {
-                        continue;
-                    }
-                }
-
-                results.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }));
-            } else {
-                // No valid b for this a (later b's are even larger).
-                // Important: do NOT advance j here; for a larger a, this same b might become valid.
-            }
+        if partials.is_empty() {
+            return Vec::new();
         }
-    } else {
-        // --- Greedy: binary search O(|A| log |B|) ---
-        for &a_pos in positions_a.iter() {
-            let (min_b, max_b_exclusive) = compute_bounds(a_pos);
 
-            let lo = lower_bound(positions_b, min_b);
-            let hi = lower_bound(positions_b, max_b_exclusive); // first >= max_b_exclusive (exclusive end)
-
-            if lo < hi {
-                let b_pos = positions_b[hi - 1]; // farthest valid b
-                let start = a_pos as usize;
-                let end = (b_pos + 1) as usize;
-
-                if let Some(dl) = doc_len {
-                    if end > dl as usize {
-                        continue;
-                    }
-                }
-
-                results.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }));
-            }
-        }
+        step_idx += 2;
     }
 
-    results
+    // Convert partials to spans [start, last+1)
+    let mut out = Vec::with_capacity(partials.len());
+    for p in partials {
+        let start = p.start as usize;
+        let end = (p.last + 1) as usize;
+
+        if let Some(dl) = doc_len {
+            if end > dl as usize {
+                continue;
+            }
+        }
+
+        out.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }));
+    }
+    out
+}
+
+/// Lazy join (nearest valid next atom) using two-pointer when next is a List.
+/// O(|partials| + |next_positions|) for List, O(|partials|) for Any.
+fn join_lazy<'a>(
+    mut partials: Vec<Partial>,
+    next: &PosView<'a>,
+    min_gap: usize,
+    max_gap: Option<usize>,
+    doc_len: Option<u32>,
+) -> Vec<Partial> {
+    // Ensure partials are sorted by last to make two-pointer valid
+    partials.sort_by_key(|p| p.last);
+
+    match next {
+        PosView::Any => {
+            let dl = match doc_len {
+                Some(dl) if dl > 0 => dl,
+                _ => return Vec::new(),
+            };
+
+            let mut out = Vec::new();
+            for mut p in partials {
+                let min_b = p.last.saturating_add(1).saturating_add(min_gap as u32);
+                let max_b_excl = if let Some(mx) = max_gap {
+                    p.last
+                        .saturating_add(1)
+                        .saturating_add(mx as u32)
+                        .saturating_add(1)
+                } else {
+                    dl
+                };
+
+                // nearest b is min_b itself, if within bounds
+                if min_b < max_b_excl && min_b < dl {
+                    p.last = min_b;
+                    out.push(p);
+                }
+            }
+            out
+        }
+
+        PosView::List(next_pos) => {
+            let mut out = Vec::new();
+            let mut j = 0usize;
+
+            for mut p in partials {
+                let min_b = p.last.saturating_add(1).saturating_add(min_gap as u32);
+                let max_b_excl = if let Some(mx) = max_gap {
+                    p.last
+                        .saturating_add(1)
+                        .saturating_add(mx as u32)
+                        .saturating_add(1)
+                } else {
+                    doc_len.unwrap_or(u32::MAX)
+                };
+
+                while j < next_pos.len() && next_pos[j] < min_b {
+                    j += 1;
+                }
+                if j >= next_pos.len() {
+                    break; // no further matches possible for later partials (they need >= min_b)
+                }
+
+                let b = next_pos[j];
+                if b < max_b_excl {
+                    p.last = b;
+                    out.push(p);
+                } else {
+                    // Too large for this p; don't advance j (for larger p.last, bounds shift right).
+                }
+            }
+
+            out
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// Greedy join (farthest valid next atom) using binary search.
+/// O(|partials| log |next_positions|) for List, O(|partials|) for Any.
+fn join_greedy<'a>(
+    partials: Vec<Partial>,
+    next: &PosView<'a>,
+    min_gap: usize,
+    max_gap: Option<usize>,
+    doc_len: Option<u32>,
+) -> Vec<Partial> {
+    match next {
+        PosView::Any => {
+            let dl = match doc_len {
+                Some(dl) if dl > 0 => dl,
+                _ => return Vec::new(),
+            };
+
+            let mut out = Vec::new();
+            for mut p in partials {
+                let min_b = p.last.saturating_add(1).saturating_add(min_gap as u32);
+                let max_b_excl = if let Some(mx) = max_gap {
+                    p.last
+                        .saturating_add(1)
+                        .saturating_add(mx as u32)
+                        .saturating_add(1)
+                } else {
+                    dl
+                };
+
+                // farthest b is min(max_b_excl-1, dl-1), if >= min_b
+                let max_in_doc = dl - 1;
+                if max_b_excl == 0 {
+                    continue;
+                }
+                let cand = (max_b_excl - 1).min(max_in_doc);
+                if cand >= min_b && cand < dl {
+                    p.last = cand;
+                    out.push(p);
+                }
+            }
+            out
+        }
+
+        PosView::List(next_pos) => {
+            if next_pos.is_empty() {
+                return Vec::new();
+            }
+
+            let mut out = Vec::new();
+            for mut p in partials {
+                let min_b = p.last.saturating_add(1).saturating_add(min_gap as u32);
+                let max_b_excl = if let Some(mx) = max_gap {
+                    p.last
+                        .saturating_add(1)
+                        .saturating_add(mx as u32)
+                        .saturating_add(1)
+                } else {
+                    doc_len.unwrap_or(u32::MAX)
+                };
+
+                let lo = lower_bound(next_pos, min_b);
+                let hi = lower_bound(next_pos, max_b_excl); // exclusive end
+
+                if lo < hi {
+                    let b = next_pos[hi - 1];
+                    p.last = b;
+                    out.push(p);
+                }
+            }
+            out
+        }
+    }
 }
 
 /// Bitset-based matching for k>=3 using fast shift-and algorithm
@@ -1208,6 +1394,141 @@ fn find_spans_scan<'a>(
 }
 
 /// Original stored-field based matching (fallback)
+/// Maximum number of backtracking iterations to prevent exponential blowup
+const MAX_BACKTRACK_ITERATIONS: usize = 10_000;
+
+/// Try to match exactly `count` repetitions of a pattern starting at `pos`
+fn try_repetition_count(
+    pattern: &crate::compiler::ast::Pattern,
+    count: usize,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    mut pos: usize,
+    len: usize,
+    mut captures: Vec<crate::types::NamedCapture>,
+) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
+    for _ in 0..count {
+        if pos >= len {
+            return None;
+        }
+        if let Some(m) = matches_pattern_at_position(pattern, field_cache, pos) {
+            pos = m.span.end;
+            captures.extend(m.captures);
+        } else {
+            return None;
+        }
+    }
+    Some((pos, captures))
+}
+
+/// Recursive backtracking matcher for pattern sequences
+/// Returns Some((end_pos, captures)) if sequence matches, None otherwise
+fn match_sequence_recursive(
+    patterns: &[crate::compiler::ast::Pattern],
+    pattern_idx: usize,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    pos: usize,
+    len: usize,
+    captures: Vec<crate::types::NamedCapture>,
+    iteration_count: &mut usize,
+) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
+    use crate::compiler::ast::{Pattern, QuantifierKind};
+    
+    // Check iteration limit to prevent exponential blowup
+    *iteration_count += 1;
+    if *iteration_count > MAX_BACKTRACK_ITERATIONS {
+        log::warn!("Backtracking limit exceeded ({} iterations), aborting match", MAX_BACKTRACK_ITERATIONS);
+        return None;
+    }
+    
+    // Base case: all patterns matched successfully
+    if pattern_idx >= patterns.len() {
+        return Some((pos, captures));
+    }
+    
+    // Don't match beyond document length
+    if pos > len {
+        return None;
+    }
+    
+    let pat = &patterns[pattern_idx];
+    
+    // Special handling for Repetition patterns - these need backtracking
+    if let Pattern::Repetition { pattern: inner, min, max, kind } = pat {
+        // Calculate reasonable upper bound for repetitions
+        let max_possible = len.saturating_sub(pos);
+        let max_count = max.map(|m| m.min(max_possible)).unwrap_or(max_possible);
+        
+        if *kind == QuantifierKind::Lazy {
+            // Lazy: try shortest first (min, min+1, min+2, ..., max)
+            for count in *min..=max_count {
+                if let Some((end_pos, new_captures)) = try_repetition_count(
+                    inner, count, field_cache, pos, len, captures.clone()
+                ) {
+                    // Try to match remaining patterns with this repetition count
+                    if let Some(result) = match_sequence_recursive(
+                        patterns, pattern_idx + 1, field_cache, end_pos, len, new_captures, iteration_count
+                    ) {
+                        return Some(result);
+                    }
+                }
+                // If remaining patterns don't match, try next count
+            }
+            return None;
+        } else {
+            // Greedy: try longest first (max, max-1, max-2, ..., min)
+            for count in (*min..=max_count).rev() {
+                if let Some((end_pos, new_captures)) = try_repetition_count(
+                    inner, count, field_cache, pos, len, captures.clone()
+                ) {
+                    // Try to match remaining patterns with this repetition count
+                    if let Some(result) = match_sequence_recursive(
+                        patterns, pattern_idx + 1, field_cache, end_pos, len, new_captures, iteration_count
+                    ) {
+                        return Some(result);
+                    }
+                }
+                // If remaining patterns don't match, try shorter count
+            }
+            return None;
+        }
+    }
+    
+    // Non-repetition patterns: match normally and continue
+    if pos < len {
+        if let Some(m) = matches_pattern_at_position(pat, field_cache, pos) {
+            let mut new_captures = captures;
+            new_captures.extend(m.captures);
+            return match_sequence_recursive(
+                patterns, pattern_idx + 1, field_cache, m.span.end, len, new_captures, iteration_count
+            );
+        }
+    }
+    
+    // Special case: zero-width assertions can match at end of document
+    if let Pattern::Assertion(_) = pat {
+        if let Some(m) = matches_pattern_at_position(pat, field_cache, pos) {
+            let mut new_captures = captures;
+            new_captures.extend(m.captures);
+            return match_sequence_recursive(
+                patterns, pattern_idx + 1, field_cache, m.span.end, len, new_captures, iteration_count
+            );
+        }
+    }
+    
+    None
+}
+
+/// Entry point for backtracking sequence matcher
+fn match_sequence_with_backtracking(
+    patterns: &[crate::compiler::ast::Pattern],
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    start_pos: usize,
+    len: usize,
+) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
+    let mut iteration_count = 0;
+    match_sequence_recursive(patterns, 0, field_cache, start_pos, len, Vec::new(), &mut iteration_count)
+}
+
 pub fn find_constraint_spans_in_sequence(
     pattern: &crate::compiler::ast::Pattern, 
     field_cache: &std::collections::HashMap<String, Vec<String>>
@@ -1218,40 +1539,22 @@ pub fn find_constraint_spans_in_sequence(
         let mut results = Vec::new();
         
         // Use 'word' field to determine sentence length as it's the most reliable
-        let len = field_cache.get("word").or_else(|| field_cache.values().next()).map(|v| v.len()).unwrap_or(0);
-        if len == 0 { return results; }
+        let len = field_cache.get("word")
+            .or_else(|| field_cache.values().next())
+            .map(|v| v.len())
+            .unwrap_or(0);
+        
+        if len == 0 { 
+            return results; 
+        }
 
+        // Use backtracking matcher for proper lazy/greedy semantics
         for start in 0..len {
-            let mut pos = start;
-            let mut all_captures = Vec::new();
-            let mut matched = true;
-            
-            for (idx, pat) in patterns.iter().enumerate() {
-                if pos >= len {
-                    matched = false;
-                    break;
-                }
-                
-                if let Some(span_with_caps) = matches_pattern_at_position(pat, field_cache, pos) {
-                    pos = span_with_caps.span.end;
-                    all_captures.extend(span_with_caps.captures);
-                } else {
-                    // Log failure for debugging
-                    if patterns.len() < 4 { // Only for relatively simple patterns
-                         let p_strs: Vec<String> = patterns.iter().map(|p| format!("{:?}", p)).collect();
-                         let is_target = p_strs.iter().any(|s| s.contains("JJ") || s.contains("NNP") || s.contains("VBZ"));
-                         if is_target {
-                             println!("DEBUG: Sequence match fail. Patterns: {:?} | start: {}, failed_at_idx: {}, failed_at_pos: {}", p_strs, start, idx, pos);
-                         }
-                    }
-                    matched = false;
-                    break;
-                }
-            }
-            
-            if matched {
-                let full_span = crate::types::Span { start, end: pos };
-                results.push(crate::types::SpanWithCaptures::with_captures(full_span, all_captures));
+            if let Some((end_pos, captures)) = match_sequence_with_backtracking(
+                patterns, field_cache, start, len
+            ) {
+                let full_span = crate::types::Span { start, end: end_pos };
+                results.push(crate::types::SpanWithCaptures::with_captures(full_span, captures));
             }
         }
         results
