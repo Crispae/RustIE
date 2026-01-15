@@ -403,11 +403,24 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
                 base_traversal
             }
         }
-        Rule::disjunctive_traversal => {
+        Rule::outgoing_disjunctive => {
             let mut labels = Vec::new();
             for label_pair in pair.into_inner() {
                 if label_pair.as_rule() == Rule::traversal_label {
-                    labels.push(build_traversal_label(label_pair, true));
+                    labels.push(build_traversal_label(label_pair, true)); // outgoing
+                }
+            }
+            if labels.len() == 1 {
+                labels.pop().unwrap()
+            } else {
+                crate::compiler::ast::Traversal::Disjunctive(labels)
+            }
+        }
+        Rule::incoming_disjunctive => {
+            let mut labels = Vec::new();
+            for label_pair in pair.into_inner() {
+                if label_pair.as_rule() == Rule::traversal_label {
+                    labels.push(build_traversal_label(label_pair, false)); // incoming
                 }
             }
             if labels.len() == 1 {

@@ -37,7 +37,8 @@ impl GraphCompiler {
     /// 
     /// Rules:
     /// - Constraint must be exact string or regex matcher (not wildcard)
-    /// - Traversal must be simple Incoming/Outgoing with exact or regex label (not wildcard, disjunction)
+    /// - Traversal must be simple Incoming/Outgoing with exact or regex label, 
+    ///   disjunctive traversal (same direction), or concatenated traversal (not wildcard)
     /// - For first constraint: use the first traversal step
     /// - For last constraint: use the last traversal step
     fn try_build_collapse_spec(
@@ -149,9 +150,82 @@ impl GraphCompiler {
                 // Optional traversal: can't collapse (would drop "no-edge" matches)
                 return None;
             }
-            FlatPatternStep::Traversal(Traversal::Disjunctive(_)) => {
-                // Disjunctive traversal: can't collapse (would require union of multiple drivers)
-                return None;
+            FlatPatternStep::Traversal(Traversal::Disjunctive(traversals)) => {
+                // Disjunctive traversal: convert labels to regex pattern
+                log::info!(
+                    "Processing DISJUNCTIVE traversal with {} alternatives for {} constraint",
+                    traversals.len(),
+                    if is_first { "first" } else { "last" }
+                );
+                
+                // Extract labels and verify all are same direction
+                let mut labels = Vec::new();
+                let mut all_outgoing = true;
+                let mut all_incoming = true;
+                
+                for trav in traversals {
+                    match trav {
+                        Traversal::Outgoing(matcher) => {
+                            all_incoming = false;
+                            match matcher {
+                                Matcher::String(s) => {
+                                    log::info!("  - Outgoing edge label (exact): '{}'", s);
+                                    labels.push(regex::escape(s));
+                                }
+                                Matcher::Regex { pattern, .. } => {
+                                    log::info!("  - Outgoing edge label (regex): '{}'", pattern);
+                                    labels.push(pattern.clone());
+                                }
+                            }
+                        }
+                        Traversal::Incoming(matcher) => {
+                            all_outgoing = false;
+                            match matcher {
+                                Matcher::String(s) => {
+                                    log::info!("  - Incoming edge label (exact): '{}'", s);
+                                    labels.push(regex::escape(s));
+                                }
+                                Matcher::Regex { pattern, .. } => {
+                                    log::info!("  - Incoming edge label (regex): '{}'", pattern);
+                                    labels.push(pattern.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            log::warn!("  - Nested complex traversal not supported, falling back");
+                            return None;
+                        }
+                    }
+                }
+                
+                if labels.is_empty() || (!all_outgoing && !all_incoming) {
+                    log::warn!(
+                        "Disjunctive traversal cannot be collapsed: empty={} mixed_directions={}",
+                        labels.is_empty(),
+                        !all_outgoing && !all_incoming
+                    );
+                    return None; // Mixed directions or empty
+                }
+                
+                // Build regex pattern: "(label1|label2|label3)"
+                // Note: FST regex doesn't support anchors (^ and $), but since we match
+                // against complete terms in the dictionary, anchors aren't needed
+                let regex_pattern = format!("({})", labels.join("|"));
+                log::info!(
+                    "Disjunctive traversal collapsed to regex: '{}' (direction: {})",
+                    regex_pattern,
+                    if all_outgoing { "outgoing" } else { "incoming" }
+                );
+                let edge_matcher = CollapsedMatcher::RegexPattern(regex_pattern);
+                
+                // Determine edge field based on direction and position
+                let edge_field = if all_outgoing {
+                    if is_first { outgoing_edges_field } else { incoming_edges_field }
+                } else {
+                    incoming_edges_field
+                };
+                
+                (edge_field, edge_matcher)
             }
             FlatPatternStep::Traversal(Traversal::KleeneStar(_)) => {
                 // Kleene star: can't collapse (variable length)

@@ -32,10 +32,10 @@ fn main() -> Result<()> {
     let engine = ExtractorEngine::from_path(&args.index)?;
     
     println!("Index loaded: {} documents", engine.num_docs());
-    println!("\nQuery: ([entity=/B-Gene/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene/])");
+    println!("\nQuery: ([entity=/B-Gene.*/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene.*/])");
     println!("Running {} iterations...\n", args.iterations);
     
-    let query = "([entity=/B-Gene/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene/])";
+    let query = "([entity=/B-Gene.*/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene.*/])";
     
     let start = std::time::Instant::now();
     let mut total_hits = 0;

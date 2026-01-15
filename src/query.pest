@@ -12,12 +12,13 @@ default_regex = @{ "/" ~ (!("/" | "\n") ~ ANY)* ~ "/" }
 pattern_chain = { quantified_pattern ~ pattern_link* }
 pattern_link = { traversal | quantified_pattern }
 traversal = { traversal_op ~ quantified_pattern }
-traversal_op = { outgoing_wildcard | incoming_wildcard | outgoing | incoming | disjunctive_traversal | concatenated_traversal }
+traversal_op = { outgoing_wildcard | incoming_wildcard | outgoing_disjunctive | incoming_disjunctive | outgoing | incoming | concatenated_traversal }
 outgoing_wildcard = { ">>" }
 incoming_wildcard = { "<<" }
 outgoing = { ">" ~ traversal_label ~ quantifier? }
 incoming = { "<" ~ traversal_label ~ quantifier? }
-disjunctive_traversal = { ">" ~ traversal_label ~ ( "|" ~ traversal_label )+ }
+outgoing_disjunctive = { ">" ~ traversal_label ~ ( "|" ~ traversal_label )+ }
+incoming_disjunctive = { "<" ~ traversal_label ~ ( "|" ~ traversal_label )+ }
 concatenated_traversal = { ">" ~ traversal_label ~ ( ">" ~ traversal_label )+ }
 traversal_label = { traversal_regex | label }
 // Extended regex: support standard Rust/Tantivy regex syntax

@@ -645,11 +645,288 @@ impl GraphTraversal {
                             }
                         }
                     }
-                    _ => {}
+                    crate::compiler::ast::Traversal::Disjunctive(alternatives) => {
+                        // Union of all alternative traversals - try each and collect all results
+                        let vocabulary = self.graph.vocabulary();
+                        for alt in alternatives {
+                            let alt_resolved = self.resolve_traversal_matcher(alt, vocabulary);
+                            match alt {
+                                crate::compiler::ast::Traversal::Outgoing(_) => {
+                                    if let Some(edges) = self.graph.outgoing(node) {
+                                        for i in (0..edges.len()).step_by(2) {
+                                            if i + 1 < edges.len() {
+                                                let target_node = edges[i];
+                                                let label_id = edges[i + 1];
+                                                if self.matches_label(&alt_resolved, label_id) {
+                                                    self.automaton_traverse_paths_optimized(pattern, target_node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::compiler::ast::Traversal::Incoming(_) => {
+                                    if let Some(edges) = self.graph.incoming(node) {
+                                        for i in (0..edges.len()).step_by(2) {
+                                            if i + 1 < edges.len() {
+                                                let source_node = edges[i];
+                                                let label_id = edges[i + 1];
+                                                if self.matches_label(&alt_resolved, label_id) {
+                                                    self.automaton_traverse_paths_optimized(pattern, source_node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::compiler::ast::Traversal::OutgoingWildcard => {
+                                    if let Some(edges) = self.graph.outgoing(node) {
+                                        for i in (0..edges.len()).step_by(2) {
+                                            if i + 1 < edges.len() {
+                                                let target_node = edges[i];
+                                                self.automaton_traverse_paths_optimized(pattern, target_node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                                            }
+                                        }
+                                    }
+                                }
+                                crate::compiler::ast::Traversal::IncomingWildcard => {
+                                    if let Some(edges) = self.graph.incoming(node) {
+                                        for i in (0..edges.len()).step_by(2) {
+                                            if i + 1 < edges.len() {
+                                                let source_node = edges[i];
+                                                self.automaton_traverse_paths_optimized(pattern, source_node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Nested disjunctive/concatenated handled by recursive resolve
+                                _ => {}
+                            }
+                        }
+                    }
+                    crate::compiler::ast::Traversal::Concatenated(steps) => {
+                        // Concatenated traversal: execute each step in sequence
+                        // This is more complex - we need to chain the traversals
+                        self.execute_concatenated_in_automaton(
+                            pattern, node, step_idx, steps, 0, memo,
+                            constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                        );
+                    }
+                    crate::compiler::ast::Traversal::KleeneStar(inner) => {
+                        // Kleene star: zero or more repetitions
+                        // First, try zero repetitions (skip to next step)
+                        self.automaton_traverse_paths_optimized(pattern, node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                        
+                        // Then try one or more repetitions
+                        let inner_resolved = self.resolve_traversal_matcher(inner, self.graph.vocabulary());
+                        self.execute_kleene_star_in_automaton(
+                            pattern, node, step_idx, inner, &inner_resolved, memo,
+                            constraint_field_names, constraint_tokens, resolved_matchers, path, results,
+                            &mut std::collections::HashSet::new()
+                        );
+                    }
+                    crate::compiler::ast::Traversal::NoTraversal => {
+                        // No traversal means stay at current node, advance step
+                        self.automaton_traverse_paths_optimized(pattern, node, step_idx + 1, memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results);
+                    }
                 }
             }
         }
         memo[idx] = false; // Backtrack: allow other paths through this node
+    }
+
+    /// Helper: Execute concatenated traversal steps within the automaton
+    fn execute_concatenated_in_automaton(
+        &self,
+        pattern: &[FlatPatternStep],
+        node: usize,
+        outer_step_idx: usize,
+        concat_steps: &[Traversal],
+        concat_idx: usize,
+        memo: &mut Vec<bool>,
+        constraint_field_names: &[String],
+        constraint_tokens: &[Vec<String>],
+        resolved_matchers: &[Option<ResolvedTraversalMatcher>],
+        path: &mut Vec<usize>,
+        results: &mut Vec<Vec<usize>>,
+    ) {
+        // If we've completed all concatenated steps, continue to next pattern step
+        if concat_idx >= concat_steps.len() {
+            self.automaton_traverse_paths_optimized(
+                pattern, node, outer_step_idx + 1, memo,
+                constraint_field_names, constraint_tokens, resolved_matchers, path, results
+            );
+            return;
+        }
+
+        let current_trav = &concat_steps[concat_idx];
+        let vocabulary = self.graph.vocabulary();
+        let trav_resolved = self.resolve_traversal_matcher(current_trav, vocabulary);
+
+        match current_trav {
+            Traversal::Outgoing(_) => {
+                if let Some(edges) = self.graph.outgoing(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let target_node = edges[i];
+                            let label_id = edges[i + 1];
+                            if self.matches_label(&trav_resolved, label_id) {
+                                self.execute_concatenated_in_automaton(
+                                    pattern, target_node, outer_step_idx, concat_steps, concat_idx + 1,
+                                    memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Traversal::Incoming(_) => {
+                if let Some(edges) = self.graph.incoming(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let source_node = edges[i];
+                            let label_id = edges[i + 1];
+                            if self.matches_label(&trav_resolved, label_id) {
+                                self.execute_concatenated_in_automaton(
+                                    pattern, source_node, outer_step_idx, concat_steps, concat_idx + 1,
+                                    memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Traversal::OutgoingWildcard => {
+                if let Some(edges) = self.graph.outgoing(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let target_node = edges[i];
+                            self.execute_concatenated_in_automaton(
+                                pattern, target_node, outer_step_idx, concat_steps, concat_idx + 1,
+                                memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                            );
+                        }
+                    }
+                }
+            }
+            Traversal::IncomingWildcard => {
+                if let Some(edges) = self.graph.incoming(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let source_node = edges[i];
+                            self.execute_concatenated_in_automaton(
+                                pattern, source_node, outer_step_idx, concat_steps, concat_idx + 1,
+                                memo, constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                            );
+                        }
+                    }
+                }
+            }
+            // For nested complex traversals, fall back to the basic execute approach
+            _ => {}
+        }
+    }
+
+    /// Helper: Execute Kleene star traversal within the automaton
+    fn execute_kleene_star_in_automaton(
+        &self,
+        pattern: &[FlatPatternStep],
+        node: usize,
+        outer_step_idx: usize,
+        inner: &Traversal,
+        inner_resolved: &ResolvedTraversalMatcher,
+        memo: &mut Vec<bool>,
+        constraint_field_names: &[String],
+        constraint_tokens: &[Vec<String>],
+        resolved_matchers: &[Option<ResolvedTraversalMatcher>],
+        path: &mut Vec<usize>,
+        results: &mut Vec<Vec<usize>>,
+        visited: &mut std::collections::HashSet<usize>,
+    ) {
+        // Prevent infinite loops
+        if visited.contains(&node) {
+            return;
+        }
+        visited.insert(node);
+
+        // Try traversing once and then either continue to next step or repeat
+        match inner {
+            Traversal::Outgoing(_) => {
+                if let Some(edges) = self.graph.outgoing(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let target_node = edges[i];
+                            let label_id = edges[i + 1];
+                            if self.matches_label(inner_resolved, label_id) {
+                                // After one traversal, try completing (go to next step)
+                                self.automaton_traverse_paths_optimized(
+                                    pattern, target_node, outer_step_idx + 1, memo,
+                                    constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                                );
+                                // Also try repeating
+                                self.execute_kleene_star_in_automaton(
+                                    pattern, target_node, outer_step_idx, inner, inner_resolved, memo,
+                                    constraint_field_names, constraint_tokens, resolved_matchers, path, results, visited
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Traversal::Incoming(_) => {
+                if let Some(edges) = self.graph.incoming(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let source_node = edges[i];
+                            let label_id = edges[i + 1];
+                            if self.matches_label(inner_resolved, label_id) {
+                                self.automaton_traverse_paths_optimized(
+                                    pattern, source_node, outer_step_idx + 1, memo,
+                                    constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                                );
+                                self.execute_kleene_star_in_automaton(
+                                    pattern, source_node, outer_step_idx, inner, inner_resolved, memo,
+                                    constraint_field_names, constraint_tokens, resolved_matchers, path, results, visited
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Traversal::OutgoingWildcard => {
+                if let Some(edges) = self.graph.outgoing(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let target_node = edges[i];
+                            self.automaton_traverse_paths_optimized(
+                                pattern, target_node, outer_step_idx + 1, memo,
+                                constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                            );
+                            self.execute_kleene_star_in_automaton(
+                                pattern, target_node, outer_step_idx, inner, inner_resolved, memo,
+                                constraint_field_names, constraint_tokens, resolved_matchers, path, results, visited
+                            );
+                        }
+                    }
+                }
+            }
+            Traversal::IncomingWildcard => {
+                if let Some(edges) = self.graph.incoming(node) {
+                    for i in (0..edges.len()).step_by(2) {
+                        if i + 1 < edges.len() {
+                            let source_node = edges[i];
+                            self.automaton_traverse_paths_optimized(
+                                pattern, source_node, outer_step_idx + 1, memo,
+                                constraint_field_names, constraint_tokens, resolved_matchers, path, results
+                            );
+                            self.execute_kleene_star_in_automaton(
+                                pattern, source_node, outer_step_idx, inner, inner_resolved, memo,
+                                constraint_field_names, constraint_tokens, resolved_matchers, path, results, visited
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Legacy wrapper for backward compatibility
