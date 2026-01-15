@@ -11,6 +11,16 @@ pub struct ExecutionPlan {
     pub anchor_idx: usize,
 }
 
+/// Gap plan for gap-based matching (Constraint A + Repetition(Wildcard) + Constraint B)
+#[derive(Debug, Clone)]
+pub struct GapPlan {
+    pub constraint_a_idx: usize,
+    pub constraint_b_idx: usize,
+    pub min_gap: usize,
+    pub max_gap: Option<usize>,
+    pub lazy: bool,
+}
+
 /// Constraint source for position-based matching
 #[derive(Debug, Clone)]
 enum ConstraintSource {
@@ -34,6 +44,7 @@ pub struct RustieConcatQuery {
     pub pattern: Pattern,
     pub sub_queries: Vec<Box<dyn Query>>,
     pub execution_plan: Option<ExecutionPlan>,
+    pub gap_plan: Option<GapPlan>,
 }
 
 impl Clone for RustieConcatQuery {
@@ -43,6 +54,7 @@ impl Clone for RustieConcatQuery {
             pattern: self.pattern.clone(),
             sub_queries: self.sub_queries.iter().map(|q| q.box_clone()).collect(),
             execution_plan: self.execution_plan.clone(),
+            gap_plan: self.gap_plan.clone(),
         }
     }
 }
@@ -58,6 +70,7 @@ impl RustieConcatQuery {
             pattern,
             sub_queries,
             execution_plan: None,
+            gap_plan: None,
         }
     }
 }
@@ -73,6 +86,7 @@ impl Query for RustieConcatQuery {
             sub_weights,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
+            gap_plan: self.gap_plan.clone(),
         }))
     }
 }
@@ -81,6 +95,7 @@ struct RustieConcatWeight {
     sub_weights: Vec<Box<dyn Weight>>,
     pattern: Pattern,
     default_field: Field,
+    gap_plan: Option<GapPlan>,
 }
 
 /// Helper to extract constraints from a Pattern
@@ -328,6 +343,9 @@ impl Weight for RustieConcatWeight {
 
         // Compute execution plan (anchor-based verification)
         let execution_plan = compute_execution_plan(&constraint_sources, reader);
+        
+        // Get gap plan from query
+        let gap_plan = self.gap_plan.clone();
 
         let scorer = RustieConcatScorer {
             sub_scorers,
@@ -342,6 +360,7 @@ impl Weight for RustieConcatWeight {
             started: false, // Explicitly track initialization state
             constraint_sources,
             execution_plan,
+            gap_plan,
             position_buffers: Vec::new(),
             regex_tmp: Vec::with_capacity(16),
         };
@@ -366,6 +385,7 @@ pub struct RustieConcatScorer {
     started: bool,
     constraint_sources: Vec<ConstraintSource>,
     execution_plan: Option<ExecutionPlan>,
+    gap_plan: Option<GapPlan>,
     position_buffers: Vec<Vec<u32>>,  // Reusable buffers for position collection
     regex_tmp: Vec<u32>,  // Reusable buffer for regex position collection
 }
@@ -497,6 +517,7 @@ impl RustieConcatScorer {
             // Get doc length and execution plan before mutable borrow
             let doc_len = self.get_doc_length(doc_id, self.default_field).ok();
             let execution_plan = self.execution_plan.clone();
+            let gap_plan = self.gap_plan.clone();
             
             match self.get_constraint_positions(doc_id) {
                 Ok(positions_per_constraint) => {
@@ -504,6 +525,7 @@ impl RustieConcatScorer {
                     let all_spans = find_constraint_spans_from_positions(
                         &positions_per_constraint,
                         &execution_plan,
+                        &gap_plan,
                         doc_len,
                     );
                     self.current_doc_matches = all_spans;
@@ -703,11 +725,17 @@ impl RustieConcatScorer {
 fn find_constraint_spans_from_positions<'a>(
     positions_per_constraint: &[PosView<'a>],
     execution_plan: &Option<ExecutionPlan>,
+    gap_plan: &Option<GapPlan>,
     doc_len: Option<u32>,
 ) -> Vec<crate::types::SpanWithCaptures> {
     let k = positions_per_constraint.len();
     if k == 0 {
         return Vec::new();
+    }
+    
+    // Use gap-based matching if gap plan exists (takes priority over anchor)
+    if let Some(gap) = gap_plan {
+        return find_spans_with_gap(positions_per_constraint, gap, doc_len);
     }
     
     // Use anchor-based verification if plan exists
@@ -899,6 +927,105 @@ fn find_spans_two_pointer<'a>(
         }
         
         i += 1;
+    }
+    
+    results
+}
+
+/// Gap-based matching for Constraint A + Repetition(Wildcard) + Constraint B
+/// Lazy: O(|A| + |B|) using two-pointer, Greedy: O(|A| log |B|) using binary search
+fn find_spans_with_gap<'a>(
+    positions_per_constraint: &[PosView<'a>],
+    gap: &GapPlan,
+    doc_len: Option<u32>,
+) -> Vec<crate::types::SpanWithCaptures> {
+    // Defensive bounds checking
+    if gap.constraint_a_idx >= positions_per_constraint.len() ||
+       gap.constraint_b_idx >= positions_per_constraint.len() {
+        return Vec::new();
+    }
+    
+    // Extract positions for constraint A and B
+    let positions_a = match &positions_per_constraint[gap.constraint_a_idx] {
+        PosView::Any => {
+            // Constraint A is wildcard - this shouldn't happen in gap pattern
+            // but handle gracefully by returning empty
+            return Vec::new();
+        }
+        PosView::List(list) => *list,
+    };
+    
+    let positions_b = match &positions_per_constraint[gap.constraint_b_idx] {
+        PosView::Any => {
+            // Constraint B is wildcard - this shouldn't happen in gap pattern
+            // but handle gracefully by returning empty
+            return Vec::new();
+        }
+        PosView::List(list) => *list,
+    };
+    
+    if positions_a.is_empty() || positions_b.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut results = Vec::new();
+    
+    // Helper: binary search for lower bound (first position >= target)
+    let lower_bound = |arr: &[u32], target: u32| -> usize {
+        arr.binary_search(&target).unwrap_or_else(|i| i)
+    };
+    
+    // Helper: binary search for upper bound (first position > target)
+    let upper_bound = |arr: &[u32], target: u32| -> usize {
+        match arr.binary_search(&target) {
+            Ok(i) => i + 1,  // If exact match, return next position
+            Err(i) => i,     // If not found, return insertion point
+        }
+    };
+    
+    for &a_pos in positions_a.iter() {
+        // Compute valid window for b: [min_b, max_b_exclusive)
+        // Gap size = (b_pos - a_pos - 1), so:
+        // min_b = a_pos + 1 + min_gap
+        // max_b_exclusive = a_pos + 1 + max_gap + 1 (if max_gap is Some)
+        let min_b = a_pos + 1 + gap.min_gap as u32;
+        let max_b_exclusive = if let Some(max_gap) = gap.max_gap {
+            a_pos + 1 + (max_gap as u32) + 1
+        } else {
+            // Unbounded: use doc_len if available, otherwise u32::MAX
+            if let Some(dl) = doc_len {
+                dl
+            } else {
+                u32::MAX
+            }
+        };
+        
+        // Find valid range in positions_b using binary search
+        let lo = lower_bound(positions_b, min_b);
+        let hi = upper_bound(positions_b, max_b_exclusive);
+        
+        if lo < hi {
+            // Valid range found
+            let chosen_idx = if gap.lazy {
+                lo  // Lazy: smallest valid b
+            } else {
+                hi - 1  // Greedy: largest valid b
+            };
+            
+            let b_pos = positions_b[chosen_idx];
+            let start = a_pos as usize;
+            let end = (b_pos + 1) as usize;
+            
+            // Enforce doc_len bounds (correctness fix)
+            if let Some(dl) = doc_len {
+                if end > dl as usize {
+                    continue;
+                }
+            }
+            
+            let span = crate::types::Span { start, end };
+            results.push(crate::types::SpanWithCaptures::new(span));
+        }
     }
     
     results
@@ -1138,19 +1265,41 @@ fn matches_pattern_at_position(
             }
             None
         }
-        Pattern::Repetition { pattern, min, max } => {
-            // Very simple greedy repetition for matching at current position
-            // This is just to support basic concatenation of repetitions
+        Pattern::Repetition { pattern, min, max, kind } => {
+            use crate::compiler::ast::QuantifierKind;
+            
             let mut current_pos = pos;
             let mut count = 0;
             let mut total_captures = Vec::new();
             
-            while let Some(m) = matches_pattern_at_position(pattern, field_cache, current_pos) {
-                current_pos = m.span.end;
-                total_captures.extend(m.captures);
-                count += 1;
+            if *kind == QuantifierKind::Lazy {
+                // Lazy semantics: match minimum required and stop
+                while count < *min {
+                    if let Some(m) = matches_pattern_at_position(pattern, field_cache, current_pos) {
+                        current_pos = m.span.end;
+                        total_captures.extend(m.captures);
+                        count += 1;
+                    } else {
+                        // Can't match minimum required
+                        return None;
+                    }
+                }
+                
+                // Check max bound
                 if let Some(max_val) = max {
-                    if count >= *max_val { break; }
+                    if count > *max_val {
+                        return None;
+                    }
+                }
+            } else {
+                // Greedy semantics: match as many as possible
+                while let Some(m) = matches_pattern_at_position(pattern, field_cache, current_pos) {
+                    current_pos = m.span.end;
+                    total_captures.extend(m.captures);
+                    count += 1;
+                    if let Some(max_val) = max {
+                        if count >= *max_val { break; }
+                    }
                 }
             }
             

@@ -2,8 +2,8 @@ use tantivy::{
     query::{Query, BooleanQuery, Occur, TermQuery, RegexQuery},
     schema::{Term, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion};
-use crate::tantivy_integration::concat_query::RustieConcatQuery;
+use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
+use crate::tantivy_integration::concat_query::{RustieConcatQuery, GapPlan};
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
 use crate::tantivy_integration::assertion_query::LookaheadQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
@@ -44,8 +44,8 @@ impl BasicCompiler {
             Pattern::GraphTraversal { .. } => {
                 Err(anyhow!("Graph traversal patterns should be handled by GraphCompiler"))
             }
-            Pattern::Repetition { pattern, min, max } => {
-                self.compile_repetition(pattern, *min, *max)
+            Pattern::Repetition { pattern, min, max, kind } => {
+                self.compile_repetition(pattern, *min, *max, *kind)
             }
         }
     }
@@ -194,6 +194,9 @@ impl BasicCompiler {
     }
 
     fn compile_concatenated(&self, patterns: &[Pattern]) -> Result<Box<dyn Query>> {
+        // Check for gap pattern: Constraint A + Repetition(Wildcard) + Constraint B
+        let gap_plan = Self::detect_gap_pattern(patterns);
+        
         // Create sub-queries ONLY for mandatory patterns to avoid over-filtering
         // Documents that don't match optional patterns should still be considered
         let mut sub_queries = Vec::new();
@@ -222,16 +225,62 @@ impl BasicCompiler {
             .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
         
         // Use RustieConcatQuery for concatenated patterns
-        let pattern_query = RustieConcatQuery::new(
+        let mut pattern_query = RustieConcatQuery::new(
             default_field,
             concatenated_pattern,
             sub_queries,
         );
         
+        // Set gap plan if detected
+        if let Some(gap) = gap_plan {
+            pattern_query.gap_plan = Some(gap);
+        }
+        
         Ok(Box::new(pattern_query))
     }
+    
+    /// Detect gap pattern: Constraint A + Repetition(Wildcard, min, max, kind) + Constraint B
+    fn detect_gap_pattern(patterns: &[Pattern]) -> Option<GapPlan> {
+        if patterns.len() != 3 {
+            return None;
+        }
+        
+        // Check if pattern is: Constraint + Repetition(Wildcard) + Constraint
+        let constraint_a = match &patterns[0] {
+            Pattern::Constraint(_) => true,
+            _ => false,
+        };
+        
+        let repetition_wildcard = match &patterns[1] {
+            Pattern::Repetition { pattern, .. } => {
+                matches!(pattern.as_ref(), Pattern::Constraint(Constraint::Wildcard))
+            }
+            _ => false,
+        };
+        
+        let constraint_b = match &patterns[2] {
+            Pattern::Constraint(_) => true,
+            _ => false,
+        };
+        
+        if constraint_a && repetition_wildcard && constraint_b {
+            if let Pattern::Repetition { min, max, kind, .. } = &patterns[1] {
+                // Note: compile_constraint_sources skips non-constraint patterns (like Repetition),
+                // so positions_per_constraint will be [A, B] (indices 0, 1), not [A, Wildcard, B]
+                return Some(GapPlan {
+                    constraint_a_idx: 0,
+                    constraint_b_idx: 1,  // Fixed: was 2, should be 1 since wildcard is skipped
+                    min_gap: *min,
+                    max_gap: *max,
+                    lazy: *kind == QuantifierKind::Lazy,
+                });
+            }
+        }
+        
+        None
+    }
 
-    fn compile_repetition(&self, pattern: &Pattern, min: usize, max: Option<usize>) -> Result<Box<dyn Query>> {
+    fn compile_repetition(&self, pattern: &Pattern, min: usize, max: Option<usize>, _kind: QuantifierKind) -> Result<Box<dyn Query>> {
         // Maximum expansion for unbounded patterns to prevent performance issues
         const MAX_EXPANSION: usize = 10;
         

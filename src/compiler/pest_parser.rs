@@ -1,6 +1,6 @@
 use pest::Parser;
 use pest_derive::Parser;
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion};
+use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
 
 #[derive(Parser)]
 #[grammar = "query.pest"]
@@ -136,11 +136,13 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
             if let Some(quant_pair) = pairs.next() {
                 // quant_pair is pattern_quantifier, which contains greedy_quantifier or lazy_quantifier
                 let inner_quant = quant_pair.into_inner().next().unwrap();
-                let (min, max, _is_lazy) = parse_quantifier(inner_quant);
+                let (min, max, is_lazy) = parse_quantifier(inner_quant);
+                let kind = if is_lazy { QuantifierKind::Lazy } else { QuantifierKind::Greedy };
                 Pattern::Repetition {
                     pattern: Box::new(atomic),
                     min,
                     max,
+                    kind,
                 }
             } else {
                 atomic
