@@ -735,6 +735,17 @@ fn find_constraint_spans_from_positions<'a>(
     
     // Use gap-based matching if gap plan exists (takes priority over anchor)
     if let Some(gap) = gap_plan {
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                gap.constraint_a_idx < positions_per_constraint.len(),
+                "GapPlan constraint_a_idx out of bounds"
+            );
+            assert!(
+                gap.constraint_b_idx < positions_per_constraint.len(),
+                "GapPlan constraint_b_idx out of bounds"
+            );
+        }
         return find_spans_with_gap(positions_per_constraint, gap, doc_len);
     }
     
@@ -933,101 +944,120 @@ fn find_spans_two_pointer<'a>(
 }
 
 /// Gap-based matching for Constraint A + Repetition(Wildcard) + Constraint B
-/// Lazy: O(|A| + |B|) using two-pointer, Greedy: O(|A| log |B|) using binary search
+/// Lazy: O(|A| + |B|) using two-pointer
+/// Greedy: O(|A| log |B|) using binary search
 fn find_spans_with_gap<'a>(
     positions_per_constraint: &[PosView<'a>],
     gap: &GapPlan,
     doc_len: Option<u32>,
 ) -> Vec<crate::types::SpanWithCaptures> {
     // Defensive bounds checking
-    if gap.constraint_a_idx >= positions_per_constraint.len() ||
-       gap.constraint_b_idx >= positions_per_constraint.len() {
+    if gap.constraint_a_idx >= positions_per_constraint.len()
+        || gap.constraint_b_idx >= positions_per_constraint.len()
+    {
         return Vec::new();
     }
-    
+
     // Extract positions for constraint A and B
     let positions_a = match &positions_per_constraint[gap.constraint_a_idx] {
-        PosView::Any => {
-            // Constraint A is wildcard - this shouldn't happen in gap pattern
-            // but handle gracefully by returning empty
-            return Vec::new();
-        }
+        PosView::Any => return Vec::new(), // shouldn't happen for gap patterns
         PosView::List(list) => *list,
     };
-    
+
     let positions_b = match &positions_per_constraint[gap.constraint_b_idx] {
-        PosView::Any => {
-            // Constraint B is wildcard - this shouldn't happen in gap pattern
-            // but handle gracefully by returning empty
-            return Vec::new();
-        }
+        PosView::Any => return Vec::new(), // shouldn't happen for gap patterns
         PosView::List(list) => *list,
     };
-    
+
     if positions_a.is_empty() || positions_b.is_empty() {
         return Vec::new();
     }
-    
-    let mut results = Vec::new();
-    
-    // Helper: binary search for lower bound (first position >= target)
+
+    // Helper: lower bound (first index where arr[i] >= target)
     let lower_bound = |arr: &[u32], target: u32| -> usize {
         arr.binary_search(&target).unwrap_or_else(|i| i)
     };
-    
-    // Helper: binary search for upper bound (first position > target)
-    let upper_bound = |arr: &[u32], target: u32| -> usize {
-        match arr.binary_search(&target) {
-            Ok(i) => i + 1,  // If exact match, return next position
-            Err(i) => i,     // If not found, return insertion point
-        }
-    };
-    
-    for &a_pos in positions_a.iter() {
-        // Compute valid window for b: [min_b, max_b_exclusive)
-        // Gap size = (b_pos - a_pos - 1), so:
-        // min_b = a_pos + 1 + min_gap
-        // max_b_exclusive = a_pos + 1 + max_gap + 1 (if max_gap is Some)
-        let min_b = a_pos + 1 + gap.min_gap as u32;
+
+    // Convert max-gap to an exclusive high bound for b:
+    // b_pos < a_pos + 1 + max_gap + 1
+    let compute_bounds = |a_pos: u32| -> (u32, u32) {
+        let min_b = a_pos
+            .saturating_add(1)
+            .saturating_add(gap.min_gap as u32);
+
         let max_b_exclusive = if let Some(max_gap) = gap.max_gap {
-            a_pos + 1 + (max_gap as u32) + 1
+            a_pos
+                .saturating_add(1)
+                .saturating_add(max_gap as u32)
+                .saturating_add(1)
         } else {
             // Unbounded: use doc_len if available, otherwise u32::MAX
-            if let Some(dl) = doc_len {
-                dl
-            } else {
-                u32::MAX
-            }
+            doc_len.unwrap_or(u32::MAX)
         };
-        
-        // Find valid range in positions_b using binary search
-        let lo = lower_bound(positions_b, min_b);
-        let hi = upper_bound(positions_b, max_b_exclusive);
-        
-        if lo < hi {
-            // Valid range found
-            let chosen_idx = if gap.lazy {
-                lo  // Lazy: smallest valid b
-            } else {
-                hi - 1  // Greedy: largest valid b
-            };
-            
-            let b_pos = positions_b[chosen_idx];
-            let start = a_pos as usize;
-            let end = (b_pos + 1) as usize;
-            
-            // Enforce doc_len bounds (correctness fix)
-            if let Some(dl) = doc_len {
-                if end > dl as usize {
-                    continue;
-                }
+
+        (min_b, max_b_exclusive)
+    };
+
+    let mut results = Vec::new();
+
+    if gap.lazy {
+        // --- Lazy: two-pointer O(|A| + |B|) ---
+        let mut j = 0usize;
+
+        for &a_pos in positions_a.iter() {
+            let (min_b, max_b_exclusive) = compute_bounds(a_pos);
+
+            // Advance j to the first b >= min_b
+            while j < positions_b.len() && positions_b[j] < min_b {
+                j += 1;
             }
-            
-            let span = crate::types::Span { start, end };
-            results.push(crate::types::SpanWithCaptures::new(span));
+            if j >= positions_b.len() {
+                break; // no more B positions at all
+            }
+
+            let b_pos = positions_b[j];
+
+            // Must satisfy exclusive upper bound as well
+            if b_pos < max_b_exclusive {
+                let start = a_pos as usize;
+                let end = (b_pos + 1) as usize;
+
+                if let Some(dl) = doc_len {
+                    if end > dl as usize {
+                        continue;
+                    }
+                }
+
+                results.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }));
+            } else {
+                // No valid b for this a (later b's are even larger).
+                // Important: do NOT advance j here; for a larger a, this same b might become valid.
+            }
+        }
+    } else {
+        // --- Greedy: binary search O(|A| log |B|) ---
+        for &a_pos in positions_a.iter() {
+            let (min_b, max_b_exclusive) = compute_bounds(a_pos);
+
+            let lo = lower_bound(positions_b, min_b);
+            let hi = lower_bound(positions_b, max_b_exclusive); // first >= max_b_exclusive (exclusive end)
+
+            if lo < hi {
+                let b_pos = positions_b[hi - 1]; // farthest valid b
+                let start = a_pos as usize;
+                let end = (b_pos + 1) as usize;
+
+                if let Some(dl) = doc_len {
+                    if end > dl as usize {
+                        continue;
+                    }
+                }
+
+                results.push(crate::types::SpanWithCaptures::new(crate::types::Span { start, end }));
+            }
         }
     }
-    
+
     results
 }
 

@@ -197,13 +197,38 @@ impl BasicCompiler {
         // Check for gap pattern: Constraint A + Repetition(Wildcard) + Constraint B
         let gap_plan = Self::detect_gap_pattern(patterns);
         
-        // Create sub-queries ONLY for mandatory patterns to avoid over-filtering
-        // Documents that don't match optional patterns should still be considered
         let mut sub_queries = Vec::new();
-        for pattern in patterns {
-            if self.is_mandatory_pattern(pattern) {
-                let query = self.compile_pattern(pattern)?;
-                sub_queries.push(query);
+
+        if gap_plan.is_some() {
+            // Phase 1 optimization for gap queries:
+            // only compile A and B as candidate generators; skip the wildcard repetition entirely.
+            //
+            // We purposely use indices in the original `patterns` array:
+            //   patterns[0] = A
+            //   patterns[1] = Repetition(Wildcard,...)
+            //   patterns[2] = B
+            //
+            // GapPlan indices (0,1) refer to the filtered constraint list used in Phase 2.
+            //
+            // NOTE: Hardcoding [0, 2] is acceptable given the current strict detection
+            // (patterns.len() == 3). If gap detection is broadened later (e.g., to support
+            // captures/wrappers or variable-length patterns), this should be generalized.
+            for &idx in &[0usize, 2usize] {
+                if let Some(pat) = patterns.get(idx) {
+                    // Only compile if it's actually a constraint or capture-wrapped constraint.
+                    // (Avoid compiling something unexpected as a safety measure.)
+                    if Self::as_constraint(pat).is_some() {
+                        sub_queries.push(self.compile_pattern(pat)?);
+                    }
+                }
+            }
+        } else {
+            // Original behavior for non-gap patterns:
+            // include mandatory patterns only (to avoid over-filtering).
+            for pattern in patterns {
+                if self.is_mandatory_pattern(pattern) {
+                    sub_queries.push(self.compile_pattern(pattern)?);
+                }
             }
         }
         
@@ -239,6 +264,21 @@ impl BasicCompiler {
         Ok(Box::new(pattern_query))
     }
     
+    /// Helper to extract constraint from pattern (supports NamedCapture wrapper)
+    fn as_constraint(p: &Pattern) -> Option<&Constraint> {
+        match p {
+            Pattern::Constraint(c) => Some(c),
+            Pattern::NamedCapture { pattern, .. } => {
+                if let Pattern::Constraint(c) = pattern.as_ref() {
+                    Some(c)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Detect gap pattern: Constraint A + Repetition(Wildcard, min, max, kind) + Constraint B
     fn detect_gap_pattern(patterns: &[Pattern]) -> Option<GapPlan> {
         if patterns.len() != 3 {
@@ -246,11 +286,11 @@ impl BasicCompiler {
         }
         
         // Check if pattern is: Constraint + Repetition(Wildcard) + Constraint
-        let constraint_a = match &patterns[0] {
-            Pattern::Constraint(_) => true,
-            _ => false,
-        };
+        // Use as_constraint to support NamedCapture wrappers
+        let _a = Self::as_constraint(&patterns[0])?;  // Returns None if not a constraint
+        let _b = Self::as_constraint(&patterns[2])?;  // Returns None if not a constraint
         
+        // Keep repetition check strict - only accept Pattern::Repetition with Constraint(Wildcard)
         let repetition_wildcard = match &patterns[1] {
             Pattern::Repetition { pattern, .. } => {
                 matches!(pattern.as_ref(), Pattern::Constraint(Constraint::Wildcard))
@@ -258,12 +298,7 @@ impl BasicCompiler {
             _ => false,
         };
         
-        let constraint_b = match &patterns[2] {
-            Pattern::Constraint(_) => true,
-            _ => false,
-        };
-        
-        if constraint_a && repetition_wildcard && constraint_b {
+        if repetition_wildcard {
             if let Pattern::Repetition { min, max, kind, .. } = &patterns[1] {
                 // Note: compile_constraint_sources skips non-constraint patterns (like Repetition),
                 // so positions_per_constraint will be [A, B] (indices 0, 1), not [A, Wildcard, B]
