@@ -4,7 +4,7 @@ use tantivy::{
 };
 use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
-use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec};
+use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec, CollapsedMatcher};
 
 /// Compiler for graph traversal patterns
 ///
@@ -36,8 +36,8 @@ impl GraphCompiler {
     /// Returns None if the constraint or traversal is not suitable for collapsing.
     /// 
     /// Rules:
-    /// - Constraint must be exact string matcher (not regex, not wildcard)
-    /// - Traversal must be simple Incoming/Outgoing with exact label (not wildcard, disjunction)
+    /// - Constraint must be exact string or regex matcher (not wildcard)
+    /// - Traversal must be simple Incoming/Outgoing with exact or regex label (not wildcard, disjunction)
     /// - For first constraint: use the first traversal step
     /// - For last constraint: use the last traversal step
     fn try_build_collapse_spec(
@@ -70,25 +70,33 @@ impl GraphCompiler {
             (c_idx, t_idx, total_constraints - 1)
         };
         
-        // Get the constraint pattern - must be exact string matcher
+        // Helper to extract CollapsedMatcher from a Matcher
+        fn matcher_to_collapsed(matcher: &Matcher) -> Option<CollapsedMatcher> {
+            match matcher {
+                Matcher::String(term) => Some(CollapsedMatcher::Exact(term.clone())),
+                Matcher::Regex { pattern, .. } => Some(CollapsedMatcher::RegexPattern(pattern.clone())),
+            }
+        }
+        
+        // Get the constraint pattern - supports exact string and regex matchers
         let constraint_step = flat_steps.get(constraint_step_idx)?;
-        let (constraint_field_name, constraint_term) = match constraint_step {
+        let (constraint_field_name, constraint_matcher) = match constraint_step {
             FlatPatternStep::Constraint(Pattern::Constraint(
-                Constraint::Field { name, matcher: Matcher::String(term) }
-            )) => (name.clone(), term.clone()),
+                Constraint::Field { name, matcher }
+            )) => (name.clone(), matcher_to_collapsed(matcher)?),
             FlatPatternStep::Constraint(Pattern::NamedCapture { pattern, .. }) => {
                 // Unwrap named capture to get underlying constraint
                 match pattern.as_ref() {
-                    Pattern::Constraint(Constraint::Field { name, matcher: Matcher::String(term) }) => {
-                        (name.clone(), term.clone())
+                    Pattern::Constraint(Constraint::Field { name, matcher }) => {
+                        (name.clone(), matcher_to_collapsed(matcher)?)
                     }
-                    _ => return None, // Can't collapse
+                    _ => return None, // Can't collapse wildcard
                 }
             }
-            _ => return None, // Can't collapse regex/wildcard
+            _ => return None, // Can't collapse wildcard
         };
         
-        // Get the traversal - must be simple Incoming/Outgoing with exact label
+        // Get the traversal - supports exact and regex edge labels
         // 
         // Edge field mapping correctness (critical for avoiding false negatives):
         // - For first constraint:
@@ -100,20 +108,20 @@ impl GraphCompiler {
         //
         // This mapping ensures we check the correct edge field at the constraint position.
         let traversal_step = flat_steps.get(traversal_step_idx)?;
-        let (edge_field, edge_label) = match traversal_step {
-            FlatPatternStep::Traversal(Traversal::Incoming(Matcher::String(label))) => {
+        let (edge_field, edge_matcher) = match traversal_step {
+            FlatPatternStep::Traversal(Traversal::Incoming(matcher)) => {
                 // Incoming edge: constraint node must have incoming edge (works for both first and last)
-                (incoming_edges_field, label.clone())
+                (incoming_edges_field, matcher_to_collapsed(matcher)?)
             }
-            FlatPatternStep::Traversal(Traversal::Outgoing(Matcher::String(label))) => {
+            FlatPatternStep::Traversal(Traversal::Outgoing(matcher)) => {
                 if is_first {
                     // First constraint with outgoing: constraint node needs outgoing edge
-                    (outgoing_edges_field, label.clone())
+                    (outgoing_edges_field, matcher_to_collapsed(matcher)?)
                 } else {
                     // Last constraint with outgoing (going TO it): constraint node needs incoming edge
                     // Example: [word=thirsty] >xcomp [word=pretzels]
                     //          The "pretzels" node is the TARGET of >xcomp, so it has an incoming edge
-                    (incoming_edges_field, label.clone())
+                    (incoming_edges_field, matcher_to_collapsed(matcher)?)
                 }
             }
             FlatPatternStep::Traversal(Traversal::Concatenated(traversals)) => {
@@ -124,14 +132,14 @@ impl GraphCompiler {
                     traversals.last()
                 };
                 match relevant_trav {
-                    Some(Traversal::Incoming(Matcher::String(label))) => {
-                        (incoming_edges_field, label.clone())
+                    Some(Traversal::Incoming(matcher)) => {
+                        (incoming_edges_field, matcher_to_collapsed(matcher)?)
                     }
-                    Some(Traversal::Outgoing(Matcher::String(label))) => {
+                    Some(Traversal::Outgoing(matcher)) => {
                         if is_first {
-                            (outgoing_edges_field, label.clone())
+                            (outgoing_edges_field, matcher_to_collapsed(matcher)?)
                         } else {
-                            (incoming_edges_field, label.clone())
+                            (incoming_edges_field, matcher_to_collapsed(matcher)?)
                         }
                     }
                     _ => return None, // Can't collapse
@@ -156,18 +164,18 @@ impl GraphCompiler {
         let constraint_field = self.schema.get_field(&constraint_field_name).ok()?;
         
         log::info!(
-            "Built CollapsedSpec for {} constraint: field='{}' term='{}' edge_label='{}'",
+            "Built CollapsedSpec for {} constraint: field='{}' constraint={} edge={}",
             if is_first { "first" } else { "last" },
             constraint_field_name,
-            constraint_term,
-            edge_label
+            constraint_matcher.display(),
+            edge_matcher.display()
         );
         
         Some(CollapsedSpec {
             constraint_field,
-            constraint_term,
+            constraint_matcher,
             edge_field,
-            edge_label,
+            edge_matcher,
             constraint_idx,
         })
     }

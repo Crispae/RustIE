@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tantivy = "0.24"
+tantivy-fst = "0.5"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"

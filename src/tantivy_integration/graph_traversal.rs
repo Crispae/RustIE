@@ -10,6 +10,7 @@ use tantivy::{
 };
 use log::debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BinaryHeap;
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
@@ -64,18 +65,33 @@ struct PositionPrefilterPlan {
 // CandidateDriver Trait and Implementations (Odinson-style collapsed queries)
 // =============================================================================
 
+/// Default maximum number of terms to expand for regex patterns.
+/// Prevents runaway memory/time on broad patterns like `.*`
+pub const DEFAULT_MAX_TERM_EXPANSIONS: usize = 50;
+
+/// Matcher for collapsed specs - supports both exact and regex patterns.
+/// Uses pattern string only; term enumeration uses Tantivy's FST-based automaton,
+/// not the regex crate.
+#[derive(Clone, Debug)]
+pub enum CollapsedMatcher {
+    /// Exact term match
+    Exact(String),
+    /// Tantivy/Lucene-style regex pattern (matches whole term, anchored)
+    RegexPattern(String),
+}
+
 /// Specification for collapsing a constraint + edge into a single driver.
-/// Only valid when both are exact string matchers.
+/// Supports both exact string matchers and regex patterns via term enumeration.
 #[derive(Clone, Debug)]
 pub struct CollapsedSpec {
     /// Field for the constraint (e.g., word, entity, tag)
     pub constraint_field: Field,
-    /// Exact term value for the constraint
-    pub constraint_term: String,
+    /// Matcher for the constraint (exact or regex)
+    pub constraint_matcher: CollapsedMatcher,
     /// Field for the edge (incoming_edges or outgoing_edges)
     pub edge_field: Field,
-    /// Exact edge label
-    pub edge_label: String,
+    /// Matcher for the edge label (exact or regex)
+    pub edge_matcher: CollapsedMatcher,
     /// Which constraint this collapses (0 for first, last for dst)
     pub constraint_idx: usize,
 }
@@ -223,6 +239,298 @@ fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 }
 
 // =============================================================================
+// Regex Support: Term Expansion and Union Position Iteration
+// =============================================================================
+
+/// Expand a CollapsedMatcher to Vec<SegmentPostings>.
+/// Returns None if:
+/// - Field doesn't support positions
+/// - Regex exceeds max_expansions (logs warning and bails out)
+/// - No matching terms in segment
+fn expand_matcher(
+    reader: &SegmentReader,
+    field: Field,
+    matcher: &CollapsedMatcher,
+    max_expansions: usize,
+) -> Option<Vec<SegmentPostings>> {
+    let inverted_index = reader.inverted_index(field).ok()?;
+    
+    match matcher {
+        CollapsedMatcher::Exact(term_str) => {
+            // Single term lookup (fast path)
+            let term = Term::from_field_text(field, term_str);
+            let postings = inverted_index
+                .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
+                .ok()??;
+            Some(vec![postings])
+        }
+        CollapsedMatcher::RegexPattern(pattern) => {
+            // Automaton-based term enumeration
+            let term_dict = inverted_index.terms();
+            
+            // Build FST automaton from regex pattern
+            let automaton = match tantivy_fst::Regex::new(pattern) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!("Invalid regex pattern '{}': {}", pattern, e);
+                    return None;
+                }
+            };
+            
+            let mut stream = match term_dict.search(&automaton).into_stream() {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("Failed to search term dict with pattern '{}': {:?}", pattern, e);
+                    return None;
+                }
+            };
+            
+            let mut postings_list = Vec::new();
+            let mut count = 0;
+            
+            while stream.advance() {
+                if count >= max_expansions {
+                    log::warn!(
+                        "collapse regex disabled: pattern={} expanded_terms={} > max={}",
+                        pattern, count, max_expansions
+                    );
+                    return None; // Bail out - too many terms
+                }
+                
+                let term_bytes = stream.key();
+                let term = Term::from_field_bytes(field, term_bytes);
+                if let Ok(Some(postings)) = inverted_index
+                    .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
+                {
+                    postings_list.push(postings);
+                }
+                count += 1;
+            }
+            
+            if postings_list.is_empty() {
+                log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
+                return None; // No matching terms in segment
+            }
+            
+            log::debug!(
+                "Regex pattern '{}' expanded to {} terms",
+                pattern, postings_list.len()
+            );
+            Some(postings_list)
+        }
+    }
+}
+
+/// Entry in the min-heap for k-way merge of postings
+struct PostingsEntry {
+    doc: DocId,
+    idx: usize,  // Index into postings vec
+}
+
+impl Ord for PostingsEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Min-heap: smaller doc first (reverse comparison)
+        other.doc.cmp(&self.doc)
+    }
+}
+
+impl PartialOrd for PostingsEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Eq for PostingsEntry {}
+
+impl PartialEq for PostingsEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.doc == other.doc
+    }
+}
+
+/// Union iterator over multiple postings lists.
+/// Yields (doc_id, merged_positions) for each doc that appears in any postings.
+/// Uses heap-based k-way merge for efficient iteration.
+struct UnionPositionsIterator {
+    postings: Vec<SegmentPostings>,
+    heap: BinaryHeap<PostingsEntry>,
+    current_doc: DocId,
+    merged_positions: Vec<u32>,
+    position_buf: Vec<u32>,
+}
+
+impl UnionPositionsIterator {
+    fn new(postings: Vec<SegmentPostings>) -> Self {
+        let mut heap = BinaryHeap::with_capacity(postings.len());
+        
+        // Initialize heap with first doc from each postings
+        for (idx, p) in postings.iter().enumerate() {
+            let doc = p.doc();
+            if doc != tantivy::TERMINATED {
+                heap.push(PostingsEntry { doc, idx });
+            }
+        }
+        
+        let mut iter = Self {
+            postings,
+            heap,
+            current_doc: tantivy::TERMINATED,
+            merged_positions: Vec::with_capacity(32),
+            position_buf: Vec::with_capacity(16),
+        };
+        
+        // Advance to first doc
+        iter.advance_to_next_doc();
+        iter
+    }
+    
+    fn doc(&self) -> DocId {
+        self.current_doc
+    }
+    
+    fn positions(&self) -> &[u32] {
+        &self.merged_positions
+    }
+    
+    fn advance_to_next_doc(&mut self) -> DocId {
+        self.merged_positions.clear();
+        
+        if self.heap.is_empty() {
+            self.current_doc = tantivy::TERMINATED;
+            return self.current_doc;
+        }
+        
+        // Get minimum doc
+        let min_doc = self.heap.peek().unwrap().doc;
+        self.current_doc = min_doc;
+        
+        // Collect positions from all postings at min_doc
+        let mut positions_to_merge: Vec<Vec<u32>> = Vec::new();
+        
+        while let Some(entry) = self.heap.peek() {
+            if entry.doc != min_doc {
+                break;
+            }
+            
+            let entry = self.heap.pop().unwrap();
+            let postings = &mut self.postings[entry.idx];
+            
+            // Get positions for this term at this doc
+            self.position_buf.clear();
+            postings.positions(&mut self.position_buf);
+            positions_to_merge.push(self.position_buf.clone());
+            
+            // Advance this postings and re-insert if not exhausted
+            let next_doc = postings.advance();
+            if next_doc != tantivy::TERMINATED {
+                self.heap.push(PostingsEntry { doc: next_doc, idx: entry.idx });
+            }
+        }
+        
+        // Merge positions (sort + dedup)
+        self.merge_positions(&positions_to_merge);
+        
+        self.current_doc
+    }
+    
+    fn merge_positions(&mut self, position_lists: &[Vec<u32>]) {
+        // Fast path: single list
+        if position_lists.len() == 1 {
+            self.merged_positions.extend_from_slice(&position_lists[0]);
+            return;
+        }
+        
+        // Collect all positions, sort, dedup
+        let total: usize = position_lists.iter().map(|v| v.len()).sum();
+        self.merged_positions.reserve(total);
+        
+        for list in position_lists {
+            self.merged_positions.extend_from_slice(list);
+        }
+        
+        self.merged_positions.sort_unstable();
+        self.merged_positions.dedup();
+    }
+}
+
+/// Driver that combines two UnionPositionsIterators with position intersection.
+/// This is the regex-capable version of CombinedPositionDriver.
+/// Implements the Lucene "SpanMultiTermQueryWrapper + SpanNear/AND" pattern.
+struct UnionAndIntersectDriver {
+    lhs: UnionPositionsIterator,  // Constraint side
+    rhs: UnionPositionsIterator,  // Edge side
+    current_doc: DocId,
+    intersection: Vec<u32>,
+}
+
+impl UnionAndIntersectDriver {
+    fn new(lhs: UnionPositionsIterator, rhs: UnionPositionsIterator) -> Self {
+        let mut driver = Self {
+            lhs,
+            rhs,
+            current_doc: tantivy::TERMINATED,
+            intersection: Vec::with_capacity(16),
+        };
+        driver.advance_to_next_match();
+        driver
+    }
+    
+    fn advance_to_next_match(&mut self) -> DocId {
+        loop {
+            let d1 = self.lhs.doc();
+            let d2 = self.rhs.doc();
+            
+            if d1 == tantivy::TERMINATED || d2 == tantivy::TERMINATED {
+                self.current_doc = tantivy::TERMINATED;
+                return self.current_doc;
+            }
+            
+            if d1 < d2 {
+                self.lhs.advance_to_next_doc();
+                continue;
+            } else if d2 < d1 {
+                self.rhs.advance_to_next_doc();
+                continue;
+            }
+            
+            // Same doc - intersect positions
+            self.intersection.clear();
+            intersect_sorted_into(
+                self.lhs.positions(),
+                self.rhs.positions(),
+                &mut self.intersection
+            );
+            
+            let doc = d1;
+            
+            // Advance both for next iteration
+            self.lhs.advance_to_next_doc();
+            self.rhs.advance_to_next_doc();
+            
+            if !self.intersection.is_empty() {
+                self.current_doc = doc;
+                return self.current_doc;
+            }
+            // No position overlap - continue
+        }
+    }
+}
+
+impl CandidateDriver for UnionAndIntersectDriver {
+    fn doc(&self) -> DocId {
+        self.current_doc
+    }
+    
+    fn advance(&mut self) -> DocId {
+        self.advance_to_next_match()
+    }
+    
+    fn matching_positions(&self) -> Option<&[u32]> {
+        Some(&self.intersection)
+    }
+}
+
+// =============================================================================
 // End CandidateDriver Implementation
 // =============================================================================
 
@@ -356,37 +664,68 @@ struct OptimizedGraphTraversalWeight {
     dst_collapse: Option<CollapsedSpec>,
 }
 
+impl CollapsedMatcher {
+    /// Format matcher for logging
+    pub fn display(&self) -> String {
+        match self {
+            CollapsedMatcher::Exact(s) => format!("'{}'", s),
+            CollapsedMatcher::RegexPattern(p) => format!("/{}/", p),
+        }
+    }
+}
+
 impl OptimizedGraphTraversalWeight {
-    /// Build a CombinedPositionDriver from a CollapsedSpec
-    /// Returns None if postings don't exist (term not in segment)
+    /// Build a CandidateDriver from a CollapsedSpec.
+    /// Handles both exact matches (fast path) and regex patterns (term enumeration).
+    /// 
+    /// Returns None if:
+    /// - Postings don't exist (term not in segment)
+    /// - Regex expansion exceeds max_expansions limit
+    /// - No matching terms for regex pattern
     fn build_combined_driver(
         &self,
         reader: &SegmentReader,
         spec: &CollapsedSpec,
-    ) -> Option<CombinedPositionDriver> {
-        let constraint_term = Term::from_field_text(spec.constraint_field, &spec.constraint_term);
-        let edge_term = Term::from_field_text(spec.edge_field, &spec.edge_label);
+    ) -> Option<Box<dyn CandidateDriver>> {
+        // Expand constraint matcher
+        let constraint_postings = expand_matcher(
+            reader,
+            spec.constraint_field,
+            &spec.constraint_matcher,
+            DEFAULT_MAX_TERM_EXPANSIONS,
+        )?;
         
-        // Get constraint postings
-        let constraint_postings = reader
-            .inverted_index(spec.constraint_field)
-            .ok()?
-            .read_postings(&constraint_term, IndexRecordOption::WithFreqsAndPositions)
-            .ok()??;
+        // Expand edge matcher
+        let edge_postings = expand_matcher(
+            reader,
+            spec.edge_field,
+            &spec.edge_matcher,
+            DEFAULT_MAX_TERM_EXPANSIONS,
+        )?;
         
-        // Get edge postings
-        let edge_postings = reader
-            .inverted_index(spec.edge_field)
-            .ok()?
-            .read_postings(&edge_term, IndexRecordOption::WithFreqsAndPositions)
-            .ok()??;
+        // Fast path: both exact (single postings each) - use CombinedPositionDriver
+        if constraint_postings.len() == 1 && edge_postings.len() == 1 {
+            log::info!(
+                "Built CombinedPositionDriver (fast path) for constraint={} edge={}",
+                spec.constraint_matcher.display(), spec.edge_matcher.display()
+            );
+            return Some(Box::new(CombinedPositionDriver::new(
+                constraint_postings.into_iter().next().unwrap(),
+                edge_postings.into_iter().next().unwrap(),
+            )));
+        }
         
+        // Regex path: use UnionAndIntersectDriver
         log::info!(
-            "Built CombinedPositionDriver for constraint='{}' edge='{}'",
-            spec.constraint_term, spec.edge_label
+            "Built UnionAndIntersectDriver for constraint={} ({} postings) edge={} ({} postings)",
+            spec.constraint_matcher.display(), constraint_postings.len(),
+            spec.edge_matcher.display(), edge_postings.len()
         );
         
-        Some(CombinedPositionDriver::new(constraint_postings, edge_postings))
+        let lhs = UnionPositionsIterator::new(constraint_postings);
+        let rhs = UnionPositionsIterator::new(edge_postings);
+        
+        Some(Box::new(UnionAndIntersectDriver::new(lhs, rhs)))
     }
 }
 
@@ -398,9 +737,9 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         let src_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.src_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using CombinedPositionDriver for src (constraint='{}' edge='{}')",
-                    spec.constraint_term, spec.edge_label);
-                Box::new(driver)
+                log::info!("Using driver for src (constraint={} edge={})",
+                    spec.constraint_matcher.display(), spec.edge_matcher.display());
+                driver
             } else {
                 log::info!("Using EmptyDriver for src (postings unavailable in segment)");
                 Box::new(EmptyDriver)
@@ -412,9 +751,9 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         let dst_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.dst_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using CombinedPositionDriver for dst (constraint='{}' edge='{}')",
-                    spec.constraint_term, spec.edge_label);
-                Box::new(driver)
+                log::info!("Using driver for dst (constraint={} edge={})",
+                    spec.constraint_matcher.display(), spec.edge_matcher.display());
+                driver
             } else {
                 log::info!("Using EmptyDriver for dst (postings unavailable in segment)");
                 Box::new(EmptyDriver)
@@ -1558,15 +1897,40 @@ mod tests {
         // Test that CollapsedSpec can be cloned (required for passing through Weight)
         let spec = CollapsedSpec {
             constraint_field: Field::from_field_id(0),
-            constraint_term: "test".to_string(),
+            constraint_matcher: CollapsedMatcher::Exact("test".to_string()),
             edge_field: Field::from_field_id(1),
-            edge_label: "nsubj".to_string(),
+            edge_matcher: CollapsedMatcher::Exact("nsubj".to_string()),
             constraint_idx: 0,
         };
         let cloned = spec.clone();
-        assert_eq!(cloned.constraint_term, "test");
-        assert_eq!(cloned.edge_label, "nsubj");
+        assert!(matches!(cloned.constraint_matcher, CollapsedMatcher::Exact(ref s) if s == "test"));
+        assert!(matches!(cloned.edge_matcher, CollapsedMatcher::Exact(ref s) if s == "nsubj"));
         assert_eq!(cloned.constraint_idx, 0);
+    }
+
+    #[test]
+    fn test_collapsed_spec_regex() {
+        // Test CollapsedSpec with regex patterns
+        let spec = CollapsedSpec {
+            constraint_field: Field::from_field_id(0),
+            constraint_matcher: CollapsedMatcher::RegexPattern("protein.*".to_string()),
+            edge_field: Field::from_field_id(1),
+            edge_matcher: CollapsedMatcher::RegexPattern("nmod_.*".to_string()),
+            constraint_idx: 0,
+        };
+        let cloned = spec.clone();
+        assert!(matches!(cloned.constraint_matcher, CollapsedMatcher::RegexPattern(ref s) if s == "protein.*"));
+        assert!(matches!(cloned.edge_matcher, CollapsedMatcher::RegexPattern(ref s) if s == "nmod_.*"));
+    }
+
+    #[test]
+    fn test_collapsed_matcher_display() {
+        // Test display formatting for logging
+        let exact = CollapsedMatcher::Exact("hello".to_string());
+        assert_eq!(exact.display(), "'hello'");
+        
+        let regex = CollapsedMatcher::RegexPattern("nmod_.*".to_string());
+        assert_eq!(regex.display(), "/nmod_.*/");
     }
 
     #[test]
