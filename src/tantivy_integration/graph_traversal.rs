@@ -26,6 +26,12 @@ static PREFILTER_DOCS: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_KILLED: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_ALLOWED_POS_SUM: AtomicUsize = AtomicUsize::new(0);
 static PREFILTER_ALLOWED_POS_COUNT: AtomicUsize = AtomicUsize::new(0);
+// Odinson-style collapsed query metrics
+static SRC_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
+static DST_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
+static DRIVER_ALIGNMENT_DOCS: AtomicUsize = AtomicUsize::new(0);
+static DRIVER_INTERSECTION_SUM: AtomicUsize = AtomicUsize::new(0);
+static DRIVER_INTERSECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Edge term requirement for position prefiltering
 #[derive(Clone, Debug)]
@@ -85,21 +91,21 @@ trait CandidateDriver: Send {
     fn matching_positions(&self) -> Option<&[u32]>;
 }
 
-/// Wraps Box<dyn Scorer> for non-collapsed constraints.
-/// No position information available.
-struct GenericDriver {
-    scorer: Box<dyn Scorer>,
-}
+/// EmptyDriver: Immediately returns TERMINATED.
+/// Used when CombinedPositionDriver cannot be built (required term missing from segment)
+/// or when CollapsedSpec exists but postings are unavailable.
+/// This skips entire segments when required terms are missing, avoiding wasted computation.
+struct EmptyDriver;
 
-impl CandidateDriver for GenericDriver {
+impl CandidateDriver for EmptyDriver {
     fn doc(&self) -> DocId {
-        self.scorer.doc()
+        tantivy::TERMINATED
     }
-    
+
     fn advance(&mut self) -> DocId {
-        self.scorer.advance()
+        tantivy::TERMINATED
     }
-    
+
     fn matching_positions(&self) -> Option<&[u32]> {
         None
     }
@@ -217,61 +223,36 @@ fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 // End CandidateDriver Implementation
 // =============================================================================
 
-// Optimized graph traversal query that first finds documents containing both source and destination tokens
+// Optimized graph traversal query using Odinson-style collapsed query optimization.
+// Candidate generation is driven exclusively by CombinedPositionDriver - no BooleanQuery pre-filtering.
 #[derive(Debug)]
 pub struct OptimizedGraphTraversalQuery {
+    #[allow(dead_code)]
     default_field: Field,
     dependencies_binary_field: Field,
     incoming_edges_field: Field,
     outgoing_edges_field: Field,
-    src_query: Box<dyn Query>,
     traversal: crate::compiler::ast::Traversal,
-    dst_query: Box<dyn Query>,
     src_pattern: crate::compiler::ast::Pattern,
     dst_pattern: crate::compiler::ast::Pattern,
-    /// If set, src constraint can be collapsed with first edge for index-level position filtering
+    /// Collapse spec for src constraint (first) - enables CombinedPositionDriver
     src_collapse: Option<CollapsedSpec>,
-    /// If set, dst constraint can be collapsed with last edge for index-level position filtering
+    /// Collapse spec for dst constraint (last) - enables CombinedPositionDriver
     dst_collapse: Option<CollapsedSpec>,
 }
 
 
 impl OptimizedGraphTraversalQuery {
-    pub fn new(
+    /// Create a new query using only collapse specs for candidate generation.
+    /// No BooleanQuery pre-filtering - relies exclusively on CombinedPositionDriver.
+    ///
+    /// If neither src nor dst can be collapsed, EmptyDriver is used (returns no results).
+    pub fn collapsed_only(
         default_field: Field,
         dependencies_binary_field: Field,
         incoming_edges_field: Field,
         outgoing_edges_field: Field,
-        src_query: Box<dyn Query>,
         traversal: crate::compiler::ast::Traversal,
-        dst_query: Box<dyn Query>,
-        src_pattern: crate::compiler::ast::Pattern,
-        dst_pattern: crate::compiler::ast::Pattern,
-    ) -> Self {
-        Self {
-            default_field,
-            dependencies_binary_field,
-            incoming_edges_field,
-            outgoing_edges_field,
-            src_query,
-            traversal,
-            dst_query,
-            src_pattern,
-            dst_pattern,
-            src_collapse: None,
-            dst_collapse: None,
-        }
-    }
-    
-    /// Create a new query with collapse specs for Odinson-style index-level position filtering
-    pub fn with_collapse_specs(
-        default_field: Field,
-        dependencies_binary_field: Field,
-        incoming_edges_field: Field,
-        outgoing_edges_field: Field,
-        src_query: Box<dyn Query>,
-        traversal: crate::compiler::ast::Traversal,
-        dst_query: Box<dyn Query>,
         src_pattern: crate::compiler::ast::Pattern,
         dst_pattern: crate::compiler::ast::Pattern,
         src_collapse: Option<CollapsedSpec>,
@@ -282,9 +263,7 @@ impl OptimizedGraphTraversalQuery {
             dependencies_binary_field,
             incoming_edges_field,
             outgoing_edges_field,
-            src_query,
             traversal,
-            dst_query,
             src_pattern,
             dst_pattern,
             src_collapse,
@@ -295,16 +274,13 @@ impl OptimizedGraphTraversalQuery {
 
 impl Query for OptimizedGraphTraversalQuery {
 
-    fn weight(&self, scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
-        
-        // Note: Edge label filters are now included in src_query and dst_query 
-        // (added in graph_compiler.rs when creating combined_query)
-        // So we can use them directly without additional wrapping
-        
-        log::info!("Using combined_query (includes constraints + edge label filters) for candidate selection");
-        
-        let src_weight = self.src_query.weight(scoring)?;
-        let dst_weight = self.dst_query.weight(scoring)?;
+    fn weight(&self, _scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
+        // Odinson-style: No BooleanQuery weights - use CombinedPositionDriver exclusively
+        log::info!(
+            "Creating collapsed-only weight: src_collapse={}, dst_collapse={}",
+            self.src_collapse.is_some(),
+            self.dst_collapse.is_some()
+        );
 
         // Pre-compute flattened pattern once at Weight creation (not per document)
         let full_pattern = Pattern::GraphTraversal {
@@ -322,24 +298,14 @@ impl Query for OptimizedGraphTraversalQuery {
             self.outgoing_edges_field,
         );
 
-        // Log collapse specs if present
-        if self.src_collapse.is_some() {
-            log::info!("src_collapse spec present: {:?}", self.src_collapse);
-        }
-        if self.dst_collapse.is_some() {
-            log::info!("dst_collapse spec present: {:?}", self.dst_collapse);
-        }
-
         Ok(Box::new(OptimizedGraphTraversalWeight {
-            src_weight,
-            dst_weight,
             src_pattern: self.src_pattern.clone(),
             dst_pattern: self.dst_pattern.clone(),
             traversal: self.traversal.clone(),
             dependencies_binary_field: self.dependencies_binary_field,
             incoming_edges_field: self.incoming_edges_field,
             outgoing_edges_field: self.outgoing_edges_field,
-            flat_steps, // Cached flattened pattern
+            flat_steps,
             prefilter_plan,
             src_collapse: self.src_collapse.clone(),
             dst_collapse: self.dst_collapse.clone(),
@@ -354,9 +320,7 @@ impl tantivy::query::QueryClone for OptimizedGraphTraversalQuery {
             dependencies_binary_field: self.dependencies_binary_field,
             incoming_edges_field: self.incoming_edges_field,
             outgoing_edges_field: self.outgoing_edges_field,
-            src_query: self.src_query.box_clone(),
             traversal: self.traversal.clone(),
-            dst_query: self.dst_query.box_clone(),
             src_pattern: self.src_pattern.clone(),
             dst_pattern: self.dst_pattern.clone(),
             src_collapse: self.src_collapse.clone(),
@@ -365,10 +329,9 @@ impl tantivy::query::QueryClone for OptimizedGraphTraversalQuery {
     }
 }
 
-/// Optimized weight for graph traversal queries
+/// Optimized weight for graph traversal queries using Odinson-style collapsed optimization.
+/// No BooleanQuery weights - candidate generation driven exclusively by CombinedPositionDriver.
 struct OptimizedGraphTraversalWeight {
-    src_weight: Box<dyn Weight>,
-    dst_weight: Box<dyn Weight>,
     #[allow(dead_code)]
     traversal: crate::compiler::ast::Traversal,
     dependencies_binary_field: Field,
@@ -384,9 +347,9 @@ struct OptimizedGraphTraversalWeight {
     flat_steps: Vec<FlatPatternStep>,
     /// Position prefilter plan for edge-based position restrictions
     prefilter_plan: PositionPrefilterPlan,
-    /// Optional collapse spec for src constraint (Odinson-style optimization)
+    /// Collapse spec for src constraint - required for CombinedPositionDriver
     src_collapse: Option<CollapsedSpec>,
-    /// Optional collapse spec for dst constraint (Odinson-style optimization)
+    /// Collapse spec for dst constraint - required for CombinedPositionDriver
     dst_collapse: Option<CollapsedSpec>,
 }
 
@@ -427,36 +390,35 @@ impl OptimizedGraphTraversalWeight {
 impl Weight for OptimizedGraphTraversalWeight {
 
     fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
-        // Build drivers for src and dst (Odinson-style optimization)
-        // If collapse spec exists and postings are available, use CombinedPositionDriver
-        // Otherwise fall back to GenericDriver wrapping the existing scorer
-        
+        // Odinson-style: Build drivers exclusively from collapse specs
+        // No GenericDriver fallback - use EmptyDriver when postings unavailable
+
         let src_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.src_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using CombinedPositionDriver for src (Odinson-style collapsed query)");
+                log::info!("Using CombinedPositionDriver for src (constraint='{}' edge='{}')",
+                    spec.constraint_term, spec.edge_label);
                 Box::new(driver)
             } else {
-                log::info!("Falling back to GenericDriver for src (postings not available)");
-                let scorer = self.src_weight.scorer(reader, boost)?;
-                Box::new(GenericDriver { scorer })
+                log::info!("Using EmptyDriver for src (postings unavailable in segment)");
+                Box::new(EmptyDriver)
             }
         } else {
-            let scorer = self.src_weight.scorer(reader, boost)?;
-            Box::new(GenericDriver { scorer })
+            log::info!("Using EmptyDriver for src (no collapse spec - pattern not collapsible)");
+            Box::new(EmptyDriver)
         };
-        
+
         let dst_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.dst_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using CombinedPositionDriver for dst (Odinson-style collapsed query)");
+                log::info!("Using CombinedPositionDriver for dst (constraint='{}' edge='{}')",
+                    spec.constraint_term, spec.edge_label);
                 Box::new(driver)
             } else {
-                log::info!("Falling back to GenericDriver for dst (postings not available)");
-                let scorer = self.dst_weight.scorer(reader, boost)?;
-                Box::new(GenericDriver { scorer })
+                log::info!("Using EmptyDriver for dst (postings unavailable in segment)");
+                Box::new(EmptyDriver)
             }
         } else {
-            let scorer = self.dst_weight.scorer(reader, boost)?;
-            Box::new(GenericDriver { scorer })
+            log::info!("Using EmptyDriver for dst (no collapse spec - pattern not collapsible)");
+            Box::new(EmptyDriver)
         };
 
         // Cache the store reader (created once, reused for all documents in this segment)
@@ -726,6 +688,17 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                         0.0
                     };
                     
+                    let src_driver_docs = SRC_DRIVER_DOCS.load(Ordering::Relaxed);
+                    let dst_driver_docs = DST_DRIVER_DOCS.load(Ordering::Relaxed);
+                    let alignment_docs = DRIVER_ALIGNMENT_DOCS.load(Ordering::Relaxed);
+                    let intersection_sum = DRIVER_INTERSECTION_SUM.load(Ordering::Relaxed);
+                    let intersection_count = DRIVER_INTERSECTION_COUNT.load(Ordering::Relaxed);
+                    let avg_intersection = if intersection_count > 0 {
+                        intersection_sum as f64 / intersection_count as f64
+                    } else {
+                        0.0
+                    };
+                    
                     log::info!(
                         "FINAL Graph traversal stats: {} candidates checked, {} graphs deserialized ({} skipped, {:.1}% skip rate)",
                         call_num, deser_count, skipped_count, skip_rate
@@ -734,18 +707,36 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                         "FINAL Prefilter stats: {} docs checked, {} killed by prefilter ({:.1}% kill rate), avg allowed positions per constraint: {:.1}",
                         prefilter_docs, prefilter_killed, prefilter_kill_rate, avg_allowed_pos
                     );
+                    log::info!(
+                        "FINAL Odinson driver stats: src_driver={} docs, dst_driver={} docs, aligned={} docs, avg intersection size={:.1}",
+                        src_driver_docs, dst_driver_docs, alignment_docs, avg_intersection
+                    );
                 }
                 
                 return tantivy::TERMINATED;
             }
             debug!("advance() considering src_doc = {}, dst_doc = {}", src_doc, dst_doc);
             if src_doc < dst_doc {
+                SRC_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
                 self.src_driver.advance();
             } else if dst_doc < src_doc {
+                DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
                 self.dst_driver.advance();
             } else {
                 // src_doc == dst_doc: both drivers have matches in this doc
                 let doc_id = src_doc;
+                DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
+                
+                // Track intersection sizes for metrics
+                if let Some(src_pos) = self.src_driver.matching_positions() {
+                    DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
+                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(dst_pos) = self.dst_driver.matching_positions() {
+                    DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
+                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                
                 debug!("advance() found candidate doc_id = {}", doc_id);
                 if self.check_graph_traversal(doc_id) {
                     debug!("advance() doc_id {} MATCHED graph traversal", doc_id);
@@ -803,14 +794,51 @@ impl OptimizedGraphTraversalScorer {
     /// Compute allowed positions per constraint using edge postings AND constraint postings
     /// Returns None if document cannot match (required edge/constraint term missing or empty intersection)
     /// Returns Some(allowed_positions) if document passes prefilter
-    fn compute_allowed_positions(&mut self, doc_id: DocId) -> Option<Vec<Option<Vec<u32>>>> {
+    /// Compute allowed positions for each constraint, using driver positions for collapsed constraints
+    /// to avoid duplicate work (Odinson optimization).
+    /// 
+    /// For collapsed constraints (0 and last), uses driver positions directly instead of
+    /// recomputing constraint+edge intersection.
+    fn compute_allowed_positions(
+        &mut self,
+        doc_id: DocId,
+        src_driver_positions: Option<&[u32]>,
+        dst_driver_positions: Option<&[u32]>,
+    ) -> Option<Vec<Option<Vec<u32>>>> {
         // Start as "no restriction" for each constraint
         let mut allowed: Vec<Option<Vec<u32>>> = vec![None; self.prefilter_plan.num_constraints];
+        
+        // Determine which constraints are collapsed (to skip duplicate work)
+        let src_collapsed_idx = self.src_collapse.as_ref().map(|s| s.constraint_idx);
+        let dst_collapsed_idx = self.dst_collapse.as_ref().map(|s| s.constraint_idx);
+        let last_constraint_idx = self.prefilter_plan.num_constraints.saturating_sub(1);
+        let dst_is_last = dst_collapsed_idx.map(|idx| idx == last_constraint_idx).unwrap_or(false);
+
+        // Use driver positions directly for collapsed constraints (avoid duplicate work)
+        if let Some(src_positions) = src_driver_positions {
+            if let Some(idx) = src_collapsed_idx {
+                allowed[idx] = Some(src_positions.to_vec());
+                log::debug!("Using src_driver positions for constraint {} (skipping recomputation)", idx);
+            }
+        }
+        if let Some(dst_positions) = dst_driver_positions {
+            if dst_is_last {
+                if let Some(idx) = dst_collapsed_idx {
+                    allowed[idx] = Some(dst_positions.to_vec());
+                    log::debug!("Using dst_driver positions for constraint {} (skipping recomputation)", idx);
+                }
+            }
+        }
 
         let mut buf: Vec<u32> = Vec::with_capacity(32);
 
-        // Phase 1: Process edge requirements
+        // Phase 1: Process edge requirements (skip edges for collapsed constraints)
         for (req_idx, req) in self.prefilter_plan.edge_reqs.iter().enumerate() {
+            // Skip if this edge requirement is for a collapsed constraint
+            if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
+                log::debug!("Skipping edge requirement for collapsed constraint {}", req.constraint_idx);
+                continue;
+            }
             let postings_opt = self.edge_postings.get_mut(req_idx).and_then(|p| p.as_mut());
 
             // If postings is None, the term doesn't exist in this segment at all => cannot match
@@ -866,7 +894,14 @@ impl OptimizedGraphTraversalScorer {
         }
 
         // Phase 2: Process constraint requirements (intersect with edge positions)
+        // Skip collapsed constraints - they already have driver positions set
         for (req_idx, req) in self.constraint_reqs.iter().enumerate() {
+            // Skip if this constraint is collapsed (already has driver positions)
+            if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
+                log::debug!("Skipping constraint requirement for collapsed constraint {}", req.constraint_idx);
+                continue;
+            }
+            
             let postings_opt = self.constraint_postings.get_mut(req_idx).and_then(|p| p.as_mut());
 
             // If postings is None, the term doesn't exist in this segment at all => cannot match
@@ -925,10 +960,9 @@ impl OptimizedGraphTraversalScorer {
 
         // Get driver positions for first/last constraints (Odinson-style position handoff)
         // These are already filtered for position overlap between constraint and edge
-        let src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions()
-            .map(|p| p.to_vec());
-        let dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions()
-            .map(|p| p.to_vec());
+        // Clone positions to avoid borrow checker issues (they're small Vec<u32>)
+        let src_driver_positions = self.src_driver.matching_positions().map(|p| p.to_vec());
+        let dst_driver_positions = self.dst_driver.matching_positions().map(|p| p.to_vec());
         
         if src_driver_positions.is_some() {
             log::debug!("Using src_driver positions for constraint 0 (Odinson position handoff)");
@@ -938,8 +972,13 @@ impl OptimizedGraphTraversalScorer {
         }
 
         // Phase 0: Postings prefilter (before any store access)
+        // Pass driver positions to avoid duplicate work for collapsed constraints
         PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
-        let allowed_positions = match self.compute_allowed_positions(doc_id) {
+        let allowed_positions = match self.compute_allowed_positions(
+            doc_id,
+            src_driver_positions.as_deref(),
+            dst_driver_positions.as_deref(),
+        ) {
             Some(ap) => ap,
             None => {
                 PREFILTER_KILLED.fetch_add(1, Ordering::Relaxed);
@@ -1014,22 +1053,31 @@ impl OptimizedGraphTraversalScorer {
                     Pattern::Constraint(crate::compiler::ast::Constraint::Wildcard)
                 );
 
-                // Odinson position handoff: check if we can use driver positions
+                // Odinson position handoff: check if we can use driver positions from allowed_positions
+                // (which were set directly from drivers, avoiding duplicate work)
                 let is_first_constraint = constraint_count == 0;
                 let is_last_constraint = constraint_count == total_constraints - 1;
                 
-                let positions = if is_first_constraint && src_driver_positions.is_some() && self.src_collapse.is_some() {
-                    // Use src_driver positions directly (already filtered by constraint + edge)
+                let positions = if is_first_constraint && self.src_collapse.is_some() {
+                    // Use allowed_positions[0] which was set from src_driver (already filtered by constraint + edge)
                     // This skips token scanning entirely for constraint 0
-                    log::debug!("Skipping token scan for constraint 0, using {} driver positions", 
-                        src_driver_positions.as_ref().unwrap().len());
-                    src_driver_positions.as_ref().unwrap().iter().map(|&p| p as usize).collect()
-                } else if is_last_constraint && dst_driver_positions.is_some() && self.dst_collapse.is_some() {
-                    // Use dst_driver positions directly (already filtered by constraint + edge)
+                    if let Some(ref allowed) = allowed_positions[constraint_count] {
+                        log::debug!("Skipping token scan for constraint 0, using {} driver positions", allowed.len());
+                        allowed.iter().map(|&p| p as usize).collect()
+                    } else {
+                        // Fallback: shouldn't happen if driver worked correctly
+                        self.find_positions_in_tokens(tokens, constraint_pat)
+                    }
+                } else if is_last_constraint && self.dst_collapse.is_some() {
+                    // Use allowed_positions[last] which was set from dst_driver (already filtered by constraint + edge)
                     // This skips token scanning entirely for last constraint
-                    log::debug!("Skipping token scan for last constraint, using {} driver positions",
-                        dst_driver_positions.as_ref().unwrap().len());
-                    dst_driver_positions.as_ref().unwrap().iter().map(|&p| p as usize).collect()
+                    if let Some(ref allowed) = allowed_positions[constraint_count] {
+                        log::debug!("Skipping token scan for last constraint, using {} driver positions", allowed.len());
+                        allowed.iter().map(|&p| p as usize).collect()
+                    } else {
+                        // Fallback: shouldn't happen if driver worked correctly
+                        self.find_positions_in_tokens(tokens, constraint_pat)
+                    }
                 } else if is_wildcard {
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
                         allowed.iter().map(|&p| p as usize).collect()

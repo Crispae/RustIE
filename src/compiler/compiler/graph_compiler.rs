@@ -1,24 +1,24 @@
 use tantivy::{
-    query::{Query, BooleanQuery, Occur, TermQuery, RegexQuery},
-    schema::{Term, Field, Schema},
+    query::Query,
+    schema::{Field, Schema},
 };
 use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
 use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec};
-use crate::compiler::compiler::basic_compiler::BasicCompiler;
 
 /// Compiler for graph traversal patterns
+///
+/// Uses Odinson-style collapsed query optimization exclusively:
+/// - No BooleanQuery pre-filtering stage
+/// - Relies on CombinedPositionDriver for index-level position intersection
+/// - CollapsedSpec for first/last constraints merged with adjacent edges
 pub struct GraphCompiler {
-    basic_compiler: BasicCompiler,
     schema: Schema,
 }
 
 impl GraphCompiler {
     pub fn new(schema: Schema) -> Self {
-        Self {
-            basic_compiler: BasicCompiler::new(schema.clone()),
-            schema,
-        }
+        Self { schema }
     }
 
     pub fn compile_pattern(&self, pattern: &Pattern) -> Result<Box<dyn Query>> {
@@ -27,32 +27,7 @@ impl GraphCompiler {
                 self.compile_graph_traversal(src, traversal, dst)
             }
             _ => {
-                // For non-traversal patterns, delegate to basic compiler
-                self.basic_compiler.compile_pattern(pattern)
-            }
-        }
-    }
-
-    /// Extract all constraint patterns from a (possibly nested) GraphTraversal pattern
-    fn extract_all_constraints(&self, pattern: &Pattern) -> Vec<Pattern> {
-        let mut constraints = Vec::new();
-        self.collect_constraints(pattern, &mut constraints);
-        constraints
-    }
-
-    fn collect_constraints(&self, pattern: &Pattern, constraints: &mut Vec<Pattern>) {
-        match pattern {
-            Pattern::GraphTraversal { src, dst, .. } => {
-                // Recursively collect from nested traversals
-                self.collect_constraints(src, constraints);
-                self.collect_constraints(dst, constraints);
-            }
-            Pattern::Constraint(_) => {
-                constraints.push(pattern.clone());
-            }
-            _ => {
-                // For other patterns (named captures, etc.), add as-is
-                constraints.push(pattern.clone());
+                Err(anyhow!("GraphCompiler only handles GraphTraversal patterns"))
             }
         }
     }
@@ -114,10 +89,20 @@ impl GraphCompiler {
         };
         
         // Get the traversal - must be simple Incoming/Outgoing with exact label
+        // 
+        // Edge field mapping correctness (critical for avoiding false negatives):
+        // - For first constraint:
+        //   * `<nsubj` (Incoming) → incoming_edges_field (first node receives incoming edge)
+        //   * `>nsubj` (Outgoing) → outgoing_edges_field (first node has outgoing edge)
+        // - For last constraint:
+        //   * `<nsubj` (Incoming) → incoming_edges_field (last node receives incoming edge)
+        //   * `>dobj` (Outgoing) → incoming_edges_field (last node is TARGET of outgoing edge, so it has incoming edge)
+        //
+        // This mapping ensures we check the correct edge field at the constraint position.
         let traversal_step = flat_steps.get(traversal_step_idx)?;
         let (edge_field, edge_label) = match traversal_step {
             FlatPatternStep::Traversal(Traversal::Incoming(Matcher::String(label))) => {
-                // Incoming edge: constraint node must have incoming edge
+                // Incoming edge: constraint node must have incoming edge (works for both first and last)
                 (incoming_edges_field, label.clone())
             }
             FlatPatternStep::Traversal(Traversal::Outgoing(Matcher::String(label))) => {
@@ -126,6 +111,8 @@ impl GraphCompiler {
                     (outgoing_edges_field, label.clone())
                 } else {
                     // Last constraint with outgoing (going TO it): constraint node needs incoming edge
+                    // Example: [word=thirsty] >xcomp [word=pretzels]
+                    //          The "pretzels" node is the TARGET of >xcomp, so it has an incoming edge
                     (incoming_edges_field, label.clone())
                 }
             }
@@ -150,7 +137,19 @@ impl GraphCompiler {
                     _ => return None, // Can't collapse
                 }
             }
-            _ => return None, // Can't collapse wildcards/disjunctions/optional
+            FlatPatternStep::Traversal(Traversal::Optional(_)) => {
+                // Optional traversal: can't collapse (would drop "no-edge" matches)
+                return None;
+            }
+            FlatPatternStep::Traversal(Traversal::Disjunctive(_)) => {
+                // Disjunctive traversal: can't collapse (would require union of multiple drivers)
+                return None;
+            }
+            FlatPatternStep::Traversal(Traversal::KleeneStar(_)) => {
+                // Kleene star: can't collapse (variable length)
+                return None;
+            }
+            _ => return None, // Can't collapse wildcards/other complex traversals
         };
         
         // Get constraint field
@@ -173,108 +172,34 @@ impl GraphCompiler {
         })
     }
 
+    /// Compile a graph traversal pattern using Odinson-style collapsed query optimization.
+    ///
+    /// This method does NOT use BooleanQuery pre-filtering. Instead, it relies exclusively
+    /// on CombinedPositionDriver for index-level position intersection. Candidate generation
+    /// is driven by collapse specs that intersect constraint terms with edge labels.
+    ///
+    /// If collapse specs cannot be built (e.g., regex constraints, wildcard edges),
+    /// the query uses EmptyDriver and returns no results for that segment.
     fn compile_graph_traversal(&self, src: &Pattern, traversal: &Traversal, dst: &Pattern) -> Result<Box<dyn Query>> {
-        // Build the full pattern to extract all constraints and edge labels
+        // Build the full pattern
         let full_pattern = Pattern::GraphTraversal {
             src: Box::new(src.clone()),
             traversal: traversal.clone(),
             dst: Box::new(dst.clone()),
         };
 
-        // Extract ALL constraints from the entire pattern (flattened)
-        let all_constraints = self.extract_all_constraints(&full_pattern);
-
-        // Compile each constraint to a query and combine with AND (BooleanQuery)
-        // This ensures we only check documents that have ALL required tokens
-        let mut sub_queries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for constraint in &all_constraints {
-            if let Ok(query) = self.basic_compiler.compile_pattern(constraint) {
-                sub_queries.push((Occur::Must, query));
-            }
-        }
-
-        // Extract edge labels from the full pattern and add them to the AND query
+        // Flatten pattern steps - needed for collapse spec building
         let mut flat_steps = Vec::new();
         flatten_graph_traversal_pattern(&full_pattern, &mut flat_steps);
-        
-        let mut required_incoming = std::collections::HashSet::new();
-        let mut required_outgoing = std::collections::HashSet::new();
-        
-        for step in &flat_steps {
-            if let FlatPatternStep::Traversal(trav) = step {
-                match trav {
-                    Traversal::Outgoing(matcher) => {
-                        let label_str = matcher.pattern_str().to_string();
-                        required_outgoing.insert(label_str);
-                    },
-                    Traversal::Incoming(matcher) => {
-                        let label_str = matcher.pattern_str().to_string();
-                        required_incoming.insert(label_str);
-                    },
-                    Traversal::Optional(inner) => {
-                        // Extract from optional traversal
-                        match &**inner {
-                            Traversal::Outgoing(matcher) => {
-                                let label_str = matcher.pattern_str().to_string();
-                                required_outgoing.insert(label_str);
-                            },
-                            Traversal::Incoming(matcher) => {
-                                let label_str = matcher.pattern_str().to_string();
-                                required_incoming.insert(label_str);
-                            },
-                            _ => {}
-                        }
-                    },
-                    _ => {} // Wildcards/Disjunctions - skip for filtering
-                }
-            }
-        }
 
-        // Get edge label fields from schema
+        // Get edge label fields from schema (needed for collapse specs)
         let incoming_edges_field = self.schema.get_field("incoming_edges")
             .map_err(|_| anyhow!("Incoming edges field not found in schema"))?;
         let outgoing_edges_field = self.schema.get_field("outgoing_edges")
             .map_err(|_| anyhow!("Outgoing edges field not found in schema"))?;
 
-        // Add edge label filters to the AND query
-        for label in &required_outgoing {
-            let term = Term::from_field_text(outgoing_edges_field, &label);
-            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions));
-            sub_queries.push((Occur::Must, query));
-            log::info!("Added outgoing edge filter: term='{}' in field outgoing_edges", label);
-        }
-
-        for label in &required_incoming {
-            let term = Term::from_field_text(incoming_edges_field, &label);
-            let query = Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions));
-            sub_queries.push((Occur::Must, query));
-            log::info!("Added incoming edge filter: term='{}' in field incoming_edges", label);
-        }
-
-        log::info!("Combined query includes {} constraints + {} edge label filters", 
-                   all_constraints.len(), required_incoming.len() + required_outgoing.len());
-
-        // Create combined index query - documents must match ALL constraints AND edge labels
-        let combined_query: Box<dyn Query> = if sub_queries.len() == 1 {
-            sub_queries.pop().unwrap().1
-        } else if sub_queries.is_empty() {
-            // Fallback: match all documents (shouldn't happen with valid patterns)
-            Box::new(tantivy::query::AllQuery)
-        } else {
-            Box::new(BooleanQuery::new(sub_queries))
-        };
-
-        // Get the dependencies fields from schema.
-        let dependencies_binary_field = self.schema.get_field("dependencies_binary")
-            .map_err(|_| anyhow!("Dependencies binary field not found in schema"))?;
-        let incoming_edges_field = self.schema.get_field("incoming_edges")
-            .map_err(|_| anyhow!("Incoming edges field not found in schema"))?;
-        let outgoing_edges_field = self.schema.get_field("outgoing_edges")
-            .map_err(|_| anyhow!("Outgoing edges field not found in schema"))?;
-        let default_field = self.schema.get_field("word")
-            .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-
-        // Try to build collapse specs for Odinson-style index-level position filtering
+        // Build collapse specs for first and last constraints
+        // These enable CombinedPositionDriver for index-level position intersection
         let src_collapse = self.try_build_collapse_spec(
             &flat_steps,
             true,  // first constraint
@@ -287,26 +212,35 @@ impl GraphCompiler {
             incoming_edges_field,
             outgoing_edges_field,
         );
-        
-        if src_collapse.is_some() || dst_collapse.is_some() {
-            log::info!(
-                "Odinson-style collapsed query optimization enabled: src={}, dst={}",
-                src_collapse.is_some(),
-                dst_collapse.is_some()
+
+        // Log collapse spec status
+        log::info!(
+            "Odinson-style collapsed query (no BooleanQuery): src_collapse={}, dst_collapse={}",
+            src_collapse.is_some(),
+            dst_collapse.is_some()
+        );
+
+        if src_collapse.is_none() && dst_collapse.is_none() {
+            log::warn!(
+                "Neither src nor dst could be collapsed. Query will use EmptyDriver \
+                and may return no results. Consider using exact string constraints \
+                with simple edge traversals for optimal performance."
             );
         }
 
-        // Pass the combined query as BOTH src_query and dst_query
-        // The OptimizedGraphTraversalQuery will use combined_query for initial filtering
-        // Then the full pattern is used for graph traversal verification
-        Ok(Box::new(OptimizedGraphTraversalQuery::with_collapse_specs(
+        // Get remaining schema fields
+        let dependencies_binary_field = self.schema.get_field("dependencies_binary")
+            .map_err(|_| anyhow!("Dependencies binary field not found in schema"))?;
+        let default_field = self.schema.get_field("word")
+            .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
+
+        // Create the query with collapse specs only - no BooleanQuery
+        Ok(Box::new(OptimizedGraphTraversalQuery::collapsed_only(
             default_field,
             dependencies_binary_field,
             incoming_edges_field,
             outgoing_edges_field,
-            combined_query.box_clone(),  // Use combined query for src filtering
             traversal.clone(),
-            combined_query,              // Use same combined query for dst filtering
             src.clone(),
             dst.clone(),
             src_collapse,
