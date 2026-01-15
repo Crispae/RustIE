@@ -404,9 +404,7 @@ impl UnionPositionsIterator {
         let min_doc = self.heap.peek().unwrap().doc;
         self.current_doc = min_doc;
         
-        // Collect positions from all postings at min_doc
-        let mut positions_to_merge: Vec<Vec<u32>> = Vec::new();
-        
+        // Collect positions from all postings at min_doc directly into merged_positions
         while let Some(entry) = self.heap.peek() {
             if entry.doc != min_doc {
                 break;
@@ -415,10 +413,10 @@ impl UnionPositionsIterator {
             let entry = self.heap.pop().unwrap();
             let postings = &mut self.postings[entry.idx];
             
-            // Get positions for this term at this doc
+            // Get positions into temp buffer, then extend merged_positions
             self.position_buf.clear();
             postings.positions(&mut self.position_buf);
-            positions_to_merge.push(self.position_buf.clone());
+            self.merged_positions.extend_from_slice(&self.position_buf);
             
             // Advance this postings and re-insert if not exhausted
             let next_doc = postings.advance();
@@ -427,29 +425,13 @@ impl UnionPositionsIterator {
             }
         }
         
-        // Merge positions (sort + dedup)
-        self.merge_positions(&positions_to_merge);
+        // Sort and dedup the merged positions
+        if !self.merged_positions.is_empty() {
+            self.merged_positions.sort_unstable();
+            self.merged_positions.dedup();
+        }
         
         self.current_doc
-    }
-    
-    fn merge_positions(&mut self, position_lists: &[Vec<u32>]) {
-        // Fast path: single list
-        if position_lists.len() == 1 {
-            self.merged_positions.extend_from_slice(&position_lists[0]);
-            return;
-        }
-        
-        // Collect all positions, sort, dedup
-        let total: usize = position_lists.iter().map(|v| v.len()).sum();
-        self.merged_positions.reserve(total);
-        
-        for list in position_lists {
-            self.merged_positions.extend_from_slice(list);
-        }
-        
-        self.merged_positions.sort_unstable();
-        self.merged_positions.dedup();
     }
 }
 
