@@ -57,5 +57,9 @@ path = "src/bin/create_test_index.rs"
 name = "profile_query"
 path = "src/bin/profile_query.rs"
 
+[[bin]]
+name = "test_greedy_lazy"
+path = "src/bin/test_greedy_lazy.rs"
+
 [profile.release]
 debug = true

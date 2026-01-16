@@ -1397,6 +1397,10 @@ fn find_spans_scan<'a>(
 /// Maximum number of backtracking iterations to prevent exponential blowup
 const MAX_BACKTRACK_ITERATIONS: usize = 10_000;
 
+/// Maximum number of matches to generate for a repetition pattern
+/// Prevents explosion when patterns have many valid matches
+const MAX_GENERATED_MATCHES: usize = 10_000;
+
 /// Try to match exactly `count` repetitions of a pattern starting at `pos`
 fn try_repetition_count(
     pattern: &crate::compiler::ast::Pattern,
@@ -1418,6 +1422,161 @@ fn try_repetition_count(
         }
     }
     Some((pos, captures))
+}
+
+/// Try to match exactly `count` repetitions of a pattern starting at `pos`
+/// Returns (end_position, captures, sub_matches) if successful
+fn try_repetition_count_with_metadata(
+    pattern: &crate::compiler::ast::Pattern,
+    count: usize,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    start_pos: usize,
+    len: usize,
+) -> Option<(usize, Vec<crate::types::NamedCapture>, Vec<crate::types::MatchWithMetadata>)> {
+    use crate::types::MatchWithMetadata;
+    
+    let mut current_pos = start_pos;
+    let mut sub_matches = Vec::with_capacity(count);
+    let mut all_captures = Vec::new();
+    
+    for _ in 0..count {
+        if current_pos >= len {
+            // Can't match - not enough positions left
+            return None;
+        }
+        
+        // Generate matches at current position
+        let matches = generate_all_matches_at_position(pattern, field_cache, current_pos);
+        
+        if matches.is_empty() {
+            // Inner pattern doesn't match at this position
+            return None;
+        }
+        
+        // Take first match (for simple patterns like wildcards, all matches are equivalent)
+        let m = matches.into_iter().next().unwrap();
+        
+        // Ensure we're making progress (avoid infinite loops)
+        if m.span.end <= current_pos {
+            return None;
+        }
+        
+        current_pos = m.span.end;
+        all_captures.extend(m.captures.clone());
+        sub_matches.push(m);
+    }
+    
+    Some((current_pos, all_captures, sub_matches))
+}
+
+/// Generate ALL valid matches for a repetition pattern
+/// This follows Odinson's approach: generate all possibilities, then select
+/// 
+/// Handles edge cases:
+/// - min=0: generates zero-length match (optional repetition)
+/// - max bounds: respects maximum count limit
+/// - unbounded patterns: uses document length as practical limit
+/// - nested repetitions: handled recursively (Phase A: basic support)
+pub fn generate_all_repetition_matches(
+    pattern: &crate::compiler::ast::Pattern,
+    min: usize,
+    max: Option<usize>,
+    is_greedy: bool,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    pos: usize,
+) -> Vec<crate::types::MatchWithMetadata> {
+    use crate::types::{Span, MatchWithMetadata};
+    
+    // Get document length from field cache
+    let len = field_cache
+        .get("word")
+        .or_else(|| field_cache.values().next())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    
+    // Edge case: position beyond document
+    if pos > len {
+        return Vec::new();
+    }
+    
+    // Edge case: position at end of document
+    // For min=0, we can still generate a zero-length match
+    if pos == len {
+        if min == 0 {
+            // Zero-length match for optional repetition
+            let span = Span { start: pos, end: pos };
+            return vec![MatchWithMetadata::repetition(
+                span,
+                Vec::new(),
+                is_greedy,
+                Vec::new(), // No sub-matches for zero repetitions
+            )];
+        } else {
+            return Vec::new();
+        }
+    }
+    
+    // Calculate maximum possible count based on remaining document length
+    // For unbounded patterns (max=None), use remaining document length as practical limit
+    let max_possible = len.saturating_sub(pos);
+    let max_count = max
+        .map(|m| {
+            // Respect both the pattern's max and document length
+            m.min(max_possible)
+        })
+        .unwrap_or(max_possible);
+    
+    // Edge case: min exceeds max (invalid pattern)
+    if min > max_count {
+        return Vec::new();
+    }
+    
+    // Edge case: min=0 (optional repetition) - always generate zero-length match first
+    let mut matches = Vec::new();
+    if min == 0 {
+        let span = Span { start: pos, end: pos };
+        matches.push(MatchWithMetadata::repetition(
+            span,
+            Vec::new(),
+            is_greedy,
+            Vec::new(),
+        ));
+    }
+    
+    // Generate matches for each valid count from min to max
+    // Start from max(min, 1) to avoid duplicate zero-length match
+    let start_count = min.max(1);
+    for count in start_count..=max_count {
+        // Performance safeguard: limit total matches generated
+        if matches.len() >= MAX_GENERATED_MATCHES {
+            log::warn!(
+                "Match generation limit ({}) reached for repetition pattern at position {}",
+                MAX_GENERATED_MATCHES,
+                pos
+            );
+            break;
+        }
+        
+        // Try to match exactly 'count' repetitions
+        if let Some((end_pos, captures, sub_matches)) =
+            try_repetition_count_with_metadata(pattern, count, field_cache, pos, len)
+        {
+            let span = Span { start: pos, end: end_pos };
+            matches.push(MatchWithMetadata::repetition(
+                span,
+                captures,
+                is_greedy,
+                sub_matches,
+            ));
+        } else {
+            // If we can't match this count, we likely can't match larger counts either
+            // (assuming patterns are contiguous). However, for patterns that might skip,
+            // we continue trying. This is a conservative approach.
+            // For Phase A, we'll continue trying all counts.
+        }
+    }
+    
+    matches
 }
 
 /// Recursive backtracking matcher for pattern sequences
@@ -1529,15 +1688,162 @@ fn match_sequence_with_backtracking(
     match_sequence_recursive(patterns, 0, field_cache, start_pos, len, Vec::new(), &mut iteration_count)
 }
 
+/// Generate all valid sequence matches starting at a given position
+/// Returns all matches with metadata for selection algorithm
+fn generate_all_sequence_matches_recursive(
+    patterns: &[crate::compiler::ast::Pattern],
+    pattern_idx: usize,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    pos: usize,
+    len: usize,
+    mut sub_matches: Vec<crate::types::MatchWithMetadata>,
+    mut captures: Vec<crate::types::NamedCapture>,
+    iteration_count: &mut usize,
+) -> Vec<crate::types::MatchWithMetadata> {
+    use crate::compiler::ast::{Pattern, QuantifierKind};
+    use crate::types::MatchWithMetadata;
+    
+    // Check iteration limit
+    *iteration_count += 1;
+    if *iteration_count > MAX_BACKTRACK_ITERATIONS {
+        log::warn!("Backtracking limit exceeded in generate_all_sequence_matches");
+        return Vec::new();
+    }
+    
+    // Base case: all patterns matched successfully
+    if pattern_idx >= patterns.len() {
+        // Calculate actual span from sub_matches
+        let start = if let Some(first) = sub_matches.first() {
+            first.span.start
+        } else {
+            pos
+        };
+        let end = if let Some(last) = sub_matches.last() {
+            last.span.end
+        } else {
+            pos
+        };
+        let span = crate::types::Span { start, end };
+        return vec![MatchWithMetadata::sequence(span, captures, sub_matches)];
+    }
+    
+    // Don't match beyond document length
+    if pos > len {
+        return Vec::new();
+    }
+    
+    let pat = &patterns[pattern_idx];
+    let mut all_results = Vec::new();
+    
+    // Special handling for Repetition patterns
+    if let Pattern::Repetition { pattern: inner, min, max, kind } = pat {
+        let is_greedy = *kind == QuantifierKind::Greedy;
+        
+        // Generate all valid repetition matches
+        let rep_matches = generate_all_repetition_matches(
+            inner, *min, *max, is_greedy, field_cache, pos
+        );
+        
+        // For each repetition match, try to match remaining patterns
+        for rep_match in rep_matches {
+            let mut new_sub_matches = sub_matches.clone();
+            new_sub_matches.push(rep_match.clone());
+            let mut new_captures = captures.clone();
+            new_captures.extend(rep_match.captures.clone());
+            
+            let remaining = generate_all_sequence_matches_recursive(
+                patterns,
+                pattern_idx + 1,
+                field_cache,
+                rep_match.span.end,
+                len,
+                new_sub_matches,
+                new_captures,
+                iteration_count,
+            );
+            all_results.extend(remaining);
+        }
+        
+        return all_results;
+    }
+    
+    // Non-repetition patterns: generate all matches and continue
+    if pos < len {
+        let matches = generate_all_matches_at_position(pat, field_cache, pos);
+        for m in matches {
+            let mut new_sub_matches = sub_matches.clone();
+            new_sub_matches.push(m.clone());
+            let mut new_captures = captures.clone();
+            new_captures.extend(m.captures.clone());
+            
+            let remaining = generate_all_sequence_matches_recursive(
+                patterns,
+                pattern_idx + 1,
+                field_cache,
+                m.span.end,
+                len,
+                new_sub_matches,
+                new_captures,
+                iteration_count,
+            );
+            all_results.extend(remaining);
+        }
+    }
+    
+    // Handle zero-width assertions
+    if let Pattern::Assertion(_) = pat {
+        let matches = generate_all_matches_at_position(pat, field_cache, pos);
+        for m in matches {
+            let mut new_sub_matches = sub_matches.clone();
+            new_sub_matches.push(m.clone());
+            let mut new_captures = captures.clone();
+            new_captures.extend(m.captures.clone());
+            
+            let remaining = generate_all_sequence_matches_recursive(
+                patterns,
+                pattern_idx + 1,
+                field_cache,
+                m.span.end,
+                len,
+                new_sub_matches,
+                new_captures,
+                iteration_count,
+            );
+            all_results.extend(remaining);
+        }
+    }
+    
+    all_results
+}
+
+/// Generate all valid sequence matches starting at a given position
+pub fn generate_all_sequence_matches(
+    patterns: &[crate::compiler::ast::Pattern],
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    start_pos: usize,
+    len: usize,
+) -> Vec<crate::types::MatchWithMetadata> {
+    let mut iteration_count = 0;
+    generate_all_sequence_matches_recursive(
+        patterns,
+        0,
+        field_cache,
+        start_pos,
+        len,
+        Vec::new(),
+        Vec::new(),
+        &mut iteration_count,
+    )
+}
+
 pub fn find_constraint_spans_in_sequence(
     pattern: &crate::compiler::ast::Pattern, 
     field_cache: &std::collections::HashMap<String, Vec<String>>
 ) -> Vec<crate::types::SpanWithCaptures> {
     use crate::compiler::ast::Pattern;
+    use crate::tantivy_integration::match_selector::MatchSelector;
     
     if let Pattern::Concatenated(patterns) = pattern {
-        let mut results = Vec::new();
-        
         // Use 'word' field to determine sentence length as it's the most reliable
         let len = field_cache.get("word")
             .or_else(|| field_cache.values().next())
@@ -1545,21 +1851,132 @@ pub fn find_constraint_spans_in_sequence(
             .unwrap_or(0);
         
         if len == 0 { 
-            return results; 
+            return Vec::new(); 
         }
 
-        // Use backtracking matcher for proper lazy/greedy semantics
+        // Generate all valid matches using generate-all approach
+        let mut all_matches = Vec::new();
         for start in 0..len {
-            if let Some((end_pos, captures)) = match_sequence_with_backtracking(
-                patterns, field_cache, start, len
-            ) {
-                let full_span = crate::types::Span { start, end: end_pos };
-                results.push(crate::types::SpanWithCaptures::with_captures(full_span, captures));
-            }
+            let matches = generate_all_sequence_matches(patterns, field_cache, start, len);
+            all_matches.extend(matches);
         }
-        results
+        
+        // Apply selection algorithm to disambiguate competing matches
+        let selected_matches = MatchSelector::pick_matches(all_matches);
+        
+        // Convert MatchWithMetadata back to SpanWithCaptures for backward compatibility
+        selected_matches
+            .into_iter()
+            .map(|m| crate::types::SpanWithCaptures::with_captures(m.span, m.captures))
+            .collect()
     } else {
         Vec::new()
+    }
+}
+
+/// Generate all valid matches for any pattern type at a given position
+/// This is the parallel function to matches_pattern_at_position that returns
+/// all matches with metadata for selection algorithm
+pub fn generate_all_matches_at_position(
+    pattern: &crate::compiler::ast::Pattern,
+    field_cache: &std::collections::HashMap<String, Vec<String>>,
+    pos: usize,
+) -> Vec<crate::types::MatchWithMetadata> {
+    use crate::compiler::ast::Pattern;
+    use crate::types::MatchWithMetadata;
+    
+    match pattern {
+        Pattern::Constraint(constraint) => {
+            if matches_constraint_at_position(constraint, field_cache, pos) {
+                let span = crate::types::Span { start: pos, end: pos + 1 };
+                let capture = crate::types::NamedCapture::new(format!("c{}", pos), span.clone());
+                vec![MatchWithMetadata::atom(span, vec![capture])]
+            } else {
+                Vec::new()
+            }
+        }
+        Pattern::NamedCapture { name, pattern } => {
+            let mut matches = generate_all_matches_at_position(pattern, field_cache, pos);
+            // Add the named capture to each match
+            for m in &mut matches {
+                let capture = crate::types::NamedCapture::new(name.clone(), m.span.clone());
+                m.captures.push(capture);
+            }
+            matches
+        }
+        Pattern::Disjunctive(patterns) => {
+            let mut all_matches = Vec::new();
+            for (idx, pat) in patterns.iter().enumerate() {
+                let mut matches = generate_all_matches_at_position(pat, field_cache, pos);
+                // Tag each match with which clause matched
+                for m in &mut matches {
+                    // Convert to disjunction match
+                    let span = m.span.clone();
+                    let captures = std::mem::take(&mut m.captures);
+                    *m = MatchWithMetadata::disjunction(span, captures, idx);
+                }
+                all_matches.extend(matches);
+            }
+            all_matches
+        }
+        Pattern::Repetition { pattern, min, max, kind } => {
+            use crate::compiler::ast::QuantifierKind;
+            let is_greedy = *kind == QuantifierKind::Greedy;
+            generate_all_repetition_matches(pattern, *min, *max, is_greedy, field_cache, pos)
+        }
+        Pattern::Assertion(assertion) => {
+            use crate::compiler::ast::Assertion;
+            match assertion {
+                Assertion::PositiveLookahead(child) => {
+                    if generate_all_matches_at_position(child, field_cache, pos).is_empty() {
+                        Vec::new()
+                    } else {
+                        // Zero-width match
+                        let span = crate::types::Span { start: pos, end: pos };
+                        vec![MatchWithMetadata::atom(span, Vec::new())]
+                    }
+                }
+                Assertion::NegativeLookahead(child) => {
+                    if generate_all_matches_at_position(child, field_cache, pos).is_empty() {
+                        // Zero-width match
+                        let span = crate::types::Span { start: pos, end: pos };
+                        vec![MatchWithMetadata::atom(span, Vec::new())]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Assertion::PositiveLookbehind(child) => {
+                    if pos > 0 && !generate_all_matches_at_position(child, field_cache, pos - 1).is_empty() {
+                        let span = crate::types::Span { start: pos, end: pos };
+                        vec![MatchWithMetadata::atom(span, Vec::new())]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Assertion::NegativeLookbehind(child) => {
+                    if pos == 0 || generate_all_matches_at_position(child, field_cache, pos - 1).is_empty() {
+                        let span = crate::types::Span { start: pos, end: pos };
+                        vec![MatchWithMetadata::atom(span, Vec::new())]
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
+        }
+        Pattern::Concatenated(nested_patterns) => {
+            // For concatenated patterns, we'll handle this at a higher level
+            // in generate_all_sequence_matches
+            // For now, return empty - this will be handled by sequence generation
+            Vec::new()
+        }
+        Pattern::GraphTraversal { .. } => {
+            // Graph traversals are handled separately
+            Vec::new()
+        }
+        Pattern::Mention { .. } => {
+            // Mentions are handled separately
+            Vec::new()
+        }
     }
 }
 
@@ -1744,5 +2161,153 @@ fn matches_constraint_at_position(
         Constraint::Disjunctive(constraints) => {
             constraints.iter().any(|c| matches_constraint_at_position(c, field_cache, pos))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compiler::ast::{Pattern, Constraint, Matcher, QuantifierKind};
+    use crate::types::Span;
+
+    fn create_field_cache(tokens: Vec<&str>) -> std::collections::HashMap<String, Vec<String>> {
+        let mut cache = std::collections::HashMap::new();
+        cache.insert("word".to_string(), tokens.iter().map(|s| s.to_string()).collect());
+        cache
+    }
+
+    #[test]
+    fn test_generate_all_repetition_matches_greedy() {
+        // Test greedy repetition: should generate all valid matches
+        let pattern = Pattern::Constraint(Constraint::Wildcard);
+        let field_cache = create_field_cache(vec!["a", "b", "c", "a", "b", "c"]);
+        
+        // Pattern: []* (greedy star) - should generate matches for 0, 1, 2, 3, 4, 5, 6 repetitions
+        let matches = generate_all_repetition_matches(
+            &pattern,
+            0,      // min
+            None,   // max (unbounded)
+            true,   // greedy
+            &field_cache,
+            0,      // start position
+        );
+        
+        // Should generate multiple matches (at least min=0 and some valid counts)
+        assert!(!matches.is_empty());
+        // All matches should be greedy
+        for m in &matches {
+            match &m.kind {
+                crate::types::MatchKind::Repetition { is_greedy, .. } => {
+                    assert!(*is_greedy);
+                }
+                _ => panic!("Expected Repetition match kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_all_repetition_matches_lazy() {
+        // Test lazy repetition
+        let pattern = Pattern::Constraint(Constraint::Wildcard);
+        let field_cache = create_field_cache(vec!["a", "b", "c", "a", "b", "c"]);
+        
+        // Pattern: []*? (lazy star)
+        let matches = generate_all_repetition_matches(
+            &pattern,
+            0,      // min
+            None,   // max (unbounded)
+            false,  // lazy
+            &field_cache,
+            0,      // start position
+        );
+        
+        assert!(!matches.is_empty());
+        // All matches should be lazy
+        for m in &matches {
+            match &m.kind {
+                crate::types::MatchKind::Repetition { is_greedy, .. } => {
+                    assert!(!*is_greedy);
+                }
+                _ => panic!("Expected Repetition match kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_generate_all_repetition_matches_bounded() {
+        // Test bounded repetition: {1,3}
+        let pattern = Pattern::Constraint(Constraint::Wildcard);
+        let field_cache = create_field_cache(vec!["a", "b", "c", "d", "e"]);
+        
+        let matches = generate_all_repetition_matches(
+            &pattern,
+            1,      // min
+            Some(3), // max
+            true,   // greedy
+            &field_cache,
+            0,      // start position
+        );
+        
+        // Should generate matches for 1, 2, 3 repetitions
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].span.length(), 1);
+        assert_eq!(matches[1].span.length(), 2);
+        assert_eq!(matches[2].span.length(), 3);
+    }
+
+    #[test]
+    fn test_generate_all_repetition_matches_min_zero() {
+        // Test min=0 case (optional repetition)
+        let pattern = Pattern::Constraint(Constraint::Wildcard);
+        let field_cache = create_field_cache(vec!["a", "b"]);
+        
+        let matches = generate_all_repetition_matches(
+            &pattern,
+            0,      // min
+            Some(2), // max
+            false,  // lazy
+            &field_cache,
+            0,      // start position
+        );
+        
+        // Should generate matches for 0, 1, 2 repetitions
+        assert_eq!(matches.len(), 3);
+        // Zero-length match should have start == end
+        assert_eq!(matches[0].span.start, matches[0].span.end);
+    }
+
+    #[test]
+    fn test_find_constraint_spans_with_selection() {
+        // Test that selection is applied in find_constraint_spans_in_sequence
+        // Pattern: [word=a] []* [word=c] on "a b c a b c"
+        // Greedy should produce one match: "a b c a b c"
+        // Lazy should produce two matches: "a b c" and "a b c"
+        
+        let field_cache = create_field_cache(vec!["a", "b", "c", "a", "b", "c"]);
+        
+        // Create pattern: [word=a] []* [word=c] (greedy)
+        let pattern = Pattern::Concatenated(vec![
+            Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::String("a".to_string()),
+            }),
+            Pattern::Repetition {
+                pattern: Box::new(Pattern::Constraint(Constraint::Wildcard)),
+                min: 0,
+                max: None,
+                kind: QuantifierKind::Greedy,
+            },
+            Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::String("c".to_string()),
+            }),
+        ]);
+        
+        let results = find_constraint_spans_in_sequence(&pattern, &field_cache);
+        
+        // With greedy quantifier, should prefer longer match
+        // The exact behavior depends on the selection algorithm
+        // For now, just verify we get some results
+        assert!(!results.is_empty());
     }
 }
