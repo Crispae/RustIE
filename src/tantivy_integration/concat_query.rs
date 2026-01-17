@@ -147,42 +147,79 @@ fn compile_constraint_sources(
     match pattern {
         Pattern::Concatenated(patterns) => {
             // ═══════════════════════════════════════════════════════════════
-            // NEW: Check if pattern contains Repetition elements
-            // If so, fall back to stored-field path which has proper backtracking
+            // OPTIMIZED: Only fallback for COMPLEX Repetition patterns
+            // Simple wildcard repetitions ([]*?, []{0,5}, etc.) are handled as gaps
             // ═══════════════════════════════════════════════════════════════
             for pat in patterns {
-                if matches!(pat, Pattern::Repetition { .. }) {
-                    log::debug!(
-                        "Pattern contains Repetition element, falling back to stored-field path for proper backtracking"
+                if let Pattern::Repetition { pattern: inner, .. } = pat {
+                    // Check if inner pattern is a simple wildcard (can be handled as gap)
+                    let is_simple_gap = matches!(
+                        inner.as_ref(),
+                        Pattern::Constraint(Constraint::Wildcard)
                     );
-                    return Ok(Vec::new());  // Empty = fallback to stored-field path
-                }
-                // Also check inside NamedCapture
-                if let Pattern::NamedCapture { pattern: inner, .. } = pat {
-                    if matches!(inner.as_ref(), Pattern::Repetition { .. }) {
+                    
+                    if !is_simple_gap {
+                        // Complex repetition (non-wildcard inner pattern) - fallback needed
                         log::debug!(
-                            "Pattern contains Repetition inside NamedCapture, falling back to stored-field path"
+                            "Pattern contains complex Repetition element (non-wildcard), \
+                             falling back to stored-field path"
                         );
                         return Ok(Vec::new());
+                    }
+                    // Simple wildcard gap - continue, will be handled by ConcatPlan
+                }
+                
+                // Also check inside NamedCapture
+                if let Pattern::NamedCapture { pattern: inner, .. } = pat {
+                    if let Pattern::Repetition { pattern: rep_inner, .. } = inner.as_ref() {
+                        let is_simple_gap = matches!(
+                            rep_inner.as_ref(),
+                            Pattern::Constraint(Constraint::Wildcard)
+                        );
+                        if !is_simple_gap {
+                            log::debug!(
+                                "Pattern contains complex Repetition inside NamedCapture, \
+                                 falling back to stored-field path"
+                            );
+                            return Ok(Vec::new());
+                        }
                     }
                 }
             }
             // ═══════════════════════════════════════════════════════════════
             
+            // Extract constraint sources for non-gap patterns
+            // Gap patterns (wildcard repetitions) are handled by ConcatPlan
             for pat in patterns {
+                // Skip gap patterns (wildcard repetitions) - handled by ConcatPlan
+                if let Pattern::Repetition { pattern: inner, .. } = pat {
+                    if matches!(inner.as_ref(), Pattern::Constraint(Constraint::Wildcard)) {
+                        continue;  // Skip gaps
+                    }
+                }
+                
                 let constraint = match pat {
                     Pattern::Constraint(c) => c,
                     Pattern::NamedCapture { pattern: p, .. } => {
-                        if let Pattern::Constraint(c) = p.as_ref() {
-                            c
-                        } else {
-                            continue;  // Skip non-constraint patterns for now
+                        match p.as_ref() {
+                            Pattern::Constraint(c) => c,
+                            Pattern::Repetition { pattern: inner, .. } => {
+                                // Skip wildcard repetitions in named captures
+                                if matches!(inner.as_ref(), Pattern::Constraint(Constraint::Wildcard)) {
+                                    continue;
+                                }
+                                // Non-wildcard repetition should have been rejected above
+                                continue;
+                            }
+                            _ => continue,
                         }
                     }
                     _ => continue,
                 };
                 
-                let source = compile_constraint_to_source(constraint, reader, default_field, &mut regex_cache, schema)?;
+                let source = compile_constraint_to_source(
+                    constraint, reader, default_field, &mut regex_cache, schema
+                )?;
                 sources.push(source);
             }
         }
@@ -191,7 +228,7 @@ fn compile_constraint_sources(
             sources.push(source);
         }
         _ => {
-            // For non-constraint patterns, we'll fall back to stored-field path
+            // For non-constraint patterns, return empty (postings path unavailable)
             return Ok(Vec::new());
         }
     }
@@ -348,29 +385,27 @@ impl Weight for RustieConcatWeight {
                 let scorer = w.scorer(reader, boost)?;
                 // Check if scorer has any documents immediately (before advance)
                 let initial_doc = scorer.doc();
-                if num_sub_weights == 2 {
-                    println!("DEBUG: Created sub_scorer[{}] for segment {}, initial doc={} (before advance)", 
-                             i, reader.segment_id(), initial_doc);
-                    // Try to see if we can get more info about the scorer
-                    if initial_doc != tantivy::TERMINATED {
-                        println!("DEBUG: Sub_scorer[{}] already positioned at doc {}", i, initial_doc);
-                    }
-                }
                 Ok(scorer)
             })
             .collect::<TantivyResult<Vec<_>>>()?;
 
         let is_simple = sub_scorers.len() == 2;
         if is_simple {
-            println!("DEBUG: Creating RustieConcatScorer with {} sub_scorers, pattern={:?}", sub_scorers.len(), self.pattern);
         }
 
         // Compile constraint sources for postings-based Phase 2
         let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field) {
-            Ok(sources) => sources,
+            Ok(sources) => {
+                if sources.is_empty() {
+                    log::debug!("compile_constraint_sources returned empty sources for pattern={:?}, postings path unavailable", self.pattern);
+                } else {
+                    log::debug!("compile_constraint_sources found {} constraint sources for pattern={:?}, postings path available", sources.len(), self.pattern);
+                }
+                sources
+            }
             Err(e) => {
-                log::warn!("Failed to compile constraint sources, falling back to stored-field path: {}", e);
-                Vec::new()  // Empty means fallback to stored-field path
+                log::warn!("Failed to compile constraint sources, postings path unavailable: {}", e);
+                Vec::new()  // Empty means postings path cannot run
             }
         };
 
@@ -548,13 +583,23 @@ impl RustieConcatScorer {
         
         // Try postings-based path first if constraint sources are available
         if !self.constraint_sources.is_empty() {
+            log::debug!("Using postings path for doc_id={}, {} constraint sources", 
+                        doc_id, self.constraint_sources.len());
+            
             // Get doc length and execution plan before mutable borrow
-            let doc_len = self.get_doc_length(doc_id, self.default_field).ok();
+            let doc_len = match self.get_doc_length(doc_id, self.default_field) {
+                Ok(len) => Some(len),
+                Err(_e) => {
+                    None
+                }
+            };
             let execution_plan = self.execution_plan.clone();
             let concat_plan = self.concat_plan.clone();
             
             match self.get_constraint_positions(doc_id) {
                 Ok(positions_per_constraint) => {
+                    log::trace!("get_constraint_positions succeeded for doc_id={}, {} constraints", doc_id, positions_per_constraint.len());
+                    
                     // Use position-based matching
                     let all_spans = find_constraint_spans_from_positions(
                         &positions_per_constraint,
@@ -564,39 +609,27 @@ impl RustieConcatScorer {
                     );
                     
                     self.current_doc_matches = all_spans;
-                    return !self.current_doc_matches.is_empty();
+                    
+                    if !self.current_doc_matches.is_empty() {
+                        log::debug!("Postings path found {} matches for doc_id={}", 
+                                    self.current_doc_matches.len(), doc_id);
+                        return true;
+                    } else {
+                        log::debug!("Postings path found 0 matches for doc_id={}, returning false (no fallback)", doc_id);
+                        // Trust the postings path result - if it found 0 matches, return false
+                        // Don't fall back to stored-field path which is slower
+                        return false;
+                    }
                 }
                 Err(e) => {
-                    log::debug!("Postings-based path failed for doc {}: {}, falling back to stored-field path", doc_id, e);
-                    // Fall through to stored-field path
+                    log::debug!("Postings-based path failed for doc {}: {}, cannot match", doc_id, e);
+                    // Fall through to return false
                 }
             }
         }
         
-        // Fallback to stored-field path
-        let store_reader = match self.reader.get_store_reader(1) {
-            Ok(reader) => reader,
-            Err(_) => return false,
-        };
-        let doc = match store_reader.get(doc_id) {
-            Ok(doc) => doc,
-            Err(_) => return false,
-        };
-
-        let mut field_cache = std::collections::HashMap::new();
-        let field_names = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm"];
-        for name in field_names {
-            let tokens = crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), &doc, name);
-            if !tokens.is_empty() {
-                field_cache.insert(name.to_string(), tokens);
-            }
-        }
-
-        // Find all valid spans matching the concatenated pattern
-        let all_spans = find_constraint_spans_in_sequence(&self.pattern, &field_cache);
-        self.current_doc_matches = all_spans;
-        
-        !self.current_doc_matches.is_empty()
+        // Postings path unavailable (constraint_sources empty or get_constraint_positions failed)
+        return false;
     }
     
     /// Fill positions for exact term constraint
@@ -626,6 +659,8 @@ impl RustieConcatScorer {
         if postings.doc() == doc_id {
             buf.clear();
             postings.positions(buf);  // Fill buffer, returns ()
+            // Sort positions - required for two-pointer algorithm in join_lazy
+            buf.sort_unstable();
         }
         Ok(())
     }
@@ -693,12 +728,14 @@ impl RustieConcatScorer {
         }
         
         // Now create views (slices) into the filled buffers
-        Ok(self.constraint_sources.iter().enumerate().map(|(i, src)| {
+        let views: Vec<PosView> = self.constraint_sources.iter().enumerate().map(|(i, src)| {
             match src {
                 ConstraintSource::Wildcard { .. } => PosView::Any,
                 _ => PosView::List(self.position_buffers[i].as_slice()),
             }
-        }).collect())
+        }).collect();
+        
+        Ok(views)
     }
     
     /// Get document length (number of tokens) - requires fast field
@@ -1002,7 +1039,9 @@ fn find_spans_with_plan<'a>(
         match (&w[0], &w[1]) {
             (ConcatStep::Atom { .. }, ConcatStep::Gap { .. }) => {}
             (ConcatStep::Gap { .. }, ConcatStep::Atom { .. }) => {}
-            _ => return Vec::new(),
+            _ => {
+                return Vec::new();
+            }
         }
     }
 
@@ -1014,7 +1053,9 @@ fn find_spans_with_plan<'a>(
 
     let first_positions = match positions_per_constraint.get(first_cidx) {
         Some(p) => p,
-        None => return Vec::new(),
+        None => {
+            return Vec::new();
+        }
     };
 
     let mut partials: Vec<Partial> = match first_positions {
@@ -1027,6 +1068,7 @@ fn find_spans_with_plan<'a>(
             (0..dl).map(|p| Partial { start: p, last: p }).collect()
         }
     };
+
 
     if partials.is_empty() {
         return Vec::new();
@@ -1050,7 +1092,9 @@ fn find_spans_with_plan<'a>(
 
         let next_positions = match positions_per_constraint.get(next_cidx) {
             Some(p) => p,
-            None => return Vec::new(),
+            None => {
+                return Vec::new();
+            }
         };
 
         partials = if lazy {
@@ -1138,6 +1182,7 @@ fn join_lazy<'a>(
                     doc_len.unwrap_or(u32::MAX)
                 };
 
+                // Advance j to first position >= min_b
                 while j < next_pos.len() && next_pos[j] < min_b {
                     j += 1;
                 }
@@ -1146,14 +1191,15 @@ fn join_lazy<'a>(
                 }
 
                 let b = next_pos[j];
-                if b < max_b_excl {
+                if b < max_b_excl && b >= min_b {
                     p.last = b;
                     out.push(p);
-                } else {
-                    // Too large for this p; don't advance j (for larger p.last, bounds shift right).
+                    // Note: We don't advance j here for lazy matching - each partial gets the nearest match,
+                    // and multiple partials can match the same position if they have the same min_b
                 }
+                // b >= max_b_excl or b < min_b, so this partial can't match, but later partials might
+                // (they have larger p.last, so larger min_b, but same max_b_excl)
             }
-
             out
         }
     }
@@ -2125,7 +2171,6 @@ fn matches_constraint_at_position(
                 if pos < tokens.len() {
                     let result = matcher.matches(&tokens[pos]);
                     if !result && (name == "tag" || name == "word") {
-                        println!("DEBUG: Match failed: field={}, pos={}, token='{}', matcher={:?}", name, pos, tokens[pos], matcher);
                     }
                     result
                 } else {

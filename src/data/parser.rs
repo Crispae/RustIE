@@ -175,6 +175,7 @@ impl DocumentParser {
                         // This ensures each token gets the correct position (0, 1, 2, ...)
                         // instead of all tokens being at position 0
                         let encoded = crate::tantivy_integration::position_tokenizer::encode_position_aware_tokens(tokens);
+                        
 
                         match name.as_str() {
                             "raw" | "word" | "lemma" | "pos" | "tag" | "chunk" | "entity" | "norm" => {

@@ -173,7 +173,13 @@ impl ExtractorEngine {
                     log::info!("Added position-aware edge field: {}", field.name);
                 }
                 "u64" => {
-                    builder.add_u64_field(&field.name, tantivy::schema::STORED);
+                    // For sentence_length, we need it as both STORED and FAST for efficient postings path
+                    if field.name == FIELD_SENTENCE_LENGTH {
+                        builder.add_u64_field(&field.name, tantivy::schema::STORED | tantivy::schema::FAST);
+                        log::debug!("Added u64 field '{}' as STORED and FAST for postings path", field.name);
+                    } else {
+                        builder.add_u64_field(&field.name, tantivy::schema::STORED);
+                    }
                 }
                 "bytes" => {
                     builder.add_bytes_field(&field.name, tantivy::schema::STORED);
