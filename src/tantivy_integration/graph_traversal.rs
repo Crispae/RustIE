@@ -1103,7 +1103,131 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
     }
 }
 
+/// Lazy constraint token loader - parses constraint fields only when first accessed
+/// This avoids parsing constraint fields that are never reached during graph traversal
+struct LazyConstraintTokens<'a> {
+    doc: &'a tantivy::schema::TantivyDocument,
+    constraint_field_names: &'a [String],
+    schema: &'a tantivy::schema::Schema,
+    cache: Vec<Option<Vec<String>>>,  // One Option per constraint index
+}
+
+impl<'a> LazyConstraintTokens<'a> {
+    /// Create a new lazy token loader
+    fn new(
+        doc: &'a tantivy::schema::TantivyDocument,
+        constraint_field_names: &'a [String],
+        schema: &'a tantivy::schema::Schema,
+    ) -> Self {
+        let cache = vec![None; constraint_field_names.len()];
+        Self {
+            doc,
+            constraint_field_names,
+            schema,
+            cache,
+        }
+    }
+
+    /// Ensure tokens for a constraint are loaded (parses on first access)
+    fn ensure_loaded(&mut self, constraint_idx: usize) {
+        if constraint_idx >= self.cache.len() {
+            return;
+        }
+        
+        if self.cache[constraint_idx].is_none() {
+            let field_name = &self.constraint_field_names[constraint_idx];
+            let tokens = self.extract_tokens_from_field(field_name);
+            self.cache[constraint_idx] = Some(tokens);
+        }
+    }
+
+    /// Get token at a specific position for a constraint (returns owned String)
+    /// Parses the constraint field on first access
+    fn get(&mut self, constraint_idx: usize, position: usize) -> Option<String> {
+        self.ensure_loaded(constraint_idx);
+        self.cache[constraint_idx]
+            .as_ref()
+            .and_then(|tokens| tokens.get(position))
+            .cloned()
+    }
+
+    /// Get all tokens for a constraint (returns reference after ensuring loaded)
+    /// Used for position calculation that needs full token list
+    fn get_all_tokens(&mut self, constraint_idx: usize) -> Option<&[String]> {
+        self.ensure_loaded(constraint_idx);
+        self.cache[constraint_idx].as_ref().map(|tokens| tokens.as_slice())
+    }
+
+    /// Extract tokens from a field (reuses existing logic)
+    fn extract_tokens_from_field(&self, field_name: &str) -> Vec<String> {
+        crate::tantivy_integration::utils::extract_field_values(self.schema, self.doc, field_name)
+    }
+}
+
+/// Check if a constraint is exact and can skip matches() when prefilter confirms
+/// Only simple Field { Matcher::String } constraints are skippable
+fn is_exact_skippable(constraint: &crate::compiler::ast::Constraint) -> bool {
+    match constraint {
+        crate::compiler::ast::Constraint::Field { 
+            matcher: crate::compiler::ast::Matcher::String(_), 
+            .. 
+        } => true,
+        crate::compiler::ast::Constraint::Field {
+            matcher: crate::compiler::ast::Matcher::Regex { .. },
+            ..
+        } => false,  // Regex constraints need actual matching
+        crate::compiler::ast::Constraint::Negated(_) 
+        | crate::compiler::ast::Constraint::Conjunctive(_) 
+        | crate::compiler::ast::Constraint::Disjunctive(_) 
+        | crate::compiler::ast::Constraint::Wildcard 
+        | crate::compiler::ast::Constraint::Fuzzy { .. } => false,
+    }
+}
+
 impl OptimizedGraphTraversalScorer {
+    /// Build allowed positions combining src_driver, dst_driver, and prefilter positions
+    /// Converts all to HashSet<u32> for O(1) lookup
+    fn build_allowed_positions(
+        &self,
+        src_driver_positions: Option<&[u32]>,
+        dst_driver_positions: Option<&[u32]>,
+        prefilter_positions: &[Option<Vec<u32>>],
+        num_constraints: usize,
+    ) -> Vec<Option<std::collections::HashSet<u32>>> {
+        use std::collections::HashSet;
+        
+        let mut result: Vec<Option<HashSet<u32>>> = vec![None; num_constraints];
+        
+        // First constraint: from src_driver (if available)
+        if let Some(src_positions) = src_driver_positions {
+            if num_constraints > 0 {
+                result[0] = Some(src_positions.iter().copied().collect());
+            }
+        }
+        
+        // Last constraint: from dst_driver (if available)
+        if let Some(dst_positions) = dst_driver_positions {
+            let last_idx = num_constraints.saturating_sub(1);
+            if last_idx > 0 && last_idx < num_constraints {
+                result[last_idx] = Some(dst_positions.iter().copied().collect());
+            }
+        }
+        
+        // Middle constraints: from prefilter
+        for (idx, prefilter) in prefilter_positions.iter().enumerate() {
+            if idx < num_constraints {
+                // Only set if not already set by driver (first/last)
+                if result[idx].is_none() {
+                    if let Some(positions) = prefilter {
+                        result[idx] = Some(positions.iter().copied().collect());
+                    }
+                }
+            }
+        }
+        
+        result
+    }
+
     /// Intersect two sorted vectors of u32, storing result in the first vector
     /// O(n+m) time using two-pointer merge
     fn intersect_sorted_in_place(a: &mut Vec<u32>, b: &[u32]) {
@@ -1381,32 +1505,62 @@ impl OptimizedGraphTraversalScorer {
             Err(_) => return false,
         };
 
-        // Phase 2: Extract tokens for ALL constraint fields
-        // NOTE: We CANNOT skip token extraction for collapsed constraints because
-        // automaton_query_paths() needs tokens to verify matches during graph traversal.
-        // The driver positions tell us WHERE to start, but traversal still needs tokens
-        // to validate that graph nodes match the constraint patterns.
-        let mut constraint_tokens: Vec<Vec<String>> =
-            Vec::with_capacity(self.constraint_field_names.len());
+        // Phase 2: Create lazy token loader (parses on first access per constraint)
+        // OPTIMIZATION: Avoids parsing constraint fields that are never reached during traversal
+        let mut lazy_tokens = LazyConstraintTokens::new(
+            &doc,
+            &self.constraint_field_names,
+            self.reader.schema(),
+        );
 
-        for field_name in &self.constraint_field_names {
-            let tokens = self.extract_tokens_from_field(&doc, field_name);
-            constraint_tokens.push(tokens);
-        }
+        // Build allowed positions as HashSet for O(1) lookup
+        let allowed_positions_hashset = self.build_allowed_positions(
+            src_driver_positions.as_deref(),
+            dst_driver_positions.as_deref(),
+            &allowed_positions,
+            num_constraints,
+        );
+
+        // Build constraint_exact_flags by analyzing flat_steps
+        let constraint_exact_flags: Vec<bool> = flat_steps.iter()
+            .filter_map(|step| {
+                if let FlatPatternStep::Constraint(constraint_pat) = step {
+                    let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
+                    if let Pattern::Constraint(constraint) = unwrapped {
+                        Some(is_exact_skippable(constraint))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         // Phase 3: Check constraints with position restrictions
         // Odinson position handoff: use driver positions for first (constraint 0) and last constraint
+        // NOTE: We still need to compute cached_positions for src_positions used in Phase 5
+        // But we can use lazy_tokens for the actual traversal
         let mut constraint_count = 0;
         let mut cached_positions: Vec<Vec<usize>> = Vec::new();
 
         for step in flat_steps.iter() {
             if let FlatPatternStep::Constraint(constraint_pat) = step {
-                if constraint_count >= constraint_tokens.len() {
+                if constraint_count >= self.constraint_field_names.len() {
                     GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
 
-                let tokens = &constraint_tokens[constraint_count];
+                // For cached_positions, we still need tokens (used for src_positions)
+                // But the actual traversal will use lazy loading via closure
+                let tokens = match lazy_tokens.get_all_tokens(constraint_count) {
+                    Some(t) => t,
+                    None => {
+                        GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                };
+                
                 let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
                 
                 let is_wildcard = matches!(
@@ -1506,9 +1660,19 @@ impl OptimizedGraphTraversalScorer {
 
         let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
         
+        // Create closure for token access (wraps lazy_tokens)
+        let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+            lazy_tokens.get(constraint_idx, position)
+        };
+        
         for &src_pos in src_positions {
             let all_paths = traversal_engine.automaton_query_paths(
-                flat_steps, &[src_pos], &self.constraint_field_names, &constraint_tokens
+                flat_steps, 
+                &[src_pos], 
+                &self.constraint_field_names, 
+                &mut get_token,
+                &allowed_positions_hashset,
+                &constraint_exact_flags,
             );
             
             for path in &all_paths {
