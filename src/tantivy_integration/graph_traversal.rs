@@ -1141,6 +1141,7 @@ impl<'a> LazyConstraintTokens<'a> {
         }
     }
 
+
     /// Get token at a specific position for a constraint (returns owned String)
     /// Parses the constraint field on first access
     fn get(&mut self, constraint_idx: usize, position: usize) -> Option<String> {
@@ -1414,6 +1415,7 @@ impl OptimizedGraphTraversalScorer {
         let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
         self.current_doc_matches.clear();
 
+
         // Get driver positions for first/last constraints (Odinson-style position handoff)
         // These are already filtered for position overlap between constraint and edge
         // Clone positions to avoid borrow checker issues (they're small Vec<u32>)
@@ -1522,12 +1524,15 @@ impl OptimizedGraphTraversalScorer {
         );
 
         // Build constraint_exact_flags by analyzing flat_steps
+        let mut constraint_idx_counter = 0;
         let constraint_exact_flags: Vec<bool> = flat_steps.iter()
             .filter_map(|step| {
                 if let FlatPatternStep::Constraint(constraint_pat) = step {
                     let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
                     if let Pattern::Constraint(constraint) = unwrapped {
-                        Some(is_exact_skippable(constraint))
+                        let is_exact = is_exact_skippable(constraint);
+                        constraint_idx_counter += 1;
+                        Some(is_exact)
                     } else {
                         None
                     }
@@ -1710,6 +1715,7 @@ impl OptimizedGraphTraversalScorer {
         
         false
     }
+
 
     /// Extract the field name from a pattern
     #[allow(dead_code)]
