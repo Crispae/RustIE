@@ -221,10 +221,6 @@ impl CombinedPositionDriver {
             
             if !self.intersection.is_empty() {
                 self.current_doc = doc;
-                log::debug!(
-                    "CombinedPositionDriver: doc {} has {} overlapping positions",
-                    doc, self.intersection.len()
-                );
                 return self.current_doc;
             }
             // No position overlap - continue to next doc
@@ -306,11 +302,9 @@ fn expand_with_automaton(
     }
     
     if postings_list.is_empty() {
-        log::debug!("Regex matched 0 terms in segment");
         return None;
     }
     
-    log::debug!("Regex expanded to {} terms", postings_list.len());
     Some(postings_list)
 }
 
@@ -750,10 +744,6 @@ impl OptimizedGraphTraversalWeight {
         
         // Fast path: both exact (single postings each) - use CombinedPositionDriver
         if constraint_postings.len() == 1 && edge_postings.len() == 1 {
-            log::info!(
-                "Built CombinedPositionDriver (fast path) for constraint={} edge={}",
-                spec.constraint_matcher.display(), spec.edge_matcher.display()
-            );
             return Some(Box::new(CombinedPositionDriver::new(
                 constraint_postings.into_iter().next().unwrap(),
                 edge_postings.into_iter().next().unwrap(),
@@ -1547,6 +1537,25 @@ impl OptimizedGraphTraversalScorer {
         *a = out;
     }
 
+    /// Intersect two sorted slices into a new vector (avoids cloning)
+    /// O(n+m) time using two-pointer merge
+    fn intersect_sorted_slices(a: &[u32], b: &[u32]) -> Vec<u32> {
+        let mut out = Vec::with_capacity(a.len().min(b.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    out.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        out
+    }
+
     /// Compute allowed positions per constraint using edge postings AND constraint postings
     /// Returns None if document cannot match (required edge/constraint term missing or empty intersection)
     /// Returns Some(allowed_positions) if document passes prefilter
@@ -1574,14 +1583,12 @@ impl OptimizedGraphTraversalScorer {
         if let Some(src_positions) = src_driver_positions {
             if let Some(idx) = src_collapsed_idx {
                 allowed[idx] = Some(src_positions.to_vec());
-                log::debug!("Using src_driver positions for constraint {} (skipping recomputation)", idx);
             }
         }
         if let Some(dst_positions) = dst_driver_positions {
             if dst_is_last {
                 if let Some(idx) = dst_collapsed_idx {
                     allowed[idx] = Some(dst_positions.to_vec());
-                    log::debug!("Using dst_driver positions for constraint {} (skipping recomputation)", idx);
                 }
             }
         }
@@ -1594,7 +1601,6 @@ impl OptimizedGraphTraversalScorer {
         for (req_idx, req) in self.prefilter_plan.edge_reqs.iter().enumerate() {
             // Skip if this edge requirement is for a collapsed constraint
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
-                log::debug!("Skipping edge requirement for collapsed constraint {}", req.constraint_idx);
                 continue;
             }
             
@@ -1615,7 +1621,6 @@ impl OptimizedGraphTraversalScorer {
         for (req_idx, req) in self.constraint_reqs.iter().enumerate() {
             // Skip if this constraint is collapsed (already has driver positions)
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
-                log::debug!("Skipping constraint requirement for collapsed constraint {}", req.constraint_idx);
                 continue;
             }
             
@@ -1634,17 +1639,28 @@ impl OptimizedGraphTraversalScorer {
         let mut buf: Vec<u32> = Vec::with_capacity(32);
 
         // Process each constraint_idx with ALL its requirements together (Odinson-style)
-        for (constraint_idx, requirements) in requirements_by_constraint {
+        for (constraint_idx, mut requirements) in requirements_by_constraint {
+            // OPTIMIZATION: Process edges FIRST, then constraints
+            // This ensures edge_intersection is computed before processing constraints,
+            // allowing immediate intersection and keeping intermediate sets small
+            requirements.sort_by_key(|req| match req {
+                PositionRequirement::Edge { .. } => 0,  // Process edges first
+                PositionRequirement::Constraint { .. } => 1,  // Process constraints second
+            });
+            
             // For each constraint_idx, we need to:
-            // 1. Union all constraint term positions (for regex expansion)
-            // 2. Intersect all edge positions together
-            // 3. Intersect constraint union with edge intersection
+            // 1. Intersect all edge positions together (processed first)
+            // 2. Union constraint term positions, intersecting immediately with edge_intersection when available
+            // 3. Final intersection of constraint union with edge intersection (if not already done)
             
             let mut edge_intersection: Option<Vec<u32>> = None;
-            let mut constraint_union: Vec<u32> = Vec::new();
+            // OPTIMIZATION: Pre-allocate to avoid multiple reallocations
+            let mut constraint_union: Vec<u32> = Vec::with_capacity(64);
             let mut has_constraint_reqs = false;
             let mut edge_count = 0;
             let mut constraint_count = 0;
+            // Track if we've been intersecting immediately with edge_intersection
+            let mut intersected_immediately = false;
 
             for req in requirements {
                 buf.clear();
@@ -1686,8 +1702,8 @@ impl OptimizedGraphTraversalScorer {
                                 edge_intersection = Some(std::mem::take(&mut buf));
                             }
                             Some(existing) => {
-                                let before_size = existing.len();
                                 Self::intersect_sorted_in_place(existing, &buf);
+                                // OPTIMIZATION: Early exit when edge_intersection becomes empty
                                 if existing.is_empty() {
                                     return None;  // Fail immediately
                                 }
@@ -1724,11 +1740,11 @@ impl OptimizedGraphTraversalScorer {
                             // OPTIMIZATION: If edge_intersection exists, intersect immediately to keep sets small
                             // This prevents building large intermediate constraint_union sets
                             if let Some(ref edge_positions) = edge_intersection {
-                                // Intersect buf with edge_intersection before adding to union
-                                let mut filtered = buf.clone();
-                                Self::intersect_sorted_in_place(&mut filtered, edge_positions);
+                                // OPTIMIZATION: Use intersect_sorted_slices to avoid expensive clone
+                                let filtered = Self::intersect_sorted_slices(&buf, edge_positions);
                                 if !filtered.is_empty() {
                                     constraint_union.extend_from_slice(&filtered);
+                                    intersected_immediately = true;
                                 }
                             } else {
                                 // No edge restrictions yet - add all positions to union
@@ -1747,10 +1763,12 @@ impl OptimizedGraphTraversalScorer {
 
             // Compute final intersection for this constraint_idx
             let final_positions = if has_constraint_reqs {
-                // Sort and dedup the unioned constraint positions
-                let constraint_union_before_sort = constraint_union.len();
-                constraint_union.sort_unstable();
-                constraint_union.dedup();
+                // OPTIMIZATION: Sort and dedup the unioned constraint positions
+                // Even though filtered results are sorted, the union of multiple sorted slices needs sorting
+                if !constraint_union.is_empty() {
+                    constraint_union.sort_unstable();
+                    constraint_union.dedup();
+                }
                 
                 if constraint_union.is_empty() {
                     return None;
@@ -1816,12 +1834,7 @@ impl OptimizedGraphTraversalScorer {
         let src_driver_positions = self.src_driver.matching_positions().map(|p| p.to_vec());
         let dst_driver_positions = self.dst_driver.matching_positions().map(|p| p.to_vec());
         
-        if src_driver_positions.is_some() {
-            log::debug!("Using src_driver positions for constraint 0 (Odinson position handoff)");
-        }
-        if dst_driver_positions.is_some() {
-            log::debug!("Using dst_driver positions for last constraint (Odinson position handoff)");
-        }
+        // Driver positions are used for first/last constraints (Odinson position handoff)
 
         // OPTIMIZATION: Detect if ALL constraints are collapsed (2-constraint pattern)
         // When both src and dst are collapsed, compute_allowed_positions is redundant
@@ -1840,7 +1853,6 @@ impl OptimizedGraphTraversalScorer {
             // OPTIMIZATION: Skip compute_allowed_positions entirely
             // Driver positions are already filtered for constraint+edge intersection
             PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
-            log::debug!("Skipping prefilter: all {} constraints collapsed", num_constraints);
             
             let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
             if let Some(ref positions) = src_driver_positions {
@@ -1976,7 +1988,6 @@ impl OptimizedGraphTraversalScorer {
                     // Use allowed_positions[0] which was set from src_driver (already filtered by constraint + edge)
                     // This skips token scanning entirely for constraint 0
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
-                        log::debug!("Skipping token scan for constraint 0, using {} driver positions", allowed.len());
                         allowed.iter().map(|&p| p as usize).collect()
                     } else {
                         // Fallback: shouldn't happen if driver worked correctly
@@ -1986,7 +1997,6 @@ impl OptimizedGraphTraversalScorer {
                     // Use allowed_positions[last] which was set from dst_driver (already filtered by constraint + edge)
                     // This skips token scanning entirely for last constraint
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
-                        log::debug!("Skipping token scan for last constraint, using {} driver positions", allowed.len());
                         allowed.iter().map(|&p| p as usize).collect()
                     } else {
                         // Fallback: shouldn't happen if driver worked correctly
@@ -2046,8 +2056,6 @@ impl OptimizedGraphTraversalScorer {
             Ok(zc_graph) => {
                 // TRUE ZERO-COPY: Use ZeroCopyGraph directly without conversion
                 use crate::digraph::graph_trait::GraphAccess;
-                log::debug!("ZeroCopyGraph loaded successfully: {} nodes, {} labels", 
-                    zc_graph.node_count(), zc_graph.label_count());
                 // Check if we should use parallel processing
                 if src_positions.len() >= PARALLEL_START_POSITIONS_THRESHOLD {
                     // Pre-load all tokens for thread-safety before parallel processing
@@ -2412,15 +2420,9 @@ fn build_constraint_requirements(flat_steps: &[FlatPatternStep], schema: &Schema
                                 term: term_value.clone(),
                                 constraint_idx,
                             });
-                            log::debug!(
-                                "Added constraint prefilter for field '{}' (constraint_idx={}) with term '{}'",
-                                name, constraint_idx, term_value
-                            );
+                            // Constraint prefilter added
                         } else {
-                            log::debug!(
-                                "Skipping constraint prefilter for field '{}' (constraint_idx={}): field not indexed with positions",
-                                name, constraint_idx
-                            );
+                            // Constraint prefilter skipped (field not indexed with positions)
                         }
                     }
                 }
