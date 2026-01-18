@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     println!("\nQuery: ([entity=/B-Gene.*/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene.*/])");
     println!("Running {} iterations...\n", args.iterations);
     
-    let query = "([entity=/B-Gene.*/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene.*/])";
+    let query = "([entity=/B-.*/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene.*/])";
     
     let start = std::time::Instant::now();
     let mut total_hits = 0;
