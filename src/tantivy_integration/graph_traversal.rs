@@ -14,6 +14,7 @@ use std::collections::BinaryHeap;
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
+use crate::digraph::zero_copy::ZeroCopyGraph;
 use crate::compiler::ast::{Pattern, Traversal, Matcher, Constraint};
 
 // Global counter for generating unique capture names (much faster than rand)
@@ -911,6 +912,75 @@ pub struct OptimizedGraphTraversalScorer {
 }
 
 impl OptimizedGraphTraversalScorer {
+    /// Helper method to run traversal with any GraphTraversal<G: GraphAccess>
+    /// This allows us to use ZeroCopyGraph directly without conversion
+    fn run_traversal_with_engine<G: crate::digraph::graph_trait::GraphAccess>(
+        &mut self,
+        traversal_engine: &crate::digraph::traversal::GraphTraversal<G>,
+        flat_steps: &[FlatPatternStep],
+        src_positions: &[usize],
+        lazy_tokens: &mut LazyConstraintTokens,
+        allowed_positions_hashset: &[Option<std::collections::HashSet<u32>>],
+        constraint_exact_flags: &[bool],
+    ) -> bool {
+        // Extract constraint_field_names to avoid borrowing self
+        let constraint_field_names = &self.constraint_field_names;
+        
+        // Create closure for token access (wraps lazy_tokens)
+        let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+            lazy_tokens.get(constraint_idx, position)
+        };
+        
+        let mut all_matches = Vec::new();
+        
+        for &src_pos in src_positions {
+            let all_paths = traversal_engine.automaton_query_paths(
+                flat_steps, 
+                &[src_pos], 
+                constraint_field_names, 
+                &mut get_token,
+                allowed_positions_hashset,
+                constraint_exact_flags,
+            );
+            
+            for path in &all_paths {
+                if !path.is_empty() {
+                    let mut captures = Vec::with_capacity(path.len());
+                    let mut c_idx = 0;
+                    for step in flat_steps.iter() {
+                        if let FlatPatternStep::Constraint(ref pat) = step {
+                            if let Some(&node_idx) = path.get(c_idx) {
+                                let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                                let name = match pat {
+                                    Pattern::NamedCapture { name, .. } => name.clone(),
+                                    _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                };
+                                captures.push(crate::types::NamedCapture::new(name, span));
+                            }
+                            c_idx += 1;
+                        }
+                    }
+                    let min_pos = *path.iter().min().unwrap();
+                    let max_pos = *path.iter().max().unwrap();
+                    all_matches.push(
+                        crate::types::SpanWithCaptures::with_captures(
+                            crate::types::Span { start: min_pos, end: max_pos + 1 },
+                            captures
+                        )
+                    );
+                }
+            }
+            
+            if !all_paths.is_empty() {
+                // Now we can mutate self after the closure is dropped
+                self.current_doc_matches.extend(all_matches);
+                return true;
+            }
+        }
+        
+        false
+    }
+
     /// Unwrap constraint pattern by removing NamedCapture and Repetition wrappers
     /// Returns the underlying constraint pattern
     fn unwrap_constraint_pattern<'a>(&self, pat: &'a Pattern) -> &'a Pattern {
@@ -1631,9 +1701,153 @@ impl OptimizedGraphTraversalScorer {
         };
 
         GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
-        let graph = match DirectedGraph::from_bytes(binary_data) {
-            Ok(graph) => graph,
-            Err(_) => return false,
+        
+        // Phase 5: Run traversal
+        let src_positions: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
+        if constraint_count > 0 && src_positions.is_empty() {
+            return false;
+        }
+
+        // Extract values we need before mutable borrow
+        let constraint_field_names = &self.constraint_field_names;
+
+        // Try zero-copy format first (new format with magic number), fall back to legacy
+        // Use zero-copy graph directly for true zero-copy benefits
+        let traversal_result = if ZeroCopyGraph::is_valid_format(binary_data) {
+            log::info!("ZERO-COPY FORMAT DETECTED: Using ZeroCopyGraph directly (no allocation)");
+            match ZeroCopyGraph::from_bytes(binary_data) {
+                Ok(zc_graph) => {
+                    // TRUE ZERO-COPY: Use ZeroCopyGraph directly without conversion
+                    use crate::digraph::graph_trait::GraphAccess;
+                    log::debug!("ZeroCopyGraph loaded successfully: {} nodes, {} labels", 
+                        zc_graph.node_count(), zc_graph.label_count());
+                    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
+                    // Create closure for token access (wraps lazy_tokens)
+                    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+                        lazy_tokens.get(constraint_idx, position)
+                    };
+                    
+                    let mut all_matches = Vec::new();
+                    
+                    for &src_pos in src_positions {
+                        let all_paths = traversal_engine.automaton_query_paths(
+                            flat_steps, 
+                            &[src_pos], 
+                            constraint_field_names, 
+                            &mut get_token,
+                            &allowed_positions_hashset,
+                            &constraint_exact_flags,
+                        );
+                        
+                        for path in &all_paths {
+                            if !path.is_empty() {
+                                let mut captures = Vec::with_capacity(path.len());
+                                let mut c_idx = 0;
+                                for step in flat_steps.iter() {
+                                    if let FlatPatternStep::Constraint(ref pat) = step {
+                                        if let Some(&node_idx) = path.get(c_idx) {
+                                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                                            let name = match pat {
+                                                Pattern::NamedCapture { name, .. } => name.clone(),
+                                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                            };
+                                            captures.push(crate::types::NamedCapture::new(name, span));
+                                        }
+                                        c_idx += 1;
+                                    }
+                                }
+                                let min_pos = *path.iter().min().unwrap();
+                                let max_pos = *path.iter().max().unwrap();
+                                all_matches.push(
+                                    crate::types::SpanWithCaptures::with_captures(
+                                        crate::types::Span { start: min_pos, end: max_pos + 1 },
+                                        captures
+                                    )
+                                );
+                            }
+                        }
+                        
+                        if !all_paths.is_empty() {
+                            // Now we can mutate self after the closure is dropped
+                            self.current_doc_matches.extend(all_matches);
+                            return true;
+                        }
+                    }
+                    
+                    false
+                }
+                Err(e) => {
+                    log::warn!("ZeroCopyGraph::from_bytes failed: {:?}, falling back to legacy format", e);
+                    return false;
+                }
+            }
+        } else {
+            // Legacy format: convert to DirectedGraph (backward compatibility)
+            log::info!("LEGACY FORMAT DETECTED: Using DirectedGraph (requires allocation)");
+            match DirectedGraph::from_bytes(binary_data) {
+                Ok(graph) => {
+                    log::debug!("DirectedGraph loaded: {} nodes, {} labels", 
+                        graph.node_count(), graph.vocabulary().len());
+                    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
+                    // Create closure for token access (wraps lazy_tokens)
+                    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+                        lazy_tokens.get(constraint_idx, position)
+                    };
+                    
+                    let mut all_matches = Vec::new();
+                    
+                    for &src_pos in src_positions {
+                        let all_paths = traversal_engine.automaton_query_paths(
+                            flat_steps, 
+                            &[src_pos], 
+                            constraint_field_names, 
+                            &mut get_token,
+                            &allowed_positions_hashset,
+                            &constraint_exact_flags,
+                        );
+                        
+                        for path in &all_paths {
+                            if !path.is_empty() {
+                                let mut captures = Vec::with_capacity(path.len());
+                                let mut c_idx = 0;
+                                for step in flat_steps.iter() {
+                                    if let FlatPatternStep::Constraint(ref pat) = step {
+                                        if let Some(&node_idx) = path.get(c_idx) {
+                                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                                            let name = match pat {
+                                                Pattern::NamedCapture { name, .. } => name.clone(),
+                                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                            };
+                                            captures.push(crate::types::NamedCapture::new(name, span));
+                                        }
+                                        c_idx += 1;
+                                    }
+                                }
+                                let min_pos = *path.iter().min().unwrap();
+                                let max_pos = *path.iter().max().unwrap();
+                                all_matches.push(
+                                    crate::types::SpanWithCaptures::with_captures(
+                                        crate::types::Span { start: min_pos, end: max_pos + 1 },
+                                        captures
+                                    )
+                                );
+                            }
+                        }
+                        
+                        if !all_paths.is_empty() {
+                            // Now we can mutate self after the closure is dropped
+                            self.current_doc_matches.extend(all_matches);
+                            return true;
+                        }
+                    }
+                    
+                    false
+                }
+                Err(e) => {
+                    log::warn!("DirectedGraph::from_bytes failed: {:?}", e);
+                    return false;
+                }
+            }
         };
 
         // Log stats periodically
@@ -1657,63 +1871,7 @@ impl OptimizedGraphTraversalScorer {
             );
         }
 
-        // Phase 5: Run traversal
-        let src_positions: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
-        if constraint_count > 0 && src_positions.is_empty() {
-            return false;
-        }
-
-        let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
-        
-        // Create closure for token access (wraps lazy_tokens)
-        let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
-            lazy_tokens.get(constraint_idx, position)
-        };
-        
-        for &src_pos in src_positions {
-            let all_paths = traversal_engine.automaton_query_paths(
-                flat_steps, 
-                &[src_pos], 
-                &self.constraint_field_names, 
-                &mut get_token,
-                &allowed_positions_hashset,
-                &constraint_exact_flags,
-            );
-            
-            for path in &all_paths {
-                if !path.is_empty() {
-                    let mut captures = Vec::with_capacity(path.len());
-                    let mut c_idx = 0;
-                    for step in flat_steps.iter() {
-                        if let FlatPatternStep::Constraint(ref pat) = step {
-                            if let Some(&node_idx) = path.get(c_idx) {
-                                let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                                let name = match pat {
-                                    Pattern::NamedCapture { name, .. } => name.clone(),
-                                    _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
-                                };
-                                captures.push(crate::types::NamedCapture::new(name, span));
-                            }
-                            c_idx += 1;
-                        }
-                    }
-                    let min_pos = *path.iter().min().unwrap();
-                    let max_pos = *path.iter().max().unwrap();
-                    self.current_doc_matches.push(
-                        crate::types::SpanWithCaptures::with_captures(
-                            crate::types::Span { start: min_pos, end: max_pos + 1 },
-                            captures
-                        )
-                    );
-                }
-            }
-            
-            if !all_paths.is_empty() {
-                return true;
-            }
-        }
-        
-        false
+        traversal_result
     }
 
 

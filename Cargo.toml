@@ -28,6 +28,7 @@ pest = "2.7"
 pest_derive = "2.7"
 utoipa = { version = "4", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [[bin]]
 name = "api_server"

@@ -9,6 +9,7 @@ use tantivy::schema::Schema;
 
 use crate::data::document::{Document as RustDoc, Field as DocField};
 use crate::digraph::graph::DirectedGraph;
+use crate::digraph::zero_copy_writer::ZeroCopyGraphWriter;
 
 /// Required fields that must exist in the schema for core functionality
 const REQUIRED_FIELDS: &[&str] = &["doc_id", "sentence_id", "sentence_length", "word"];
@@ -210,13 +211,28 @@ impl DocumentParser {
                                 }
                                 
                                 // Serialize to binary and store
+                                // Try zero-copy format first (more efficient at query time),
+                                // fall back to legacy format for large graphs
                                 if let Ok(binary_field) = self.schema.get_field("dependencies_binary") {
-                                    match graph.to_bytes() {
-                                        Ok(bytes) => {
+                                    match ZeroCopyGraphWriter::from_directed_graph(&graph) {
+                                        Ok(writer) => {
+                                            let bytes = writer.serialize();
+                                            log::debug!("Index-time: Writing graph in ZERO-COPY format ({} nodes, {} labels, {} bytes)", 
+                                                graph.node_count(), graph.vocabulary().len(), bytes.len());
                                             tantivy_doc.add_bytes(binary_field, &bytes);
                                         }
                                         Err(e) => {
-                                    log::warn!("Graph serialization failed: {}", e);
+                                            // Fall back to legacy format (e.g., graph too large for u16)
+                                            log::warn!("Index-time: Graph too large for zero-copy format ({}), using legacy format: {}", 
+                                                graph.node_count(), e);
+                                            match graph.to_bytes() {
+                                                Ok(bytes) => {
+                                                    tantivy_doc.add_bytes(binary_field, &bytes);
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Graph serialization failed: {}", e);
+                                                }
+                                            }
                                         }
                                     }
                                 }

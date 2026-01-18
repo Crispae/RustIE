@@ -468,6 +468,90 @@ impl Default for DirectedGraph {
     }
 }
 
+// ============================================================================
+// GraphAccess trait implementation for DirectedGraph
+// ============================================================================
+
+use crate::digraph::graph_trait::GraphAccess;
+
+/// Iterator over edges stored as flattened (node, label_id) pairs.
+pub struct EdgePairIterator<'a> {
+    edges: &'a [usize],
+    pos: usize,
+}
+
+impl<'a> EdgePairIterator<'a> {
+    fn new(edges: &'a [usize]) -> Self {
+        Self { edges, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for EdgePairIterator<'a> {
+    type Item = (usize, usize);
+    
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos + 1 < self.edges.len() {
+            let target = self.edges[self.pos];
+            let label_id = self.edges[self.pos + 1];
+            self.pos += 2;
+            Some((target, label_id))
+        } else {
+            None
+        }
+    }
+    
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.edges.len() - self.pos) / 2;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for EdgePairIterator<'a> {}
+
+impl GraphAccess for DirectedGraph {
+    #[inline]
+    fn node_count(&self) -> usize {
+        self.incoming.len().max(self.outgoing.len())
+    }
+    
+    #[inline]
+    fn incoming(&self, node: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+        self.incoming.get(node).map(|edges| EdgePairIterator::new(edges))
+    }
+    
+    #[inline]
+    fn outgoing(&self, node: usize) -> Option<impl Iterator<Item = (usize, usize)>> {
+        self.outgoing.get(node).map(|edges| EdgePairIterator::new(edges))
+    }
+    
+    #[inline]
+    fn get_label(&self, label_id: usize) -> Option<&str> {
+        self.vocabulary.get_term(label_id)
+    }
+    
+    #[inline]
+    fn get_label_id(&self, label: &str) -> Option<usize> {
+        self.vocabulary.get_id(label)
+    }
+    
+    #[inline]
+    fn label_count(&self) -> usize {
+        self.vocabulary.len()
+    }
+    
+    #[inline]
+    fn roots(&self) -> impl Iterator<Item = usize> {
+        self.roots.iter().copied()
+    }
+    
+    #[inline]
+    fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
