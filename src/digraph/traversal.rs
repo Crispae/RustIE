@@ -4,6 +4,13 @@ use crate::digraph::graph::{Vocabulary, LabelMatcher};
 use crate::digraph::graph_trait::GraphAccess;
 use std::collections::{HashSet, VecDeque};
 
+/// Minimum number of start positions to enable parallel processing
+/// Below this threshold, sequential processing is faster due to overhead
+/// 
+/// Typical use case: 3-10 start positions per sentence, so threshold of 4-8
+/// allows parallelization for single sentences with many matches or multi-sentence documents
+pub const PARALLEL_START_POSITIONS_THRESHOLD: usize = 4;
+
 /// Result of a graph traversal (matches Scala implementation)
 #[derive(Debug, Clone)]
 pub enum TraversalResult {

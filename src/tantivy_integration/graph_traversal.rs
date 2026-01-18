@@ -13,10 +13,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
 use tantivy_fst::Regex;
+use rayon::prelude::*;
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::zero_copy::ZeroCopyGraph;
 use crate::compiler::ast::{Pattern, Traversal, Matcher, Constraint};
+use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
 
 // Global counter for generating unique capture names (much faster than rand)
 static CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -39,6 +41,9 @@ static DRIVER_INTERSECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
 // Optimization: Skip prefilter when all constraints are collapsed (2-constraint patterns)
 static PREFILTER_SKIPPED_ALL_COLLAPSED: AtomicUsize = AtomicUsize::new(0);
 static TOKEN_EXTRACTION_SKIPPED: AtomicUsize = AtomicUsize::new(0);
+// Regex expansion statistics
+static REGEX_EXPANSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static REGEX_EXPANSION_TERMS: AtomicUsize = AtomicUsize::new(0);
 
 /// Edge term requirement for position prefiltering
 #[derive(Clone, Debug)]
@@ -62,6 +67,22 @@ struct ConstraintTermReq {
 struct PositionPrefilterPlan {
     edge_reqs: Vec<EdgeTermReq>,
     num_constraints: usize,
+}
+
+/// Unified requirement for position prefiltering (edge or constraint)
+/// Groups all requirements by constraint_idx for combined filtering (Odinson-style)
+#[derive(Clone, Debug)]
+enum PositionRequirement {
+    Edge {
+        req_idx: usize,  // Index into self.edge_postings
+        field: Field,
+        label: String,
+    },
+    Constraint {
+        req_idx: usize,  // Index into self.constraint_postings
+        field: Field,
+        term: String,
+    },
 }
 
 // =============================================================================
@@ -610,11 +631,7 @@ impl Query for OptimizedGraphTraversalQuery {
 
     fn weight(&self, _scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
         // Odinson-style: No BooleanQuery weights - use CombinedPositionDriver exclusively
-        log::info!(
-            "Creating collapsed-only weight: src_collapse={}, dst_collapse={}",
-            self.src_collapse.is_some(),
-            self.dst_collapse.is_some()
-        );
+        // Logging removed for performance
 
         // Pre-compute flattened pattern once at Weight creation (not per document)
         let full_pattern = Pattern::GraphTraversal {
@@ -744,16 +761,94 @@ impl OptimizedGraphTraversalWeight {
         }
         
         // Regex path: use UnionAndIntersectDriver
-        log::info!(
-            "Built UnionAndIntersectDriver for constraint={} ({} postings) edge={} ({} postings)",
-            spec.constraint_matcher.display(), constraint_postings.len(),
-            spec.edge_matcher.display(), edge_postings.len()
-        );
+        // Logging removed for performance
         
         let lhs = UnionPositionsIterator::new(constraint_postings);
         let rhs = UnionPositionsIterator::new(edge_postings);
         
         Some(Box::new(UnionAndIntersectDriver::new(lhs, rhs)))
+    }
+
+    /// Expand regex patterns in constraints to their matching terms for prefiltering
+    /// Returns additional ConstraintTermReq entries for regex patterns
+    fn expand_regex_constraints(
+        &self,
+        reader: &SegmentReader,
+        flat_steps: &[FlatPatternStep],
+        schema: &Schema,
+    ) -> Vec<ConstraintTermReq> {
+        let mut expanded_reqs = Vec::new();
+        let mut constraint_idx = 0;
+
+        for step in flat_steps.iter() {
+            if let FlatPatternStep::Constraint(pat) = step {
+                let inner = unwrap_constraint_pattern_static(pat);
+                
+                if let Pattern::Constraint(Constraint::Field { name, matcher }) = inner {
+                    // Only expand regex patterns (exact strings are already handled by build_constraint_requirements)
+                    if let Matcher::Regex { pattern, .. } = matcher {
+                        if let Ok(field) = schema.get_field(name) {
+                            // Check if field is indexed with positions
+                            let field_entry = schema.get_field_entry(field);
+                            let has_positions = field_entry.field_type().get_index_record_option()
+                                .map(|opt| opt.has_positions())
+                                .unwrap_or(false);
+                            
+                            if has_positions {
+                                // Strip /.../ delimiters
+                                let clean_pattern = pattern.trim_start_matches('/').trim_end_matches('/');
+                                
+                                // Expand regex using FST automaton
+                                if let Some(automaton) = get_or_compile_regex(&self.regex_cache, clean_pattern) {
+                                    if let Ok(inverted_index) = reader.inverted_index(field) {
+                                        let term_dict = inverted_index.terms();
+                                        
+                                        if let Some(mut stream) = term_dict.search(automaton.as_ref()).into_stream().ok() {
+                                            let mut count = 0;
+                                            let mut sample_terms = Vec::new();
+                                            while stream.advance() && count < DEFAULT_MAX_TERM_EXPANSIONS {
+                                                let term_bytes = stream.key();
+                                                let term_str = String::from_utf8_lossy(term_bytes);
+                                                
+                                                if count < 5 {
+                                                    sample_terms.push(term_str.to_string());
+                                                }
+                                                
+                                                expanded_reqs.push(ConstraintTermReq {
+                                                    field,
+                                                    term: term_str.to_string(),
+                                                    constraint_idx,
+                                                });
+                                                count += 1;
+                                            }
+                                            
+                                            if count > 0 {
+                                                REGEX_EXPANSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                                                REGEX_EXPANSION_TERMS.fetch_add(count, Ordering::Relaxed);
+                                                // Logging removed for performance
+                                            } else {
+                                                log::warn!(
+                                                    "Regex constraint '{}' (constraint_idx={}, field='{}', clean_pattern='{}') expanded to 0 terms - pattern may not match any terms in segment",
+                                                    pattern, constraint_idx, name, clean_pattern
+                                                );
+                                            }
+                                        } else {
+                                            log::warn!(
+                                                "Failed to create stream for regex pattern '{}' (constraint_idx={}, field='{}', clean_pattern='{}')",
+                                                pattern, constraint_idx, name, clean_pattern
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                constraint_idx += 1;
+            }
+        }
+
+        expanded_reqs
     }
 }
 
@@ -765,29 +860,21 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         let src_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.src_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using driver for src (constraint={} edge={})",
-                    spec.constraint_matcher.display(), spec.edge_matcher.display());
                 driver
             } else {
-                log::info!("Using EmptyDriver for src (postings unavailable in segment)");
                 Box::new(EmptyDriver)
             }
         } else {
-            log::info!("Using EmptyDriver for src (no collapse spec - pattern not collapsible)");
             Box::new(EmptyDriver)
         };
 
         let dst_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.dst_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                log::info!("Using driver for dst (constraint={} edge={})",
-                    spec.constraint_matcher.display(), spec.edge_matcher.display());
                 driver
             } else {
-                log::info!("Using EmptyDriver for dst (postings unavailable in segment)");
                 Box::new(EmptyDriver)
             }
         } else {
-            log::info!("Using EmptyDriver for dst (no collapse spec - pattern not collapsible)");
             Box::new(EmptyDriver)
         };
 
@@ -818,25 +905,44 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         // Build constraint requirements from flat_steps (need schema from reader)
         let schema = reader.schema();
-        let constraint_reqs = build_constraint_requirements(&self.flat_steps, schema);
+        let mut constraint_reqs = build_constraint_requirements(&self.flat_steps, schema);
+        
+        // Expand regex patterns for constraint prefiltering (per-segment expansion)
+        let expanded_reqs = self.expand_regex_constraints(reader, &self.flat_steps, schema);
+        constraint_reqs.extend(expanded_reqs);
         
         // Log prefilter plan info (once per query)
-        log::info!(
-            "prefilter: edge_reqs={}, constraint_reqs={}, num_constraints={}",
-            self.prefilter_plan.edge_reqs.len(),
-            constraint_reqs.len(),
-            self.prefilter_plan.num_constraints
-        );
+        // Logging removed for performance
 
         // Log which constraint fields are being used for prefiltering (only those with positions)
         if !constraint_reqs.is_empty() {
-            log::info!("Constraint prefiltering enabled for {} fields with positions:", constraint_reqs.len());
-            for req in &constraint_reqs {
-                log::info!("  - Field '{}' (constraint_idx={}) term='{}'", 
-                    schema.get_field_name(req.field), req.constraint_idx, req.term);
-            }
+            // Logging removed for performance
         } else {
-            log::info!("Constraint prefiltering disabled: no constraint fields indexed with positions");
+            log::warn!("⚠️  CONSTRAINT PREFILTERING DISABLED: No constraint fields indexed with positions!");
+            log::warn!("   This means regex constraints (like /N.*/ or /V.*/) are NOT being prefiltered.");
+            log::warn!("   Only edge requirements (nsubj, dobj) are being used for prefiltering.");
+            log::warn!("   This significantly reduces prefilter effectiveness!");
+            
+            // Diagnostic: Check what constraints we have
+            let mut constraint_idx = 0;
+            for step in &self.flat_steps {
+                if let FlatPatternStep::Constraint(pat) = step {
+                    let inner = unwrap_constraint_pattern_static(pat);
+                    if let Pattern::Constraint(Constraint::Field { name, matcher }) = inner {
+                        match matcher {
+                            Matcher::String(_) => {
+                                log::warn!("   Constraint {}: field='{}' uses exact match (should be prefiltered)", 
+                                    constraint_idx, name);
+                            }
+                            Matcher::Regex { pattern, .. } => {
+                                log::warn!("   Constraint {}: field='{}' uses regex '{}' (NOT prefiltered - this is the problem!)", 
+                                    constraint_idx, name, pattern);
+                            }
+                        }
+                    }
+                    constraint_idx += 1;
+                }
+            }
         }
 
         // Create postings cursors for edge terms (one per segment)
@@ -1141,22 +1247,7 @@ impl tantivy::DocSet for OptimizedGraphTraversalScorer {
                     let prefilter_skipped_collapsed = PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed);
                     let token_extraction_skipped = TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed);
                     
-                    log::info!(
-                        "FINAL Graph traversal stats: {} candidates checked, {} graphs deserialized ({} skipped, {:.1}% skip rate)",
-                        call_num, deser_count, skipped_count, skip_rate
-                    );
-                    log::info!(
-                        "FINAL Prefilter stats: {} docs checked, {} killed by prefilter ({:.1}% kill rate), avg allowed positions per constraint: {:.1}",
-                        prefilter_docs, prefilter_killed, prefilter_kill_rate, avg_allowed_pos
-                    );
-                    log::info!(
-                        "FINAL Optimization: {} prefilter calls skipped (all-collapsed), {} token extractions skipped",
-                        prefilter_skipped_collapsed, token_extraction_skipped
-                    );
-                    log::info!(
-                        "FINAL Odinson driver stats: src_driver={} docs, dst_driver={} docs, aligned={} docs, avg intersection size={:.1}",
-                        src_driver_docs, dst_driver_docs, alignment_docs, avg_intersection
-                    );
+                    // Logging removed for performance
                 }
                 
                 return tantivy::TERMINATED;
@@ -1226,6 +1317,34 @@ struct LazyConstraintTokens<'a> {
     cache: Vec<Option<Vec<String>>>,  // One Option per constraint index
 }
 
+/// Immutable token accessor for thread-safe parallel processing
+/// Provides read-only access to pre-loaded tokens from LazyConstraintTokens
+struct ImmutableTokenAccessor<'a> {
+    tokens: Vec<Option<&'a [String]>>,  // References to pre-loaded tokens
+}
+
+impl<'a> ImmutableTokenAccessor<'a> {
+    /// Create a new immutable token accessor from a LazyConstraintTokens instance
+    /// All tokens must be pre-loaded before calling this
+    fn new(lazy_tokens: &'a LazyConstraintTokens) -> Self {
+        let tokens: Vec<Option<&'a [String]>> = lazy_tokens
+            .cache
+            .iter()
+            .map(|opt_tokens| opt_tokens.as_ref().map(|tokens| tokens.as_slice()))
+            .collect();
+        Self { tokens }
+    }
+    
+    /// Get token at a specific position for a constraint (returns owned String)
+    /// Returns None if constraint not loaded or position out of bounds
+    fn get(&self, constraint_idx: usize, position: usize) -> Option<String> {
+        self.tokens
+            .get(constraint_idx)?
+            .and_then(|tokens| tokens.get(position))
+            .cloned()
+    }
+}
+
 impl<'a> LazyConstraintTokens<'a> {
     /// Create a new lazy token loader
     fn new(
@@ -1277,6 +1396,72 @@ impl<'a> LazyConstraintTokens<'a> {
     fn extract_tokens_from_field(&self, field_name: &str) -> Vec<String> {
         crate::tantivy_integration::utils::extract_field_values(self.schema, self.doc, field_name)
     }
+}
+
+/// Process a single start position and return all matching paths as spans
+/// This is used for parallel processing where each thread processes one start position
+/// graph_bytes: The raw bytes of the graph (zero-copy, can be shared across threads)
+fn process_single_start_position(
+    graph_bytes: &[u8],
+    flat_steps: &[FlatPatternStep],
+    start_pos: usize,
+    constraint_field_names: &[String],
+    token_accessor: &ImmutableTokenAccessor,
+    allowed_positions: &[Option<std::collections::HashSet<u32>>],
+    constraint_exact_flags: &[bool],
+) -> Vec<crate::types::SpanWithCaptures> {
+    // Recreate ZeroCopyGraph from bytes for this thread (zero-copy, no allocation)
+    let graph = match ZeroCopyGraph::from_bytes(graph_bytes) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    
+    use crate::digraph::graph_trait::GraphAccess;
+    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
+    
+    // Create mutable closure for token access (wraps immutable accessor)
+    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+        token_accessor.get(constraint_idx, position)
+    };
+    
+    let all_paths = traversal_engine.automaton_query_paths(
+        flat_steps,
+        &[start_pos],
+        constraint_field_names,
+        &mut get_token,
+        allowed_positions,
+        constraint_exact_flags,
+    );
+    
+    let mut matches = Vec::new();
+    for path in &all_paths {
+        if !path.is_empty() {
+            let mut captures = Vec::with_capacity(path.len());
+            let mut c_idx = 0;
+            for step in flat_steps.iter() {
+                if let FlatPatternStep::Constraint(ref pat) = step {
+                    if let Some(&node_idx) = path.get(c_idx) {
+                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                        let name = match pat {
+                            Pattern::NamedCapture { name, .. } => name.clone(),
+                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                        };
+                        captures.push(crate::types::NamedCapture::new(name, span));
+                    }
+                    c_idx += 1;
+                }
+            }
+            let min_pos = *path.iter().min().unwrap();
+            let max_pos = *path.iter().max().unwrap();
+            matches.push(
+                crate::types::SpanWithCaptures::with_captures(
+                    crate::types::Span { start: min_pos, end: max_pos + 1 },
+                    captures
+                )
+            );
+        }
+    }
+    matches
 }
 
 /// Check if a constraint is exact and can skip matches() when prefilter confirms
@@ -1401,71 +1586,32 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
-        let mut buf: Vec<u32> = Vec::with_capacity(32);
-
-        // Phase 1: Process edge requirements (skip edges for collapsed constraints)
+        // Odinson-style combined filtering: Group ALL requirements (edges + constraints) by constraint_idx
+        use std::collections::{HashMap, HashSet};
+        let mut requirements_by_constraint: HashMap<usize, Vec<PositionRequirement>> = HashMap::new();
+        
+        // Add edge requirements (skip collapsed constraints)
         for (req_idx, req) in self.prefilter_plan.edge_reqs.iter().enumerate() {
             // Skip if this edge requirement is for a collapsed constraint
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
                 log::debug!("Skipping edge requirement for collapsed constraint {}", req.constraint_idx);
                 continue;
             }
-            let postings_opt = self.edge_postings.get_mut(req_idx).and_then(|p| p.as_mut());
-
-            // If postings is None, the term doesn't exist in this segment at all => cannot match
-            let postings = match postings_opt {
-                Some(p) => p,
-                None => {
-                    // Log: term doesn't exist in segment at all
-                    log::warn!("EdgeReq[{}] label='{}' has no postings in segment", req_idx, req.label);
-                    return None;
-                }
-            };
-
-            // Use seek() for cleaner and often faster positioning
-            postings.seek(doc_id);
-
-            // Term not present in this doc => cannot match
-            if postings.doc() != doc_id {
-                // This is expected if doc doesn't have this edge - that's a valid skip
-                return None;
-            }
-
-            buf.clear();
-            postings.positions(&mut buf);
-
-            // DIAGNOSTIC: Log position count for first few docs
-            static DIAG_COUNT: AtomicUsize = AtomicUsize::new(0);
-            let diag = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
-            if diag < 20 {
-                log::info!(
-                    "DIAG doc_id={} EdgeReq[{}] label='{}' constraint_idx={} positions={:?}",
-                    doc_id, req_idx, req.label, req.constraint_idx, buf
-                );
-            }
-
-            if buf.is_empty() {
-                log::warn!("EdgeReq[{}] label='{}' doc_id={} has term but ZERO positions!", req_idx, req.label, doc_id);
-                return None;
-            }
-
-            match &mut allowed[req.constraint_idx] {
-                None => {
-                    // First restriction: take positions (move instead of clone)
-                    allowed[req.constraint_idx] = Some(std::mem::take(&mut buf));
-                }
-                Some(existing) => {
-                    // Intersect existing with buf
-                    Self::intersect_sorted_in_place(existing, &buf);
-                    if existing.is_empty() {
-                        return None;
-                    }
-                }
-            }
+            
+            requirements_by_constraint
+                .entry(req.constraint_idx)
+                .or_insert_with(Vec::new)
+                .push(PositionRequirement::Edge {
+                    req_idx,
+                    field: req.field,
+                    label: req.label.clone(),
+                });
         }
-
-        // Phase 2: Process constraint requirements (intersect with edge positions)
-        // Skip collapsed constraints - they already have driver positions set
+        
+        // Add constraint requirements (skip collapsed constraints)
+        // Track which constraint indices have requirements for validation
+        let mut constraint_indices_with_reqs: HashSet<usize> = HashSet::new();
+        
         for (req_idx, req) in self.constraint_reqs.iter().enumerate() {
             // Skip if this constraint is collapsed (already has driver positions)
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
@@ -1473,43 +1619,177 @@ impl OptimizedGraphTraversalScorer {
                 continue;
             }
             
-            let postings_opt = self.constraint_postings.get_mut(req_idx).and_then(|p| p.as_mut());
+            constraint_indices_with_reqs.insert(req.constraint_idx);
+            
+            requirements_by_constraint
+                .entry(req.constraint_idx)
+                .or_insert_with(Vec::new)
+                .push(PositionRequirement::Constraint {
+                    req_idx,
+                    field: req.field,
+                    term: req.term.clone(),
+                });
+        }
 
-            // If postings is None, the term doesn't exist in this segment at all => cannot match
-            let postings = match postings_opt {
-                Some(p) => p,
-                None => {
-                    // Term doesn't exist - document cannot match this exact constraint
+        let mut buf: Vec<u32> = Vec::with_capacity(32);
+
+        // Process each constraint_idx with ALL its requirements together (Odinson-style)
+        for (constraint_idx, requirements) in requirements_by_constraint {
+            // For each constraint_idx, we need to:
+            // 1. Union all constraint term positions (for regex expansion)
+            // 2. Intersect all edge positions together
+            // 3. Intersect constraint union with edge intersection
+            
+            let mut edge_intersection: Option<Vec<u32>> = None;
+            let mut constraint_union: Vec<u32> = Vec::new();
+            let mut has_constraint_reqs = false;
+            let mut edge_count = 0;
+            let mut constraint_count = 0;
+
+            for req in requirements {
+                buf.clear();
+                
+                match req {
+                    PositionRequirement::Edge { req_idx, .. } => {
+                        edge_count += 1;
+                        let postings_opt = self.edge_postings.get_mut(req_idx).and_then(|p| p.as_mut());
+
+                        // If postings is None, the term doesn't exist in this segment at all => cannot match
+                        let postings = match postings_opt {
+                            Some(p) => p,
+                            None => {
+                                log::warn!("EdgeReq[{}] has no postings in segment", req_idx);
+                                return None;
+                            }
+                        };
+
+                        // Only seek if we're not already at or past the target document
+                        if postings.doc() < doc_id {
+                            postings.seek(doc_id);
+                        }
+
+                        // Term not present in this doc => cannot match
+                        if postings.doc() != doc_id {
+                            return None;
+                        }
+
+                        postings.positions(&mut buf);
+
+                        if buf.is_empty() {
+                            log::warn!("EdgeReq[{}] doc_id={} has term but ZERO positions!", req_idx, doc_id);
+                            return None;
+                        }
+
+                        // Intersect with existing edge positions
+                        match &mut edge_intersection {
+                            None => {
+                                edge_intersection = Some(std::mem::take(&mut buf));
+                            }
+                            Some(existing) => {
+                                let before_size = existing.len();
+                                Self::intersect_sorted_in_place(existing, &buf);
+                                if existing.is_empty() {
+                                    return None;  // Fail immediately
+                                }
+                            }
+                        }
+                    }
+                    PositionRequirement::Constraint { req_idx, .. } => {
+                        constraint_count += 1;
+                        has_constraint_reqs = true;
+                        
+                        let postings_opt = self.constraint_postings.get_mut(req_idx).and_then(|p| p.as_mut());
+
+                        // If postings is None, skip this term (other terms for same constraint_idx might match)
+                        let postings = match postings_opt {
+                            Some(p) => p,
+                            None => {
+                                continue;
+                            }
+                        };
+
+                        // Only seek if we're not already at or past the target document
+                        if postings.doc() < doc_id {
+                            postings.seek(doc_id);
+                        }
+
+                        // Term not present in this doc => skip this term
+                        if postings.doc() != doc_id {
+                            continue;
+                        }
+
+                        postings.positions(&mut buf);
+
+                        if !buf.is_empty() {
+                            // OPTIMIZATION: If edge_intersection exists, intersect immediately to keep sets small
+                            // This prevents building large intermediate constraint_union sets
+                            if let Some(ref edge_positions) = edge_intersection {
+                                // Intersect buf with edge_intersection before adding to union
+                                let mut filtered = buf.clone();
+                                Self::intersect_sorted_in_place(&mut filtered, edge_positions);
+                                if !filtered.is_empty() {
+                                    constraint_union.extend_from_slice(&filtered);
+                                }
+                            } else {
+                                // No edge restrictions yet - add all positions to union
+                                constraint_union.extend_from_slice(&buf);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check: if a constraint has requirements but no matching terms, document cannot match
+            if constraint_indices_with_reqs.contains(&constraint_idx) && constraint_union.is_empty() {
+                // This constraint has regex expansion but no terms matched in this document
+                return None;
+            }
+
+            // Compute final intersection for this constraint_idx
+            let final_positions = if has_constraint_reqs {
+                // Sort and dedup the unioned constraint positions
+                let constraint_union_before_sort = constraint_union.len();
+                constraint_union.sort_unstable();
+                constraint_union.dedup();
+                
+                if constraint_union.is_empty() {
                     return None;
+                }
+
+                // Intersect constraint union with edge intersection
+                match edge_intersection {
+                    None => {
+                        // No edge restrictions - use constraint positions
+                        constraint_union
+                    }
+                    Some(mut edge_positions) => {
+                        // Intersect: only positions that have BOTH the edge AND at least one constraint term
+                        Self::intersect_sorted_in_place(&mut edge_positions, &constraint_union);
+                        if edge_positions.is_empty() {
+                            return None;  // Fail immediately
+                        }
+                        edge_positions
+                    }
+                }
+            } else {
+                // No constraint requirements - use edge intersection directly
+                match edge_intersection {
+                    None => {
+                        // No requirements at all for this constraint_idx (shouldn't happen, but handle gracefully)
+                        continue;
+                    }
+                    Some(edge_positions) => edge_positions,
                 }
             };
 
-            postings.seek(doc_id);
+            allowed[constraint_idx] = Some(final_positions);
+        }
 
-            // Term not present in this doc => cannot match
-            if postings.doc() != doc_id {
-                return None;
-            }
-
-            buf.clear();
-            postings.positions(&mut buf);
-
-            if buf.is_empty() {
-                return None;
-            }
-
-            // Intersect constraint positions with existing allowed positions (from edges)
-            match &mut allowed[req.constraint_idx] {
-                None => {
-                    // No edge restriction yet - take constraint positions (move instead of clone)
-                    allowed[req.constraint_idx] = Some(std::mem::take(&mut buf));
-                }
-                Some(existing) => {
-                    // Intersect: only positions that have BOTH the edge AND the constraint term
-                    Self::intersect_sorted_in_place(existing, &buf);
-                    if existing.is_empty() {
-                        return None;
-                    }
+        // Validate: all constraints with requirements must have positions
+        for constraint_idx in &constraint_indices_with_reqs {
+            if Some(*constraint_idx) != src_collapsed_idx && Some(*constraint_idx) != dst_collapsed_idx {
+                if allowed[*constraint_idx].is_none() || allowed[*constraint_idx].as_ref().unwrap().is_empty() {
+                    return None;
                 }
             }
         }
@@ -1768,56 +2048,91 @@ impl OptimizedGraphTraversalScorer {
                 use crate::digraph::graph_trait::GraphAccess;
                 log::debug!("ZeroCopyGraph loaded successfully: {} nodes, {} labels", 
                     zc_graph.node_count(), zc_graph.label_count());
-                let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
-                // Create closure for token access (wraps lazy_tokens)
-                let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
-                    lazy_tokens.get(constraint_idx, position)
-                };
-                
-                let mut all_matches = Vec::new();
-                
-                for &src_pos in src_positions {
-                    let all_paths = traversal_engine.automaton_query_paths(
-                        flat_steps, 
-                        &[src_pos], 
-                        constraint_field_names, 
-                        &mut get_token,
-                        &allowed_positions_hashset,
-                        &constraint_exact_flags,
-                    );
-                    
-                    for path in &all_paths {
-                        if !path.is_empty() {
-                            let mut captures = Vec::with_capacity(path.len());
-                            let mut c_idx = 0;
-                            for step in flat_steps.iter() {
-                                if let FlatPatternStep::Constraint(ref pat) = step {
-                                    if let Some(&node_idx) = path.get(c_idx) {
-                                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                                        let name = match pat {
-                                            Pattern::NamedCapture { name, .. } => name.clone(),
-                                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
-                                        };
-                                        captures.push(crate::types::NamedCapture::new(name, span));
-                                    }
-                                    c_idx += 1;
-                                }
-                            }
-                            let min_pos = *path.iter().min().unwrap();
-                            let max_pos = *path.iter().max().unwrap();
-                            all_matches.push(
-                                crate::types::SpanWithCaptures::with_captures(
-                                    crate::types::Span { start: min_pos, end: max_pos + 1 },
-                                    captures
-                                )
-                            );
-                        }
+                // Check if we should use parallel processing
+                if src_positions.len() >= PARALLEL_START_POSITIONS_THRESHOLD {
+                    // Pre-load all tokens for thread-safety before parallel processing
+                    for constraint_idx in 0..constraint_field_names.len() {
+                        lazy_tokens.ensure_loaded(constraint_idx);
                     }
                     
-                    if !all_paths.is_empty() {
-                        // Now we can mutate self after the closure is dropped
+                    // Create immutable token accessor for parallel processing
+                    let token_accessor = ImmutableTokenAccessor::new(&lazy_tokens);
+                    
+                    // Process start positions in parallel
+                    // Pass binary_data (bytes) instead of graph, so each thread can create its own ZeroCopyGraph
+                    // This is safe because ZeroCopyGraph is zero-copy - it just holds references to the bytes
+                    let all_matches: Vec<crate::types::SpanWithCaptures> = src_positions
+                        .par_iter()
+                        .flat_map(|&src_pos| {
+                            process_single_start_position(
+                                binary_data,
+                                flat_steps,
+                                src_pos,
+                                constraint_field_names,
+                                &token_accessor,
+                                &allowed_positions_hashset,
+                                &constraint_exact_flags,
+                            )
+                        })
+                        .collect();
+                    
+                    if !all_matches.is_empty() {
                         self.current_doc_matches.extend(all_matches);
                         return true;
+                    }
+                } else {
+                    // Sequential processing for small number of start positions (preserves lazy loading)
+                    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
+                    // Create closure for token access (wraps lazy_tokens)
+                    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+                        lazy_tokens.get(constraint_idx, position)
+                    };
+                    
+                    let mut all_matches = Vec::new();
+                    
+                    for &src_pos in src_positions {
+                        let all_paths = traversal_engine.automaton_query_paths(
+                            flat_steps, 
+                            &[src_pos], 
+                            constraint_field_names, 
+                            &mut get_token,
+                            &allowed_positions_hashset,
+                            &constraint_exact_flags,
+                        );
+                        
+                        for path in &all_paths {
+                            if !path.is_empty() {
+                                let mut captures = Vec::with_capacity(path.len());
+                                let mut c_idx = 0;
+                                for step in flat_steps.iter() {
+                                    if let FlatPatternStep::Constraint(ref pat) = step {
+                                        if let Some(&node_idx) = path.get(c_idx) {
+                                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                                            let name = match pat {
+                                                Pattern::NamedCapture { name, .. } => name.clone(),
+                                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                            };
+                                            captures.push(crate::types::NamedCapture::new(name, span));
+                                        }
+                                        c_idx += 1;
+                                    }
+                                }
+                                let min_pos = *path.iter().min().unwrap();
+                                let max_pos = *path.iter().max().unwrap();
+                                all_matches.push(
+                                    crate::types::SpanWithCaptures::with_captures(
+                                        crate::types::Span { start: min_pos, end: max_pos + 1 },
+                                        captures
+                                    )
+                                );
+                            }
+                        }
+                        
+                        if !all_paths.is_empty() {
+                            // Now we can mutate self after the closure is dropped
+                            self.current_doc_matches.extend(all_matches);
+                            return true;
+                        }
                     }
                 }
                 
@@ -1841,14 +2156,7 @@ impl OptimizedGraphTraversalScorer {
             let pf_skip_collapsed = PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed);
             let token_skip = TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed);
             
-            log::info!(
-                "Stats: calls={} deser={} skipped={} prefilter_killed={}/{} ({:.1}%) avg_positions={:.1} collapsed_skip={} token_skip={}",
-                call_num, deser, skipped,
-                pf_killed, pf_docs,
-                if pf_docs > 0 { pf_killed as f64 / pf_docs as f64 * 100.0 } else { 0.0 },
-                if pos_count > 0 { pos_sum as f64 / pos_count as f64 } else { 0.0 },
-                pf_skip_collapsed, token_skip
-            );
+            // Logging removed for performance
         }
 
         traversal_result
@@ -2131,6 +2439,135 @@ fn unwrap_constraint_pattern_static(pat: &Pattern) -> &Pattern {
         Pattern::NamedCapture { pattern, .. } => unwrap_constraint_pattern_static(pattern),
         Pattern::Repetition { pattern, .. } => unwrap_constraint_pattern_static(pattern),
         _ => pat,
+    }
+}
+
+/// Public function to retrieve profiling statistics
+/// Returns a struct with all performance metrics
+#[derive(Debug, Clone)]
+pub struct GraphTraversalStats {
+    pub call_count: usize,
+    pub graph_deser_count: usize,
+    pub graph_deser_skipped: usize,
+    pub prefilter_docs: usize,
+    pub prefilter_killed: usize,
+    pub prefilter_allowed_pos_sum: usize,
+    pub prefilter_allowed_pos_count: usize,
+    pub src_driver_docs: usize,
+    pub dst_driver_docs: usize,
+    pub driver_alignment_docs: usize,
+    pub driver_intersection_sum: usize,
+    pub driver_intersection_count: usize,
+    pub prefilter_skipped_all_collapsed: usize,
+    pub token_extraction_skipped: usize,
+    pub regex_expansion_count: usize,
+    pub regex_expansion_terms: usize,
+}
+
+impl GraphTraversalStats {
+    pub fn get() -> Self {
+        Self {
+            call_count: CALL_COUNT.load(Ordering::Relaxed),
+            graph_deser_count: GRAPH_DESER_COUNT.load(Ordering::Relaxed),
+            graph_deser_skipped: GRAPH_DESER_SKIPPED.load(Ordering::Relaxed),
+            prefilter_docs: PREFILTER_DOCS.load(Ordering::Relaxed),
+            prefilter_killed: PREFILTER_KILLED.load(Ordering::Relaxed),
+            prefilter_allowed_pos_sum: PREFILTER_ALLOWED_POS_SUM.load(Ordering::Relaxed),
+            prefilter_allowed_pos_count: PREFILTER_ALLOWED_POS_COUNT.load(Ordering::Relaxed),
+            src_driver_docs: SRC_DRIVER_DOCS.load(Ordering::Relaxed),
+            dst_driver_docs: DST_DRIVER_DOCS.load(Ordering::Relaxed),
+            driver_alignment_docs: DRIVER_ALIGNMENT_DOCS.load(Ordering::Relaxed),
+            driver_intersection_sum: DRIVER_INTERSECTION_SUM.load(Ordering::Relaxed),
+            driver_intersection_count: DRIVER_INTERSECTION_COUNT.load(Ordering::Relaxed),
+            prefilter_skipped_all_collapsed: PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed),
+            token_extraction_skipped: TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed),
+            regex_expansion_count: REGEX_EXPANSION_COUNT.load(Ordering::Relaxed),
+            regex_expansion_terms: REGEX_EXPANSION_TERMS.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset() {
+        CALL_COUNT.store(0, Ordering::Relaxed);
+        GRAPH_DESER_COUNT.store(0, Ordering::Relaxed);
+        GRAPH_DESER_SKIPPED.store(0, Ordering::Relaxed);
+        PREFILTER_DOCS.store(0, Ordering::Relaxed);
+        PREFILTER_KILLED.store(0, Ordering::Relaxed);
+        PREFILTER_ALLOWED_POS_SUM.store(0, Ordering::Relaxed);
+        PREFILTER_ALLOWED_POS_COUNT.store(0, Ordering::Relaxed);
+        SRC_DRIVER_DOCS.store(0, Ordering::Relaxed);
+        DST_DRIVER_DOCS.store(0, Ordering::Relaxed);
+        DRIVER_ALIGNMENT_DOCS.store(0, Ordering::Relaxed);
+        DRIVER_INTERSECTION_SUM.store(0, Ordering::Relaxed);
+        DRIVER_INTERSECTION_COUNT.store(0, Ordering::Relaxed);
+        PREFILTER_SKIPPED_ALL_COLLAPSED.store(0, Ordering::Relaxed);
+        TOKEN_EXTRACTION_SKIPPED.store(0, Ordering::Relaxed);
+        REGEX_EXPANSION_COUNT.store(0, Ordering::Relaxed);
+        REGEX_EXPANSION_TERMS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn print_summary(&self) {
+        println!("\n=== Graph Traversal Performance Statistics ===");
+        
+        let skip_rate = if self.call_count > 0 {
+            (self.graph_deser_skipped as f64 / self.call_count as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        let prefilter_kill_rate = if self.prefilter_docs > 0 {
+            (self.prefilter_killed as f64 / self.prefilter_docs as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        let avg_allowed_pos = if self.prefilter_allowed_pos_count > 0 {
+            self.prefilter_allowed_pos_sum as f64 / self.prefilter_allowed_pos_count as f64
+        } else {
+            0.0
+        };
+        
+        let avg_intersection = if self.driver_intersection_count > 0 {
+            self.driver_intersection_sum as f64 / self.driver_intersection_count as f64
+        } else {
+            0.0
+        };
+        
+        println!("Document Processing:");
+        println!("  Candidates checked: {}", self.call_count);
+        println!("  Graphs deserialized: {} ({} skipped, {:.1}% skip rate)", 
+                 self.graph_deser_count, self.graph_deser_skipped, skip_rate);
+        
+        println!("\nPrefilter Performance:");
+        println!("  Documents checked: {}", self.prefilter_docs);
+        println!("  Killed by prefilter: {} ({:.1}% kill rate)", 
+                 self.prefilter_killed, prefilter_kill_rate);
+        println!("  Avg allowed positions per constraint: {:.1}", avg_allowed_pos);
+        println!("  Prefilter skipped (all-collapsed): {}", self.prefilter_skipped_all_collapsed);
+        
+        println!("\nOdinson Driver Performance:");
+        println!("  Source driver docs: {}", self.src_driver_docs);
+        println!("  Destination driver docs: {}", self.dst_driver_docs);
+        println!("  Aligned docs: {}", self.driver_alignment_docs);
+        println!("  Avg intersection size: {:.1}", avg_intersection);
+        
+        println!("\nOptimizations:");
+        println!("  Token extractions skipped: {}", self.token_extraction_skipped);
+        
+        println!("\nRegex Expansion:");
+        println!("  Regex patterns expanded: {}", self.regex_expansion_count);
+        println!("  Total terms from expansion: {}", self.regex_expansion_terms);
+        if self.regex_expansion_count > 0 {
+            let avg_terms = self.regex_expansion_terms as f64 / self.regex_expansion_count as f64;
+            println!("  Average terms per pattern: {:.1}", avg_terms);
+        }
+        
+        // Calculate efficiency metrics
+        if self.call_count > 0 {
+            let deser_rate = (self.graph_deser_count as f64 / self.call_count as f64) * 100.0;
+            println!("\nEfficiency Metrics:");
+            println!("  Graph deserialization rate: {:.1}% (lower is better)", deser_rate);
+            println!("  Prefilter effectiveness: {:.1}% documents filtered out", prefilter_kill_rate);
+        }
     }
 }
 
