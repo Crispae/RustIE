@@ -210,9 +210,9 @@ impl DocumentParser {
                                     graph.add_edge(*from as usize, *to as usize, &rel);
                                 }
                                 
-                                // Serialize to binary and store
-                                // Try zero-copy format first (more efficient at query time),
-                                // fall back to legacy format for large graphs
+                                // Serialize to binary and store in zero-copy format
+                                // NOTE: For single-sentence dependency graphs, the limits (65,535 nodes/labels) 
+                                // are essentially unreachable in practice. This check is defensive programming.
                                 if let Ok(binary_field) = self.schema.get_field("dependencies_binary") {
                                     match ZeroCopyGraphWriter::from_directed_graph(&graph) {
                                         Ok(writer) => {
@@ -222,17 +222,9 @@ impl DocumentParser {
                                             tantivy_doc.add_bytes(binary_field, &bytes);
                                         }
                                         Err(e) => {
-                                            // Fall back to legacy format (e.g., graph too large for u16)
-                                            log::warn!("Index-time: Graph too large for zero-copy format ({}), using legacy format: {}", 
+                                            // Zero-copy format failed - log error and skip this graph
+                                            log::error!("Index-time: Failed to serialize graph in zero-copy format ({} nodes): {}. Skipping graph.", 
                                                 graph.node_count(), e);
-                                            match graph.to_bytes() {
-                                                Ok(bytes) => {
-                                                    tantivy_doc.add_bytes(binary_field, &bytes);
-                                                }
-                                                Err(e) => {
-                                                    log::warn!("Graph serialization failed: {}", e);
-                                                }
-                                            }
                                         }
                                     }
                                 }
