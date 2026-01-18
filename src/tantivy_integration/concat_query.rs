@@ -3,6 +3,8 @@ use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet, Term
 use tantivy::schema::{Field, IndexRecordOption, Value};
 use tantivy::postings::Postings;
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use tantivy_fst::Regex;
 use crate::compiler::ast::{Pattern, Constraint, Matcher};
 
 /// Execution plan for anchor-based verification
@@ -94,6 +96,7 @@ impl Query for RustieConcatQuery {
             pattern: self.pattern.clone(),
             default_field: self.default_field,
             concat_plan: self.concat_plan.clone(),
+            regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
         }))
     }
 }
@@ -103,6 +106,8 @@ struct RustieConcatWeight {
     pattern: Pattern,
     default_field: Field,
     concat_plan: Option<ConcatPlan>,
+    /// Cached compiled regex automata (shared across segments, thread-safe)
+    regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 }
 
 /// Helper to extract constraints from a Pattern
@@ -136,6 +141,7 @@ fn compile_constraint_sources(
     pattern: &Pattern,
     reader: &SegmentReader,
     default_field: &Field,
+    regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 ) -> TantivyResult<Vec<ConstraintSource>> {
     use crate::compiler::ast::Pattern;
     let mut sources = Vec::new();
@@ -218,13 +224,13 @@ fn compile_constraint_sources(
                 };
                 
                 let source = compile_constraint_to_source(
-                    constraint, reader, default_field, &mut regex_cache, schema
+                    constraint, reader, default_field, &mut regex_cache, schema, regex_automaton_cache.clone()
                 )?;
                 sources.push(source);
             }
         }
         Pattern::Constraint(c) => {
-            let source = compile_constraint_to_source(c, reader, default_field, &mut regex_cache, schema)?;
+            let source = compile_constraint_to_source(c, reader, default_field, &mut regex_cache, schema, regex_automaton_cache.clone())?;
             sources.push(source);
         }
         _ => {
@@ -236,6 +242,75 @@ fn compile_constraint_sources(
     Ok(sources)
 }
 
+/// Helper function to expand regex terms using a cached automaton.
+/// Extracted to avoid code duplication and enable caching.
+fn expand_regex_terms_with_automaton(
+    term_dict: &tantivy::termdict::TermDictionary,
+    automaton: &Regex,
+    field: Field,
+    inverted_index: &tantivy::InvertedIndexReader,
+    regex_cache: &mut HashMap<String, Vec<Term>>,
+    cache_key: &str,
+    pattern: &str,
+) -> TantivyResult<Vec<Term>> {
+    let mut stream = term_dict.search(automaton).into_stream()
+        .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to search term dict: {:?}", e)))?;
+    
+    let mut terms = Vec::new();
+    let mut count = 0;
+    
+    while stream.advance() {
+        if count >= MAX_REGEX_EXPANSION {
+            log::warn!("Regex pattern '{}' exceeds expansion cap ({}), truncating", pattern, MAX_REGEX_EXPANSION);
+            break;
+        }
+        
+        let term_bytes = stream.key();
+        let term = Term::from_field_bytes(field, term_bytes);
+        terms.push(term);
+        count += 1;
+    }
+    
+    if terms.is_empty() {
+        log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
+    } else {
+        log::debug!("Regex pattern '{}' expanded to {} terms", pattern, terms.len());
+        regex_cache.insert(cache_key.to_string(), terms.clone());
+    }
+    
+    Ok(terms)
+}
+
+/// Get or compile a regex automaton from the cache (thread-safe).
+fn get_or_compile_regex_automaton(
+    cache: &Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    pattern: &str,
+) -> TantivyResult<Arc<Regex>> {
+    // Fast path: read lock
+    {
+        let read_guard = cache.read()
+            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to acquire regex cache read lock: {}", e)))?;
+        if let Some(regex) = read_guard.get(pattern) {
+            return Ok(Arc::clone(regex));
+        }
+    } // Read lock released here
+    
+    // Slow path: write lock
+    let mut write_guard = cache.write()
+        .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to acquire regex cache write lock: {}", e)))?;
+    
+    // Double-check after acquiring write lock (another thread might have compiled it)
+    if let Some(regex) = write_guard.get(pattern) {
+        return Ok(Arc::clone(regex));
+    }
+    
+    // Compile and cache
+    let regex = Arc::new(Regex::new(pattern)
+        .map_err(|e| tantivy::TantivyError::SchemaError(format!("Invalid regex pattern '{}': {}", pattern, e)))?);
+    write_guard.insert(pattern.to_string(), Arc::clone(&regex));
+    Ok(regex)
+}
+
 /// Compile a single constraint to ConstraintSource
 fn compile_constraint_to_source(
     constraint: &Constraint,
@@ -243,6 +318,7 @@ fn compile_constraint_to_source(
     default_field: &Field,
     regex_cache: &mut HashMap<String, Vec<Term>>,
     schema: &tantivy::schema::Schema,
+    regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 ) -> TantivyResult<ConstraintSource> {
     match constraint {
         Constraint::Wildcard => {
@@ -262,7 +338,7 @@ fn compile_constraint_to_source(
                     // Strip /.../ delimiters before FST expansion
                     let clean_pattern = pattern.trim_start_matches('/').trim_end_matches('/');
                     
-                    // Check cache first
+                    // Check segment-local term cache first
                     let cache_key = format!("{}:{}", name, pattern);
                     let terms = if let Some(cached) = regex_cache.get(&cache_key) {
                         cached.clone()
@@ -272,35 +348,19 @@ fn compile_constraint_to_source(
                             .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to get inverted index: {}", e)))?;
                         let term_dict = inverted_index.terms();
                         
-                        let automaton = tantivy_fst::Regex::new(clean_pattern)
-                            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Invalid regex pattern '{}': {}", pattern, e)))?;
+                        // Get or compile regex automaton from cache (thread-safe)
+                        let automaton = get_or_compile_regex_automaton(&regex_automaton_cache, clean_pattern)?;
                         
-                        let mut stream = term_dict.search(&automaton).into_stream()
-                            .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to search term dict: {:?}", e)))?;
-                        
-                        let mut terms = Vec::new();
-                        let mut count = 0;
-                        
-                        while stream.advance() {
-                            if count >= MAX_REGEX_EXPANSION {
-                                log::warn!("Regex pattern '{}' exceeds expansion cap ({}), truncating", pattern, MAX_REGEX_EXPANSION);
-                                break;
-                            }
-                            
-                            let term_bytes = stream.key();
-                            let term = Term::from_field_bytes(field, term_bytes);
-                            terms.push(term);
-                            count += 1;
-                        }
-                        
-                        if terms.is_empty() {
-                            log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
-                        } else {
-                            log::debug!("Regex pattern '{}' expanded to {} terms", pattern, terms.len());
-                            regex_cache.insert(cache_key, terms.clone());
-                        }
-                        
-                        terms
+                        // Expand terms using the cached automaton
+                        expand_regex_terms_with_automaton(
+                            &term_dict,
+                            automaton.as_ref(),
+                            field,
+                            &inverted_index,
+                            regex_cache,
+                            &cache_key,
+                            pattern,
+                        )?
                     };
                     
                     Ok(ConstraintSource::Regex { field, pattern: pattern.clone(), terms })
@@ -394,7 +454,7 @@ impl Weight for RustieConcatWeight {
         }
 
         // Compile constraint sources for postings-based Phase 2
-        let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field) {
+        let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field, self.regex_automaton_cache.clone()) {
             Ok(sources) => {
                 if sources.is_empty() {
                     log::debug!("compile_constraint_sources returned empty sources for pattern={:?}, postings path unavailable", self.pattern);

@@ -10,7 +10,9 @@ use tantivy::{
 };
 use log::debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
+use std::sync::{Arc, RwLock};
+use tantivy_fst::Regex;
 
 use crate::compiler::ast::FlatPatternStep;
 use crate::digraph::graph::DirectedGraph;
@@ -244,6 +246,87 @@ fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 // Regex Support: Term Expansion and Union Position Iteration
 // =============================================================================
 
+/// Helper function to expand terms using a cached regex automaton.
+/// Extracted to avoid code duplication and enable caching.
+fn expand_with_automaton(
+    term_dict: &tantivy::termdict::TermDictionary,
+    automaton: &Regex,
+    field: Field,
+    inverted_index: &tantivy::InvertedIndexReader,
+    max_expansions: usize,
+) -> Option<Vec<SegmentPostings>> {
+    let mut stream = match term_dict.search(automaton).into_stream() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("Failed to search term dict: {:?}", e);
+            return None;
+        }
+    };
+    
+    let mut postings_list = Vec::new();
+    let mut count = 0;
+    
+    while stream.advance() {
+        if count >= max_expansions {
+            log::warn!(
+                "collapse regex disabled: expanded_terms={} > max={}",
+                count, max_expansions
+            );
+            return None;
+        }
+        
+        let term_bytes = stream.key();
+        let term = Term::from_field_bytes(field, term_bytes);
+        if let Ok(Some(postings)) = inverted_index
+            .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
+        {
+            postings_list.push(postings);
+        }
+        count += 1;
+    }
+    
+    if postings_list.is_empty() {
+        log::debug!("Regex matched 0 terms in segment");
+        return None;
+    }
+    
+    log::debug!("Regex expanded to {} terms", postings_list.len());
+    Some(postings_list)
+}
+
+/// Get or compile a regex automaton from the cache (thread-safe).
+fn get_or_compile_regex(
+    cache: &Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    pattern: &str,
+) -> Option<Arc<Regex>> {
+    // Fast path: read lock
+    {
+        let read_guard = cache.read().ok()?;
+        if let Some(regex) = read_guard.get(pattern) {
+            return Some(Arc::clone(regex));
+        }
+    } // Read lock released here
+    
+    // Slow path: write lock
+    let mut write_guard = cache.write().ok()?;
+    
+    // Double-check after acquiring write lock (another thread might have compiled it)
+    if let Some(regex) = write_guard.get(pattern) {
+        return Some(Arc::clone(regex));
+    }
+    
+    // Compile and cache
+    let regex = match Regex::new(pattern) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            log::warn!("Invalid regex pattern '{}': {}", pattern, e);
+            return None;
+        }
+    };
+    write_guard.insert(pattern.to_string(), Arc::clone(&regex));
+    Some(regex)
+}
+
 /// Expand a CollapsedMatcher to Vec<SegmentPostings>.
 /// Returns None if:
 /// - Field doesn't support positions
@@ -254,6 +337,7 @@ fn expand_matcher(
     field: Field,
     matcher: &CollapsedMatcher,
     max_expansions: usize,
+    regex_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 ) -> Option<Vec<SegmentPostings>> {
     let inverted_index = reader.inverted_index(field).ok()?;
     
@@ -270,55 +354,11 @@ fn expand_matcher(
             // Automaton-based term enumeration
             let term_dict = inverted_index.terms();
             
-            // Build FST automaton from regex pattern
-            let automaton = match tantivy_fst::Regex::new(pattern) {
-                Ok(a) => a,
-                Err(e) => {
-                    log::warn!("Invalid regex pattern '{}': {}", pattern, e);
-                    return None;
-                }
-            };
+            // Get or compile regex automaton from cache (thread-safe)
+            let automaton = get_or_compile_regex(&regex_cache, pattern)?;
             
-            let mut stream = match term_dict.search(&automaton).into_stream() {
-                Ok(s) => s,
-                Err(e) => {
-                    log::warn!("Failed to search term dict with pattern '{}': {:?}", pattern, e);
-                    return None;
-                }
-            };
-            
-            let mut postings_list = Vec::new();
-            let mut count = 0;
-            
-            while stream.advance() {
-                if count >= max_expansions {
-                    log::warn!(
-                        "collapse regex disabled: pattern={} expanded_terms={} > max={}",
-                        pattern, count, max_expansions
-                    );
-                    return None; // Bail out - too many terms
-                }
-                
-                let term_bytes = stream.key();
-                let term = Term::from_field_bytes(field, term_bytes);
-                if let Ok(Some(postings)) = inverted_index
-                    .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
-                {
-                    postings_list.push(postings);
-                }
-                count += 1;
-            }
-            
-            if postings_list.is_empty() {
-                log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
-                return None; // No matching terms in segment
-            }
-            
-            log::debug!(
-                "Regex pattern '{}' expanded to {} terms",
-                pattern, postings_list.len()
-            );
-            Some(postings_list)
+            // Expand terms using the cached automaton
+            expand_with_automaton(&term_dict, automaton.as_ref(), field, &inverted_index, max_expansions)
         }
     }
 }
@@ -604,6 +644,7 @@ impl Query for OptimizedGraphTraversalQuery {
             prefilter_plan,
             src_collapse: self.src_collapse.clone(),
             dst_collapse: self.dst_collapse.clone(),
+            regex_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
         }))
     }
 }
@@ -646,6 +687,8 @@ struct OptimizedGraphTraversalWeight {
     src_collapse: Option<CollapsedSpec>,
     /// Collapse spec for dst constraint - required for CombinedPositionDriver
     dst_collapse: Option<CollapsedSpec>,
+    /// Cached compiled regex automata (shared across segments, thread-safe)
+    regex_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 }
 
 impl CollapsedMatcher {
@@ -677,6 +720,7 @@ impl OptimizedGraphTraversalWeight {
             spec.constraint_field,
             &spec.constraint_matcher,
             DEFAULT_MAX_TERM_EXPANSIONS,
+            self.regex_cache.clone(),
         )?;
         
         // Expand edge matcher
@@ -685,6 +729,7 @@ impl OptimizedGraphTraversalWeight {
             spec.edge_field,
             &spec.edge_matcher,
             DEFAULT_MAX_TERM_EXPANSIONS,
+            self.regex_cache.clone(),
         )?;
         
         // Fast path: both exact (single postings each) - use CombinedPositionDriver
