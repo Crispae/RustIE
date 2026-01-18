@@ -1027,6 +1027,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
 mod tests {
     use super::*;
     use crate::compiler::ast::{Traversal, Matcher};
+    use crate::digraph::DirectedGraph;
 
     #[test]
     fn test_outgoing_wildcard() {
