@@ -8,9 +8,15 @@
 //!   samply record ./target/release/profile_query.exe --index ./test_api_index
 
 use rustie::ExtractorEngine;
+use rustie::tantivy_integration::graph_traversal::GraphTraversalStats;
 use std::path::Path;
 use clap::Parser;
 use anyhow::Result;
+
+// Initialize logging to see debug/info messages
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+}
 
 #[derive(Parser)]
 #[command(name = "profile_query")]
@@ -26,16 +32,22 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    // Initialize logging to see regex expansion messages
+    init_logging();
+    
     let args = Args::parse();
     
     println!("Loading index from: {}", args.index);
     let engine = ExtractorEngine::from_path(&args.index)?;
     
     println!("Index loaded: {} documents", engine.num_docs());
-    println!("\nQuery: ([entity=/B-Gene/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene/])");
+    println!("\nQuery: ([tag=/N.*/]) <nsubj ([tag=/V.*/]) >dobj ([tag=/N.*/])");
     println!("Running {} iterations...\n", args.iterations);
     
-    let query = "([entity=/B-Gene/]) <nsubj ([tag=/V.*/]) >dobj ([entity=/B-Gene/])";
+    let query = "([tag=/N.*/]) <nsubj ([tag=/V.*/]) >dobj ([tag=/N.*/])";
+    
+    // Reset stats before starting
+    GraphTraversalStats::reset();
     
     let start = std::time::Instant::now();
     let mut total_hits = 0;
@@ -68,6 +80,10 @@ fn main() -> Result<()> {
     println!("Average time per query: {:.2}ms", avg_time);
     println!("Total hits across all runs: {}", total_hits);
     println!("Average hits per query: {:.2}", total_hits as f64 / args.iterations as f64);
+    
+    // Print detailed performance statistics
+    let stats = GraphTraversalStats::get();
+    stats.print_summary();
     
     Ok(())
 }

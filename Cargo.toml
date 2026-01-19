@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 tantivy = "0.24"
+tantivy-fst = "0.5"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
@@ -27,6 +28,7 @@ pest = "2.7"
 pest_derive = "2.7"
 utoipa = { version = "4", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "6", features = ["actix-web"] }
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [[bin]]
 name = "api_server"
@@ -55,6 +57,10 @@ path = "src/bin/create_test_index.rs"
 [[bin]]
 name = "profile_query"
 path = "src/bin/profile_query.rs"
+
+[[bin]]
+name = "test_greedy_lazy"
+path = "src/bin/test_greedy_lazy.rs"
 
 [profile.release]
 debug = true

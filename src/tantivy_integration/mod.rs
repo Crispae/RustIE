@@ -9,6 +9,7 @@ pub mod assertion_query;
 pub mod named_capture_query;
 pub mod position_tokenizer;
 pub mod position_prefilter;
+pub mod match_selector;
 
 pub use spans::*;
 pub use collector::*;
@@ -18,4 +19,5 @@ pub use boolean_query::*;
 pub use assertion_query::*;
 pub use named_capture_query::*;
 pub use position_tokenizer::*;
-pub use position_prefilter::*; 
+pub use position_prefilter::*;
+pub use match_selector::*; 

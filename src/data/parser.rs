@@ -9,6 +9,7 @@ use tantivy::schema::Schema;
 
 use crate::data::document::{Document as RustDoc, Field as DocField};
 use crate::digraph::graph::DirectedGraph;
+use crate::digraph::zero_copy_writer::ZeroCopyGraphWriter;
 
 /// Required fields that must exist in the schema for core functionality
 const REQUIRED_FIELDS: &[&str] = &["doc_id", "sentence_id", "sentence_length", "word"];
@@ -175,6 +176,7 @@ impl DocumentParser {
                         // This ensures each token gets the correct position (0, 1, 2, ...)
                         // instead of all tokens being at position 0
                         let encoded = crate::tantivy_integration::position_tokenizer::encode_position_aware_tokens(tokens);
+                        
 
                         match name.as_str() {
                             "raw" | "word" | "lemma" | "pos" | "tag" | "chunk" | "entity" | "norm" => {
@@ -208,14 +210,21 @@ impl DocumentParser {
                                     graph.add_edge(*from as usize, *to as usize, &rel);
                                 }
                                 
-                                // Serialize to binary and store
+                                // Serialize to binary and store in zero-copy format
+                                // NOTE: For single-sentence dependency graphs, the limits (65,535 nodes/labels) 
+                                // are essentially unreachable in practice. This check is defensive programming.
                                 if let Ok(binary_field) = self.schema.get_field("dependencies_binary") {
-                                    match graph.to_bytes() {
-                                        Ok(bytes) => {
+                                    match ZeroCopyGraphWriter::from_directed_graph(&graph) {
+                                        Ok(writer) => {
+                                            let bytes = writer.serialize();
+                                            log::debug!("Index-time: Writing graph in ZERO-COPY format ({} nodes, {} labels, {} bytes)", 
+                                                graph.node_count(), graph.vocabulary().len(), bytes.len());
                                             tantivy_doc.add_bytes(binary_field, &bytes);
                                         }
                                         Err(e) => {
-                                    log::warn!("Graph serialization failed: {}", e);
+                                            // Zero-copy format failed - log error and skip this graph
+                                            log::error!("Index-time: Failed to serialize graph in zero-copy format ({} nodes): {}. Skipping graph.", 
+                                                graph.node_count(), e);
                                         }
                                     }
                                 }

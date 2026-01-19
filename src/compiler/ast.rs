@@ -117,6 +117,13 @@ pub enum FlatPatternStep {
     Traversal(Traversal),
 }
 
+/// Quantifier kind: greedy or lazy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantifierKind {
+    Greedy,
+    Lazy,
+}
+
 /// Main pattern types for Odinson queries
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Pattern {
@@ -127,7 +134,7 @@ pub enum Pattern {
     NamedCapture { name: String, pattern: Box<Pattern> },
     Mention { arg_name: Option<String>, label: String },
     GraphTraversal { src: Box<Pattern>, traversal: Traversal, dst: Box<Pattern> },
-    Repetition { pattern: Box<Pattern>, min: usize, max: Option<usize> },
+    Repetition { pattern: Box<Pattern>, min: usize, max: Option<usize>, kind: QuantifierKind },
 }
 
 impl Pattern {
@@ -241,11 +248,12 @@ impl Ast {
     }
 
     /// Create a repetition pattern
-    pub fn repetition_pattern(pattern: Pattern, min: usize, max: Option<usize>) -> Pattern {
+    pub fn repetition_pattern(pattern: Pattern, min: usize, max: Option<usize>, kind: QuantifierKind) -> Pattern {
         Pattern::Repetition {
             pattern: Box::new(pattern),
             min,
             max,
+            kind,
         }
     }
 }
@@ -550,6 +558,7 @@ mod tests {
             pattern: Box::new(inner),
             min: 1,
             max: Some(3),
+            kind: QuantifierKind::Greedy,
         };
         let tokens = vec!["x".to_string(), "y".to_string(), "x".to_string()];
         let positions = pattern.extract_matching_positions("word", &tokens);
@@ -664,7 +673,7 @@ mod tests {
     #[test]
     fn test_ast_repetition_pattern() {
         let inner = Pattern::Constraint(Constraint::Wildcard);
-        let pattern = Ast::repetition_pattern(inner, 1, Some(5));
+        let pattern = Ast::repetition_pattern(inner, 1, Some(5), QuantifierKind::Greedy);
         match pattern {
             Pattern::Repetition { min, max, .. } => {
                 assert_eq!(min, 1);
@@ -677,7 +686,7 @@ mod tests {
     #[test]
     fn test_ast_repetition_pattern_unbounded() {
         let inner = Pattern::Constraint(Constraint::Wildcard);
-        let pattern = Ast::repetition_pattern(inner, 0, None);
+        let pattern = Ast::repetition_pattern(inner, 0, None, QuantifierKind::Greedy);
         match pattern {
             Pattern::Repetition { min, max, .. } => {
                 assert_eq!(min, 0);
