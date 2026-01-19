@@ -2,7 +2,7 @@ use tantivy::{
     query::Query,
     schema::{Field, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
+use crate::query::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
 use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec, CollapsedMatcher};
 

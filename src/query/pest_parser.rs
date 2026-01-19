@@ -1,6 +1,6 @@
 use pest::Parser;
 use pest_derive::Parser;
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
+use crate::query::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
 
 #[derive(Parser)]
 #[grammar = "query.pest"]
@@ -42,7 +42,7 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
 
             // Collect all pattern links
             let mut patterns = vec![first];
-            let mut pending_traversal: Option<crate::compiler::ast::Traversal> = None;
+            let mut pending_traversal: Option<crate::query::ast::Traversal> = None;
 
             for link_pair in pairs {
                 match link_pair.as_rule() {
@@ -373,10 +373,10 @@ fn build_assertion(pair: pest::iterators::Pair<Rule>) -> Assertion {
     }
 }
 
-fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast::Traversal {
+fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::query::ast::Traversal {
     match pair.as_rule() {
-        Rule::outgoing_wildcard => crate::compiler::ast::Traversal::OutgoingWildcard,
-        Rule::incoming_wildcard => crate::compiler::ast::Traversal::IncomingWildcard,
+        Rule::outgoing_wildcard => crate::query::ast::Traversal::OutgoingWildcard,
+        Rule::incoming_wildcard => crate::query::ast::Traversal::IncomingWildcard,
         Rule::outgoing => {
             let mut inner = pair.into_inner();
             let label_pair = inner.next().unwrap();
@@ -386,7 +386,7 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
             
             // Check if there's a quantifier and wrap accordingly
             if quantifier_pair.is_some() {
-                crate::compiler::ast::Traversal::Optional(Box::new(base_traversal))
+                crate::query::ast::Traversal::Optional(Box::new(base_traversal))
             } else {
                 base_traversal
             }
@@ -400,7 +400,7 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
             
             // Check if there's a quantifier and wrap accordingly
             if quantifier_pair.is_some() {
-                crate::compiler::ast::Traversal::Optional(Box::new(base_traversal))
+                crate::query::ast::Traversal::Optional(Box::new(base_traversal))
             } else {
                 base_traversal
             }
@@ -415,7 +415,7 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
             if labels.len() == 1 {
                 labels.pop().unwrap()
             } else {
-                crate::compiler::ast::Traversal::Disjunctive(labels)
+                crate::query::ast::Traversal::Disjunctive(labels)
             }
         }
         Rule::incoming_disjunctive => {
@@ -428,7 +428,7 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
             if labels.len() == 1 {
                 labels.pop().unwrap()
             } else {
-                crate::compiler::ast::Traversal::Disjunctive(labels)
+                crate::query::ast::Traversal::Disjunctive(labels)
             }
         }
         Rule::concatenated_traversal => {
@@ -441,7 +441,7 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
             if labels.len() == 1 {
                 labels.pop().unwrap()
             } else {
-                crate::compiler::ast::Traversal::Concatenated(labels)
+                crate::query::ast::Traversal::Concatenated(labels)
             }
         }
         other => {
@@ -451,26 +451,26 @@ fn build_traversal_op(pair: pest::iterators::Pair<Rule>) -> crate::compiler::ast
     }
 }
 
-fn build_traversal_label(pair: pest::iterators::Pair<Rule>, outgoing: bool) -> crate::compiler::ast::Traversal {
+fn build_traversal_label(pair: pest::iterators::Pair<Rule>, outgoing: bool) -> crate::query::ast::Traversal {
     match pair.as_rule() {
         Rule::label => {
-            let matcher = crate::compiler::ast::Matcher::String(pair.as_str().to_string());
+            let matcher = crate::query::ast::Matcher::String(pair.as_str().to_string());
             if outgoing {
-                crate::compiler::ast::Traversal::Outgoing(matcher)
+                crate::query::ast::Traversal::Outgoing(matcher)
             } else {
-                crate::compiler::ast::Traversal::Incoming(matcher)
+                crate::query::ast::Traversal::Incoming(matcher)
             }
         }
         Rule::traversal_regex => {
             let pattern = &pair.as_str()[1..pair.as_str().len()-1];
-            let matcher = crate::compiler::ast::Matcher::Regex {
+            let matcher = crate::query::ast::Matcher::Regex {
                 pattern: pattern.to_string(),
                 regex: std::sync::Arc::new(regex::Regex::new(pattern).unwrap()),
             };
             if outgoing {
-                crate::compiler::ast::Traversal::Outgoing(matcher)
+                crate::query::ast::Traversal::Outgoing(matcher)
             } else {
-                crate::compiler::ast::Traversal::Incoming(matcher)
+                crate::query::ast::Traversal::Incoming(matcher)
             }
         }
         Rule::traversal_label => {

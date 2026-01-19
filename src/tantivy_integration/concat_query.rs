@@ -5,7 +5,7 @@ use tantivy::postings::Postings;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tantivy_fst::Regex;
-use crate::compiler::ast::{Pattern, Constraint, Matcher};
+use crate::query::ast::{Pattern, Constraint, Matcher};
 
 /// Execution plan for anchor-based verification
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ struct RustieConcatWeight {
 
 /// Helper to extract constraints from a Pattern
 fn extract_constraints_from_pattern(pattern: &Pattern) -> Vec<&Constraint> {
-    use crate::compiler::ast::Pattern;
+    use crate::query::ast::Pattern;
     let mut constraints = Vec::new();
     
     match pattern {
@@ -143,7 +143,7 @@ fn compile_constraint_sources(
     default_field: &Field,
     regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
 ) -> TantivyResult<Vec<ConstraintSource>> {
-    use crate::compiler::ast::Pattern;
+    use crate::query::ast::Pattern;
     let mut sources = Vec::new();
     let schema = reader.schema();
     
@@ -1509,7 +1509,7 @@ const MAX_GENERATED_MATCHES: usize = 10_000;
 
 /// Try to match exactly `count` repetitions of a pattern starting at `pos`
 fn try_repetition_count(
-    pattern: &crate::compiler::ast::Pattern,
+    pattern: &crate::query::ast::Pattern,
     count: usize,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     mut pos: usize,
@@ -1533,7 +1533,7 @@ fn try_repetition_count(
 /// Try to match exactly `count` repetitions of a pattern starting at `pos`
 /// Returns (end_position, captures, sub_matches) if successful
 fn try_repetition_count_with_metadata(
-    pattern: &crate::compiler::ast::Pattern,
+    pattern: &crate::query::ast::Pattern,
     count: usize,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     start_pos: usize,
@@ -1584,7 +1584,7 @@ fn try_repetition_count_with_metadata(
 /// - unbounded patterns: uses document length as practical limit
 /// - nested repetitions: handled recursively (Phase A: basic support)
 pub fn generate_all_repetition_matches(
-    pattern: &crate::compiler::ast::Pattern,
+    pattern: &crate::query::ast::Pattern,
     min: usize,
     max: Option<usize>,
     is_greedy: bool,
@@ -1688,7 +1688,7 @@ pub fn generate_all_repetition_matches(
 /// Recursive backtracking matcher for pattern sequences
 /// Returns Some((end_pos, captures)) if sequence matches, None otherwise
 fn match_sequence_recursive(
-    patterns: &[crate::compiler::ast::Pattern],
+    patterns: &[crate::query::ast::Pattern],
     pattern_idx: usize,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize,
@@ -1696,7 +1696,7 @@ fn match_sequence_recursive(
     captures: Vec<crate::types::NamedCapture>,
     iteration_count: &mut usize,
 ) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
-    use crate::compiler::ast::{Pattern, QuantifierKind};
+    use crate::query::ast::{Pattern, QuantifierKind};
     
     // Check iteration limit to prevent exponential blowup
     *iteration_count += 1;
@@ -1785,7 +1785,7 @@ fn match_sequence_recursive(
 
 /// Entry point for backtracking sequence matcher
 fn match_sequence_with_backtracking(
-    patterns: &[crate::compiler::ast::Pattern],
+    patterns: &[crate::query::ast::Pattern],
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     start_pos: usize,
     len: usize,
@@ -1797,7 +1797,7 @@ fn match_sequence_with_backtracking(
 /// Generate all valid sequence matches starting at a given position
 /// Returns all matches with metadata for selection algorithm
 fn generate_all_sequence_matches_recursive(
-    patterns: &[crate::compiler::ast::Pattern],
+    patterns: &[crate::query::ast::Pattern],
     pattern_idx: usize,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize,
@@ -1806,7 +1806,7 @@ fn generate_all_sequence_matches_recursive(
     mut captures: Vec<crate::types::NamedCapture>,
     iteration_count: &mut usize,
 ) -> Vec<crate::types::MatchWithMetadata> {
-    use crate::compiler::ast::{Pattern, QuantifierKind};
+    use crate::query::ast::{Pattern, QuantifierKind};
     use crate::types::MatchWithMetadata;
     
     // Check iteration limit
@@ -1924,7 +1924,7 @@ fn generate_all_sequence_matches_recursive(
 
 /// Generate all valid sequence matches starting at a given position
 pub fn generate_all_sequence_matches(
-    patterns: &[crate::compiler::ast::Pattern],
+    patterns: &[crate::query::ast::Pattern],
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     start_pos: usize,
     len: usize,
@@ -1943,10 +1943,10 @@ pub fn generate_all_sequence_matches(
 }
 
 pub fn find_constraint_spans_in_sequence(
-    pattern: &crate::compiler::ast::Pattern, 
+    pattern: &crate::query::ast::Pattern, 
     field_cache: &std::collections::HashMap<String, Vec<String>>
 ) -> Vec<crate::types::SpanWithCaptures> {
-    use crate::compiler::ast::Pattern;
+    use crate::query::ast::Pattern;
     use crate::tantivy_integration::match_selector::MatchSelector;
     
     if let Pattern::Concatenated(patterns) = pattern {
@@ -1984,11 +1984,11 @@ pub fn find_constraint_spans_in_sequence(
 /// This is the parallel function to matches_pattern_at_position that returns
 /// all matches with metadata for selection algorithm
 pub fn generate_all_matches_at_position(
-    pattern: &crate::compiler::ast::Pattern,
+    pattern: &crate::query::ast::Pattern,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize,
 ) -> Vec<crate::types::MatchWithMetadata> {
-    use crate::compiler::ast::Pattern;
+    use crate::query::ast::Pattern;
     use crate::types::MatchWithMetadata;
     
     match pattern {
@@ -2026,12 +2026,12 @@ pub fn generate_all_matches_at_position(
             all_matches
         }
         Pattern::Repetition { pattern, min, max, kind } => {
-            use crate::compiler::ast::QuantifierKind;
+            use crate::query::ast::QuantifierKind;
             let is_greedy = *kind == QuantifierKind::Greedy;
             generate_all_repetition_matches(pattern, *min, *max, is_greedy, field_cache, pos)
         }
         Pattern::Assertion(assertion) => {
-            use crate::compiler::ast::Assertion;
+            use crate::query::ast::Assertion;
             match assertion {
                 Assertion::PositiveLookahead(child) => {
                     if generate_all_matches_at_position(child, field_cache, pos).is_empty() {
@@ -2087,11 +2087,11 @@ pub fn generate_all_matches_at_position(
 }
 
 fn matches_pattern_at_position(
-    pattern: &crate::compiler::ast::Pattern,
+    pattern: &crate::query::ast::Pattern,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize
 ) -> Option<crate::types::SpanWithCaptures> {
-    use crate::compiler::ast::Pattern;
+    use crate::query::ast::Pattern;
     
     match pattern {
         Pattern::Constraint(constraint) => {
@@ -2122,7 +2122,7 @@ fn matches_pattern_at_position(
             None
         }
         Pattern::Repetition { pattern, min, max, kind } => {
-            use crate::compiler::ast::QuantifierKind;
+            use crate::query::ast::QuantifierKind;
             
             let mut current_pos = pos;
             let mut count = 0;
@@ -2167,7 +2167,7 @@ fn matches_pattern_at_position(
             }
         }
         Pattern::Assertion(assertion) => {
-            use crate::compiler::ast::Assertion;
+            use crate::query::ast::Assertion;
             match assertion {
                 Assertion::PositiveLookahead(child) => {
                     if matches_pattern_at_position(child, field_cache, pos).is_some() {
@@ -2218,11 +2218,11 @@ fn matches_pattern_at_position(
 }
 
 fn matches_constraint_at_position(
-    constraint: &crate::compiler::ast::Constraint,
+    constraint: &crate::query::ast::Constraint,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize
 ) -> bool {
-    use crate::compiler::ast::Constraint;
+    use crate::query::ast::Constraint;
     
     match constraint {
         Constraint::Wildcard => true,
@@ -2272,7 +2272,7 @@ fn matches_constraint_at_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::ast::{Pattern, Constraint, Matcher, QuantifierKind};
+    use crate::query::ast::{Pattern, Constraint, Matcher, QuantifierKind};
     use crate::types::Span;
 
     fn create_field_cache(tokens: Vec<&str>) -> std::collections::HashMap<String, Vec<String>> {

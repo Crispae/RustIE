@@ -117,7 +117,7 @@ impl SpanScorer for DisjunctionSpans {
 /// 1. Tantivy's query engine already found matching documents
 /// 2. We were re-implementing pattern matching logic that Tantivy already did
 /// 3. The pattern's extract_matching_positions method provides the same functionality more efficiently
-pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern, tokens: &[String]) -> Vec<Vec<SpanWithCaptures>> {
+pub fn find_constraint_spans_in_sequence(pattern: &crate::query::ast::Pattern, tokens: &[String]) -> Vec<Vec<SpanWithCaptures>> {
     // This function is deprecated and should not be used
     // Use pattern.extract_matching_positions() instead
     vec![]

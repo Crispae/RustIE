@@ -14,10 +14,14 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
 use tantivy_fst::Regex;
 use rayon::prelude::*;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+use serde_json;
 
-use crate::compiler::ast::FlatPatternStep;
+use crate::query::ast::FlatPatternStep;
 use crate::digraph::zero_copy::ZeroCopyGraph;
-use crate::compiler::ast::{Pattern, Traversal, Matcher, Constraint};
+use crate::query::ast::{Pattern, Traversal, Matcher, Constraint};
 use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
 
 // Global counter for generating unique capture names (much faster than rand)
@@ -48,11 +52,35 @@ static REGEX_EXPANSION_TERMS: AtomicUsize = AtomicUsize::new(0);
 // Helper function for debug logging (formats JSON properly)
 #[inline]
 fn write_debug_log(entry: &str) {
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
-        use std::io::Write;
-        let _ = writeln!(file, "{}", entry);
+    // Debug logging disabled - no-op to avoid file I/O overhead
+    let _ = entry;
+    // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+    //     use std::io::Write;
+    //     let _ = writeln!(file, "{}", entry);
+    // }
+}
+
+// #region agent log
+// Performance instrumentation helper
+#[inline]
+fn perf_log(session_id: &str, run_id: &str, hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    let log_entry = serde_json::json!({
+        "sessionId": session_id,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": timestamp
+    });
+    // Use absolute path to ensure logs are written regardless of working directory
+    let log_path = r"c:\Users\saurav\OneDrive - URV\Escritorio\PARC\tantivy\RustIE\ruste_push\.cursor\debug.log";
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(file, "{}", log_entry);
     }
 }
+// #endregion
 
 /// Edge term requirement for position prefiltering
 #[derive(Clone, Debug)]
@@ -167,14 +195,18 @@ impl<'a> ExactSizeIterator for PositionIterator<'a> {
 trait CandidateDriver: Send {
     /// Current document ID
     fn doc(&self) -> DocId;
-    
+
     /// Advance to the next matching document
     fn advance(&mut self) -> DocId;
-    
+
+    /// Seek to the first document >= target (uses skip lists for O(log n) performance)
+    /// This is the key optimization over sequential advance
+    fn seek(&mut self, target: DocId) -> DocId;
+
     /// If this driver is position-aware (collapsed constraint + edge),
     /// return the positions that matched (intersection). Otherwise None.
     fn matching_positions(&self) -> Option<&[u32]>;
-    
+
     /// Return a lazy iterator over matching positions (Odinson-style)
     /// Returns None if not position-aware
     fn matching_positions_iter(&self) -> Option<PositionIterator<'_>> {
@@ -197,6 +229,10 @@ impl CandidateDriver for EmptyDriver {
     }
 
     fn advance(&mut self) -> DocId {
+        tantivy::TERMINATED
+    }
+
+    fn seek(&mut self, _target: DocId) -> DocId {
         tantivy::TERMINATED
     }
 
@@ -246,16 +282,35 @@ impl CombinedPositionDriver {
                 return self.current_doc;
             }
             
-            // Align to same doc using seek() (uses skip lists)
+            // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
+            // Skip lists have overhead, so for small gaps (<10 docs), sequential advance() is faster
+            const SEEK_THRESHOLD: DocId = 10;
             if d1 < d2 {
-                self.constraint_postings.seek(d2);
+                let gap = d2 - d1;
+                if gap >= SEEK_THRESHOLD && self.constraint_postings.doc() < d2 {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.constraint_postings.seek(d2);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.constraint_postings.advance();
+                }
                 continue;
             } else if d2 < d1 {
-                self.edge_postings.seek(d1);
+                let gap = d1 - d2;
+                if gap >= SEEK_THRESHOLD && self.edge_postings.doc() < d1 {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.edge_postings.seek(d1);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.edge_postings.advance();
+                }
                 continue;
             }
             
             // Same doc - compute position intersection
+            // #region agent log
+            let pos_intersect_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            // #endregion
             self.constraint_buf.clear();
             self.edge_buf.clear();
             self.constraint_postings.positions(&mut self.constraint_buf);
@@ -263,6 +318,10 @@ impl CombinedPositionDriver {
             
             self.intersection.clear();
             intersect_sorted_into(&self.constraint_buf, &self.edge_buf, &mut self.intersection);
+            // #region agent log
+            let pos_intersect_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            perf_log("debug-session", "run1", "H6", "graph_traversal.rs:315", "position_intersection_time_advance", serde_json::json!({"doc": d1, "constraint_pos_count": self.constraint_buf.len(), "edge_pos_count": self.edge_buf.len(), "intersection_count": self.intersection.len(), "time_ms": pos_intersect_end - pos_intersect_start}));
+            // #endregion
             
             let doc = d1;
             
@@ -283,13 +342,149 @@ impl CandidateDriver for CombinedPositionDriver {
     fn doc(&self) -> DocId {
         self.current_doc
     }
-    
+
     fn advance(&mut self) -> DocId {
         self.advance_to_next_match()
     }
-    
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        // If already at or past target, return current
+        if self.current_doc != tantivy::TERMINATED && self.current_doc >= target {
+            return self.current_doc;
+        }
+
+        // OPTIMIZATION: Adaptive seeking - use seek() for large gaps, advance() for small gaps
+        // Skip lists have overhead, so for small gaps (<10 docs), sequential advance() is faster
+        const SEEK_THRESHOLD: DocId = 10;
+        // #region agent log
+        let constraint_doc_before = self.constraint_postings.doc();
+        let edge_doc_before = self.edge_postings.doc();
+        let constraint_gap = if constraint_doc_before < target { target - constraint_doc_before } else { 0 };
+        let edge_gap = if edge_doc_before < target { target - edge_doc_before } else { 0 };
+        perf_log("debug-session", "run1", "H1", "graph_traversal.rs:315", "combined_driver_seek_start", serde_json::json!({"target": target, "constraint_doc": constraint_doc_before, "edge_doc": edge_doc_before, "constraint_gap": constraint_gap, "edge_gap": edge_gap}));
+        // #endregion
+        if self.constraint_postings.doc() < target {
+            let gap = target - self.constraint_postings.doc();
+            if gap >= SEEK_THRESHOLD {
+                // Large gap: use skip-list seeking (O(log n))
+                self.constraint_postings.seek(target);
+            } else {
+                // Small gap: use sequential advance() (O(1) for small gaps)
+                while self.constraint_postings.doc() < target {
+                    self.constraint_postings.advance();
+                }
+            }
+        }
+        if self.edge_postings.doc() < target {
+            let gap = target - self.edge_postings.doc();
+            if gap >= SEEK_THRESHOLD {
+                // Large gap: use skip-list seeking (O(log n))
+                self.edge_postings.seek(target);
+            } else {
+                // Small gap: use sequential advance() (O(1) for small gaps)
+                while self.edge_postings.doc() < target {
+                    self.edge_postings.advance();
+                }
+            }
+        }
+        // #region agent log
+        let constraint_doc_after = self.constraint_postings.doc();
+        let edge_doc_after = self.edge_postings.doc();
+        perf_log("debug-session", "run1", "H1", "graph_traversal.rs:320", "combined_driver_seek_end", serde_json::json!({"constraint_doc_after": constraint_doc_after, "edge_doc_after": edge_doc_after}));
+        // #endregion
+
+        // Now find the next matching document (with position intersection)
+        self.seek_to_next_match()
+    }
+
     fn matching_positions(&self) -> Option<&[u32]> {
         Some(&self.intersection)
+    }
+}
+
+impl CombinedPositionDriver {
+    /// Internal seek that finds next doc >= current with overlapping positions
+    /// Used after seeking both postings to a target
+    fn seek_to_next_match(&mut self) -> DocId {
+        loop {
+            let d1 = self.constraint_postings.doc();
+            let d2 = self.edge_postings.doc();
+
+            // If either is exhausted, we're done
+            if d1 == tantivy::TERMINATED || d2 == tantivy::TERMINATED {
+                self.current_doc = tantivy::TERMINATED;
+                return self.current_doc;
+            }
+
+            // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
+            // Skip lists have overhead, so for small gaps (<10 docs), sequential advance() is faster
+            const SEEK_THRESHOLD: DocId = 10;
+            if d1 < d2 {
+                let gap = d2 - d1;
+                if gap >= SEEK_THRESHOLD && self.constraint_postings.doc() < d2 {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.constraint_postings.seek(d2);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.constraint_postings.advance();
+                }
+                continue;
+            } else if d2 < d1 {
+                let gap = d1 - d2;
+                if gap >= SEEK_THRESHOLD && self.edge_postings.doc() < d1 {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.edge_postings.seek(d1);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.edge_postings.advance();
+                }
+                continue;
+            }
+
+            // Same doc - compute position intersection
+            // #region agent log
+            let pos_intersect_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            // #endregion
+            self.constraint_buf.clear();
+            self.edge_buf.clear();
+            self.constraint_postings.positions(&mut self.constraint_buf);
+            self.edge_postings.positions(&mut self.edge_buf);
+
+            self.intersection.clear();
+            intersect_sorted_into(&self.constraint_buf, &self.edge_buf, &mut self.intersection);
+            // #region agent log
+            let pos_intersect_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            perf_log("debug-session", "run1", "H6", "graph_traversal.rs:442", "position_intersection_time", serde_json::json!({"doc": d1, "constraint_pos_count": self.constraint_buf.len(), "edge_pos_count": self.edge_buf.len(), "intersection_count": self.intersection.len(), "time_ms": pos_intersect_end - pos_intersect_start}));
+            // #endregion
+
+            let doc = d1;
+
+            // Advance both for next iteration
+            // #region agent log
+            let constraint_doc_before = self.constraint_postings.doc();
+            let edge_doc_before = self.edge_postings.doc();
+            perf_log("debug-session", "run1", "H1", "graph_traversal.rs:371", "advance_call_in_seek_to_next_match_v2", serde_json::json!({"constraint_doc": constraint_doc_before, "edge_doc": edge_doc_before, "doc": doc}));
+            // #endregion
+            self.constraint_postings.advance();
+            self.edge_postings.advance();
+            // #region agent log
+            let constraint_doc_after = self.constraint_postings.doc();
+            let edge_doc_after = self.edge_postings.doc();
+            let constraint_gap = if constraint_doc_after != tantivy::TERMINATED && constraint_doc_before != tantivy::TERMINATED {
+                constraint_doc_after - constraint_doc_before
+            } else { 0 };
+            let edge_gap = if edge_doc_after != tantivy::TERMINATED && edge_doc_before != tantivy::TERMINATED {
+                edge_doc_after - edge_doc_before
+            } else { 0 };
+            perf_log("debug-session", "run1", "H1", "graph_traversal.rs:373", "advance_result_in_seek_to_next_match_v2", serde_json::json!({"constraint_doc_after": constraint_doc_after, "edge_doc_after": edge_doc_after, "constraint_gap": constraint_gap, "edge_gap": edge_gap}));
+            // #endregion
+
+            if !self.intersection.is_empty() {
+                self.current_doc = doc;
+                return self.current_doc;
+            }
+            // No position overlap - continue to next doc
+        }
     }
 }
 
@@ -573,44 +768,70 @@ impl UnionPositionsIterator {
     
     fn advance_to_next_doc(&mut self) -> DocId {
         self.merged_positions.clear();
-        
+
         if self.heap.is_empty() {
             self.current_doc = tantivy::TERMINATED;
             return self.current_doc;
         }
-        
+
         // Get minimum doc
         let min_doc = self.heap.peek().unwrap().doc;
         self.current_doc = min_doc;
-        
+
         // Collect positions from all postings at min_doc directly into merged_positions
         while let Some(entry) = self.heap.peek() {
             if entry.doc != min_doc {
                 break;
             }
-            
+
             let entry = self.heap.pop().unwrap();
             let postings = &mut self.postings[entry.idx];
-            
+
             // Get positions into temp buffer, then extend merged_positions
             self.position_buf.clear();
             postings.positions(&mut self.position_buf);
             self.merged_positions.extend_from_slice(&self.position_buf);
-            
+
             // Advance this postings and re-insert if not exhausted
             let next_doc = postings.advance();
             if next_doc != tantivy::TERMINATED {
                 self.heap.push(PostingsEntry { doc: next_doc, idx: entry.idx });
             }
         }
-        
+
         // Sort and dedup the merged positions
         if !self.merged_positions.is_empty() {
             self.merged_positions.sort_unstable();
             self.merged_positions.dedup();
         }
-        
+
         self.current_doc
+    }
+
+    /// Seek to the first document >= target
+    /// Uses seek() on underlying postings for O(log n) skip-list based seeking
+    fn seek_to_doc(&mut self, target: DocId) -> DocId {
+        // If already at or past target, return current
+        if self.current_doc != tantivy::TERMINATED && self.current_doc >= target {
+            return self.current_doc;
+        }
+
+        // Clear and rebuild heap by seeking all postings to target
+        self.heap.clear();
+        for (idx, p) in self.postings.iter_mut().enumerate() {
+            // CRITICAL: Only seek if current doc < target (tantivy requires self.doc() <= target)
+            let doc = if p.doc() < target {
+                p.seek(target)
+            } else {
+                p.doc()
+            };
+            if doc != tantivy::TERMINATED {
+                self.heap.push(PostingsEntry { doc, idx });
+            }
+        }
+
+        // Advance to next valid doc (which will be >= target)
+        self.advance_to_next_doc()
     }
 }
 
@@ -637,23 +858,41 @@ impl UnionAndIntersectDriver {
     }
     
     fn advance_to_next_match(&mut self) -> DocId {
+        // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
         loop {
             let d1 = self.lhs.doc();
             let d2 = self.rhs.doc();
-            
+
             if d1 == tantivy::TERMINATED || d2 == tantivy::TERMINATED {
                 self.current_doc = tantivy::TERMINATED;
                 return self.current_doc;
             }
-            
+
+            // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
+            // Skip lists have overhead, so for small gaps (<10 docs), sequential advance() is faster
+            const SEEK_THRESHOLD: DocId = 10;
             if d1 < d2 {
-                self.lhs.advance_to_next_doc();
+                let gap = d2 - d1;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.lhs.seek_to_doc(d2);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.lhs.advance_to_next_doc();
+                }
                 continue;
             } else if d2 < d1 {
-                self.rhs.advance_to_next_doc();
+                let gap = d1 - d2;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.rhs.seek_to_doc(d1);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.rhs.advance_to_next_doc();
+                }
                 continue;
             }
-            
+
             // Same doc - intersect positions
             self.intersection.clear();
             intersect_sorted_into(
@@ -661,13 +900,13 @@ impl UnionAndIntersectDriver {
                 self.rhs.positions(),
                 &mut self.intersection
             );
-            
+
             let doc = d1;
-            
+
             // Advance both for next iteration
             self.lhs.advance_to_next_doc();
             self.rhs.advance_to_next_doc();
-            
+
             if !self.intersection.is_empty() {
                 self.current_doc = doc;
                 return self.current_doc;
@@ -681,13 +920,87 @@ impl CandidateDriver for UnionAndIntersectDriver {
     fn doc(&self) -> DocId {
         self.current_doc
     }
-    
+
     fn advance(&mut self) -> DocId {
         self.advance_to_next_match()
     }
-    
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        // If already at or past target, return current
+        if self.current_doc != tantivy::TERMINATED && self.current_doc >= target {
+            return self.current_doc;
+        }
+
+        // OPTIMIZATION: Seek both union iterators to target (O(log n) per postings)
+        self.lhs.seek_to_doc(target);
+        self.rhs.seek_to_doc(target);
+
+        // Find next doc with position intersection
+        self.seek_to_next_match()
+    }
+
     fn matching_positions(&self) -> Option<&[u32]> {
         Some(&self.intersection)
+    }
+}
+
+impl UnionAndIntersectDriver {
+    /// Internal seek that finds next doc >= current with overlapping positions
+    fn seek_to_next_match(&mut self) -> DocId {
+        loop {
+            let d1 = self.lhs.doc();
+            let d2 = self.rhs.doc();
+
+            if d1 == tantivy::TERMINATED || d2 == tantivy::TERMINATED {
+                self.current_doc = tantivy::TERMINATED;
+                return self.current_doc;
+            }
+
+            // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
+            // Skip lists have overhead, so for small gaps (<10 docs), sequential advance() is faster
+            const SEEK_THRESHOLD: DocId = 10;
+            if d1 < d2 {
+                let gap = d2 - d1;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.lhs.seek_to_doc(d2);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.lhs.advance_to_next_doc();
+                }
+                continue;
+            } else if d2 < d1 {
+                let gap = d1 - d2;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.rhs.seek_to_doc(d1);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    self.rhs.advance_to_next_doc();
+                }
+                continue;
+            }
+
+            // Same doc - intersect positions
+            self.intersection.clear();
+            intersect_sorted_into(
+                self.lhs.positions(),
+                self.rhs.positions(),
+                &mut self.intersection
+            );
+
+            let doc = d1;
+
+            // Advance both for next iteration
+            self.lhs.advance_to_next_doc();
+            self.rhs.advance_to_next_doc();
+
+            if !self.intersection.is_empty() {
+                self.current_doc = doc;
+                return self.current_doc;
+            }
+            // No position overlap - continue
+        }
     }
 }
 
@@ -704,9 +1017,9 @@ pub struct OptimizedGraphTraversalQuery {
     dependencies_binary_field: Field,
     incoming_edges_field: Field,
     outgoing_edges_field: Field,
-    traversal: crate::compiler::ast::Traversal,
-    src_pattern: crate::compiler::ast::Pattern,
-    dst_pattern: crate::compiler::ast::Pattern,
+    traversal: crate::query::ast::Traversal,
+    src_pattern: crate::query::ast::Pattern,
+    dst_pattern: crate::query::ast::Pattern,
     /// Collapse spec for src constraint (first) - enables CombinedPositionDriver
     src_collapse: Option<CollapsedSpec>,
     /// Collapse spec for dst constraint (last) - enables CombinedPositionDriver
@@ -724,9 +1037,9 @@ impl OptimizedGraphTraversalQuery {
         dependencies_binary_field: Field,
         incoming_edges_field: Field,
         outgoing_edges_field: Field,
-        traversal: crate::compiler::ast::Traversal,
-        src_pattern: crate::compiler::ast::Pattern,
-        dst_pattern: crate::compiler::ast::Pattern,
+        traversal: crate::query::ast::Traversal,
+        src_pattern: crate::query::ast::Pattern,
+        dst_pattern: crate::query::ast::Pattern,
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
     ) -> Self {
@@ -802,16 +1115,16 @@ impl tantivy::query::QueryClone for OptimizedGraphTraversalQuery {
 /// No BooleanQuery weights - candidate generation driven exclusively by CombinedPositionDriver.
 struct OptimizedGraphTraversalWeight {
     #[allow(dead_code)]
-    traversal: crate::compiler::ast::Traversal,
+    traversal: crate::query::ast::Traversal,
     dependencies_binary_field: Field,
     #[allow(dead_code)]
     incoming_edges_field: Field,
     #[allow(dead_code)]
     outgoing_edges_field: Field,
     #[allow(dead_code)]
-    src_pattern: crate::compiler::ast::Pattern,
+    src_pattern: crate::query::ast::Pattern,
     #[allow(dead_code)]
-    dst_pattern: crate::compiler::ast::Pattern,
+    dst_pattern: crate::query::ast::Pattern,
     /// Pre-computed flattened pattern steps (cached once per query)
     flat_steps: Vec<FlatPatternStep>,
     /// Position prefilter plan for edge-based position restrictions
@@ -971,37 +1284,45 @@ impl Weight for OptimizedGraphTraversalWeight {
         // Odinson-style: Build drivers exclusively from collapse specs
         // No GenericDriver fallback - use EmptyDriver when postings unavailable
 
+        // #region agent log
         let src_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.src_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
+                perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1148", "src_driver_type", serde_json::json!({"type": "CombinedPositionDriver"}));
                 driver
             } else {
+                perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1151", "src_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "build_combined_driver_failed"}));
                 Box::new(EmptyDriver)
             }
         } else {
+            perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1154", "src_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "no_src_collapse"}));
             Box::new(EmptyDriver)
         };
 
         let dst_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.dst_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
+                perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1158", "dst_driver_type", serde_json::json!({"type": "CombinedPositionDriver"}));
                 driver
             } else {
+                perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1161", "dst_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "build_combined_driver_failed"}));
                 Box::new(EmptyDriver)
             }
         } else {
+            perf_log("debug-session", "run1", "H3", "graph_traversal.rs:1164", "dst_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "no_dst_collapse"}));
             Box::new(EmptyDriver)
         };
+        // #endregion
 
         // Cache the store reader (created once, reused for all documents in this segment)
         let store_reader = reader.get_store_reader(1)?;
 
         // Pre-extract constraint field names from flat_steps (computed once, not per document)
         // Helper to unwrap NamedCapture/Repetition to get field name
-        fn unwrap_pattern_for_field_name(pat: &crate::compiler::ast::Pattern) -> String {
-            use crate::compiler::ast::Pattern;
+        fn unwrap_pattern_for_field_name(pat: &crate::query::ast::Pattern) -> String {
+            use crate::query::ast::Pattern;
             match pat {
                 Pattern::NamedCapture { pattern, .. } => unwrap_pattern_for_field_name(pattern),
                 Pattern::Repetition { pattern, .. } => unwrap_pattern_for_field_name(pattern),
-                Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, .. }) => name.clone(),
+                Pattern::Constraint(crate::query::ast::Constraint::Field { name, .. }) => name.clone(),
                 _ => "word".to_string(),
             }
         }
@@ -1141,7 +1462,7 @@ pub struct OptimizedGraphTraversalScorer {
     /// Destination candidate driver (may be CombinedPositionDriver or GenericDriver)
     dst_driver: Box<dyn CandidateDriver>,
     #[allow(dead_code)]
-    traversal: crate::compiler::ast::Traversal,
+    traversal: crate::query::ast::Traversal,
     dependencies_binary_field: Field,
     reader: SegmentReader,
     /// Cached store reader (created once, reused for all documents)
@@ -1150,9 +1471,9 @@ pub struct OptimizedGraphTraversalScorer {
     current_matches: Vec<(DocId, Score)>,
     match_index: usize,
     #[allow(dead_code)]
-    src_pattern: crate::compiler::ast::Pattern,
+    src_pattern: crate::query::ast::Pattern,
     #[allow(dead_code)]
-    dst_pattern: crate::compiler::ast::Pattern,
+    dst_pattern: crate::query::ast::Pattern,
     current_doc_matches: Vec<crate::types::SpanWithCaptures>,
     /// Boost factor from weight creation
     boost: Score,
@@ -1303,121 +1624,225 @@ impl Scorer for OptimizedGraphTraversalScorer {
 }
 
 impl tantivy::DocSet for OptimizedGraphTraversalScorer {
-    
+
     fn advance(&mut self) -> DocId {
-        
+        // OPTIMIZATION: Use seek-based intersection like Tantivy's Intersection
+        // This uses skip lists to jump over non-matching documents instead of
+        // advancing one document at a time.
+
+        // #region agent log
+        let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        // #endregion
+
+        // First, get next candidate
+        // OPTIMIZATION: For gap of 1, use advance() directly (faster than seek())
+        // For larger gaps or initial seek, use seek()
+        let current_doc = self.doc();
+        // #region agent log
+        let seek_target = if current_doc == tantivy::TERMINATED { 0 } else { current_doc.saturating_add(1) };
+        perf_log("debug-session", "run1", "H1", "graph_traversal.rs:1488", "advance_start", serde_json::json!({"current_doc": current_doc, "seek_target": seek_target}));
+        // #endregion
+        let mut candidate = if current_doc == tantivy::TERMINATED {
+            // Initial seek from start
+            self.src_driver.seek(0)
+        } else {
+            // For gap of 1, advance() is faster than seek() due to less overhead
+            self.src_driver.advance()
+        };
+
         loop {
-            // Use drivers instead of scorers (Odinson-style optimization)
-            let src_doc = self.src_driver.doc();
-            let dst_doc = self.dst_driver.doc();
-
-            // If either driver is exhausted, we're done
-            if src_doc == tantivy::TERMINATED || dst_doc == tantivy::TERMINATED {
+            // If src is exhausted, we're done
+            if candidate == tantivy::TERMINATED {
                 self.current_doc = None;
-                debug!("advance() terminated: src_doc = {}, dst_doc = {}", src_doc, dst_doc);
-
-                // Log final stats when driver is exhausted (using module-level statics)
-                let call_num = CALL_COUNT.load(Ordering::Relaxed);
-                if call_num == 0 {
-                    log::warn!(
-                        "NO CANDIDATES FOUND! Drivers returned 0 matching documents. \
-                        This usually means the index was created with the OLD schema. \
-                        You need to RE-INDEX your documents with the new position-aware schema."
-                    );
-                }
-                if call_num > 0 {
-                    let deser_count = GRAPH_DESER_COUNT.load(Ordering::Relaxed);
-                    let skipped_count = GRAPH_DESER_SKIPPED.load(Ordering::Relaxed);
-                    let skip_rate = (skipped_count as f64 / call_num as f64) * 100.0;
-                    
-                    let prefilter_docs = PREFILTER_DOCS.load(Ordering::Relaxed);
-                    let prefilter_killed = PREFILTER_KILLED.load(Ordering::Relaxed);
-                    let prefilter_kill_rate = if prefilter_docs > 0 {
-                        (prefilter_killed as f64 / prefilter_docs as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    
-                    let allowed_pos_sum = PREFILTER_ALLOWED_POS_SUM.load(Ordering::Relaxed);
-                    let allowed_pos_count = PREFILTER_ALLOWED_POS_COUNT.load(Ordering::Relaxed);
-                    let avg_allowed_pos = if allowed_pos_count > 0 {
-                        allowed_pos_sum as f64 / allowed_pos_count as f64
-                    } else {
-                        0.0
-                    };
-                    
-                    let src_driver_docs = SRC_DRIVER_DOCS.load(Ordering::Relaxed);
-                    let dst_driver_docs = DST_DRIVER_DOCS.load(Ordering::Relaxed);
-                    let alignment_docs = DRIVER_ALIGNMENT_DOCS.load(Ordering::Relaxed);
-                    let intersection_sum = DRIVER_INTERSECTION_SUM.load(Ordering::Relaxed);
-                    let intersection_count = DRIVER_INTERSECTION_COUNT.load(Ordering::Relaxed);
-                    let avg_intersection = if intersection_count > 0 {
-                        intersection_sum as f64 / intersection_count as f64
-                    } else {
-                        0.0
-                    };
-                    
-                    let prefilter_skipped_collapsed = PREFILTER_SKIPPED_ALL_COLLAPSED.load(Ordering::Relaxed);
-                    let token_extraction_skipped = TOKEN_EXTRACTION_SKIPPED.load(Ordering::Relaxed);
-                    
-                    // Logging removed for performance
-                }
-                
+                self.log_final_stats();
                 return tantivy::TERMINATED;
             }
-            debug!("advance() considering src_doc = {}, dst_doc = {}", src_doc, dst_doc);
-            if src_doc < dst_doc {
-                SRC_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
-                self.src_driver.advance();
-            } else if dst_doc < src_doc {
-                DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
-                self.dst_driver.advance();
-            } else {
-                // src_doc == dst_doc: both drivers have matches in this doc
-                let doc_id = src_doc;
-                DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
-                
-                // Track intersection sizes for metrics
-                if let Some(src_pos) = self.src_driver.matching_positions() {
-                    DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
-                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(dst_pos) = self.dst_driver.matching_positions() {
-                    DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
-                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                
-                debug!("advance() found candidate doc_id = {}", doc_id);
-                if self.check_graph_traversal(doc_id) {
-                    debug!("advance() doc_id {} MATCHED graph traversal", doc_id);
-                    self.current_doc = Some(doc_id);
-                    // Compute Odinson-style score based on span widths and match count
-                    let score = self.compute_odinson_score();
-                    debug!("Odinson-style score for doc_id {}: {}", doc_id, score);
-                    self.current_matches.push((doc_id, score));
-                    self.match_index = self.current_matches.len() - 1;
-                    // Advance both drivers for next call
-                    self.src_driver.advance();
-                    self.dst_driver.advance();
-                    return doc_id;
+
+            // OPTIMIZATION: Adaptive alignment - use seek() for large gaps, advance() for small gaps
+            // Check current doc first to determine gap size
+            let dst_current = self.dst_driver.doc();
+            // #region agent log
+            let dst_gap = if dst_current < candidate { candidate - dst_current } else { 0 };
+            perf_log("debug-session", "run1", "H1", "graph_traversal.rs:1505", "dst_seek_call", serde_json::json!({"candidate": candidate, "dst_current": dst_current, "dst_gap": dst_gap}));
+            // #endregion
+            const SEEK_THRESHOLD: DocId = 10;
+            let dst_doc = if dst_current < candidate {
+                let gap = candidate - dst_current;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    self.dst_driver.seek(candidate)
                 } else {
-                    debug!("advance() doc_id {} did NOT match graph traversal", doc_id);
-                    // No match, advance both drivers
-                    self.src_driver.advance();
-                    self.dst_driver.advance();
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    let mut doc = dst_current;
+                    while doc < candidate {
+                        doc = self.dst_driver.advance();
+                        if doc == tantivy::TERMINATED {
+                            break;
+                        }
+                    }
+                    doc
                 }
+            } else {
+                // Already at or past candidate
+                dst_current
+            };
+
+            if dst_doc == tantivy::TERMINATED {
+                self.current_doc = None;
+                self.log_final_stats();
+                return tantivy::TERMINATED;
             }
+
+            if dst_doc > candidate {
+                // dst is ahead - align src to dst's position
+                DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
+                // #region agent log
+                let gap = dst_doc - candidate;
+                perf_log("debug-session", "run1", "H2", "graph_traversal.rs:1516", "src_seek_after_dst_ahead", serde_json::json!({"candidate": candidate, "dst_doc": dst_doc, "gap": gap}));
+                // #endregion
+                // OPTIMIZATION: Adaptive seeking - use seek() for large gaps, advance() for small gaps
+                const SEEK_THRESHOLD: DocId = 10;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    candidate = self.src_driver.seek(dst_doc);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    while candidate < dst_doc {
+                        candidate = self.src_driver.advance();
+                        if candidate == tantivy::TERMINATED {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // dst_doc == candidate: Both drivers at same document
+            debug_assert_eq!(candidate, dst_doc);
+            DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
+
+            // Track intersection sizes for metrics
+            if let Some(src_pos) = self.src_driver.matching_positions() {
+                DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
+                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(dst_pos) = self.dst_driver.matching_positions() {
+                DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
+                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Phase 2: Check graph traversal (only for candidate documents)
+            // #region agent log
+            let graph_check_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            // #endregion
+            if self.check_graph_traversal(candidate) {
+                // #region agent log
+                let graph_check_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+                perf_log("debug-session", "run1", "H5", "graph_traversal.rs:1535", "graph_traversal_match", serde_json::json!({"candidate": candidate, "check_time_ms": graph_check_end - graph_check_start}));
+                // #endregion
+                self.current_doc = Some(candidate);
+                let score = self.compute_odinson_score();
+                self.current_matches.push((candidate, score));
+                self.match_index = self.current_matches.len() - 1;
+                // #region agent log
+                let total_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() - start_time;
+                perf_log("debug-session", "run1", "H1", "graph_traversal.rs:1540", "advance_success", serde_json::json!({"candidate": candidate, "total_time_ms": total_time}));
+                // #endregion
+                return candidate;
+            }
+            // #region agent log
+            let graph_check_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+            perf_log("debug-session", "run1", "H5", "graph_traversal.rs:1543", "graph_traversal_no_match", serde_json::json!({"candidate": candidate, "check_time_ms": graph_check_end - graph_check_start}));
+            // #endregion
+
+            // No match - advance to next candidate
+            // For gap of 1, advance() is faster than seek() due to skip-list overhead
+            // #region agent log
+            perf_log("debug-session", "run1", "H1", "graph_traversal.rs:1545", "src_advance_next_after_no_match", serde_json::json!({"candidate": candidate}));
+            // #endregion
+            candidate = self.src_driver.advance();
+        }
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        // OPTIMIZATION: Implement seek for TwoPhaseIterator support
+        let current = self.doc();
+        if current != tantivy::TERMINATED && current >= target {
+            return current;
+        }
+
+        // Seek src_driver to target
+        let mut candidate = self.src_driver.seek(target);
+
+        loop {
+            if candidate == tantivy::TERMINATED {
+                self.current_doc = None;
+                return tantivy::TERMINATED;
+            }
+
+            let dst_doc = self.dst_driver.seek(candidate);
+
+            if dst_doc == tantivy::TERMINATED {
+                self.current_doc = None;
+                return tantivy::TERMINATED;
+            }
+
+            if dst_doc > candidate {
+                // OPTIMIZATION: Adaptive seeking - use seek() for large gaps, advance() for small gaps
+                const SEEK_THRESHOLD: DocId = 10;
+                let gap = dst_doc - candidate;
+                if gap >= SEEK_THRESHOLD {
+                    // Large gap: use skip-list seeking (O(log n))
+                    candidate = self.src_driver.seek(dst_doc);
+                } else {
+                    // Small gap: use sequential advance() (O(1) for small gaps)
+                    while candidate < dst_doc {
+                        candidate = self.src_driver.advance();
+                        if candidate == tantivy::TERMINATED {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Both at same doc - check graph
+            if self.check_graph_traversal(candidate) {
+                self.current_doc = Some(candidate);
+                let score = self.compute_odinson_score();
+                self.current_matches.push((candidate, score));
+                self.match_index = self.current_matches.len() - 1;
+                return candidate;
+            }
+
+            // Advance to next candidate
+            // For gap of 1, advance() is faster than seek() due to skip-list overhead
+            candidate = self.src_driver.advance();
         }
     }
 
     fn doc(&self) -> DocId {
-        let doc = self.current_doc.unwrap_or(tantivy::TERMINATED);
-        doc
+        self.current_doc.unwrap_or(tantivy::TERMINATED)
     }
 
     fn size_hint(&self) -> u32 {
-        // Not meaningful in this mode
+        // Estimate based on smaller driver
         0
+    }
+}
+
+impl OptimizedGraphTraversalScorer {
+    /// Log final statistics when iteration completes
+    fn log_final_stats(&self) {
+        let call_num = CALL_COUNT.load(Ordering::Relaxed);
+        if call_num == 0 {
+            log::warn!(
+                "NO CANDIDATES FOUND! Drivers returned 0 matching documents. \
+                This usually means the index was created with the OLD schema. \
+                You need to RE-INDEX your documents with the new position-aware schema."
+            );
+        }
+        // Detailed stats available via GraphTraversalStats::get()
     }
 }
 
@@ -1579,21 +2004,21 @@ fn process_single_start_position(
 
 /// Check if a constraint is exact and can skip matches() when prefilter confirms
 /// Only simple Field { Matcher::String } constraints are skippable
-fn is_exact_skippable(constraint: &crate::compiler::ast::Constraint) -> bool {
+fn is_exact_skippable(constraint: &crate::query::ast::Constraint) -> bool {
     match constraint {
-        crate::compiler::ast::Constraint::Field { 
-            matcher: crate::compiler::ast::Matcher::String(_), 
+        crate::query::ast::Constraint::Field { 
+            matcher: crate::query::ast::Matcher::String(_), 
             .. 
         } => true,
-        crate::compiler::ast::Constraint::Field {
-            matcher: crate::compiler::ast::Matcher::Regex { .. },
+        crate::query::ast::Constraint::Field {
+            matcher: crate::query::ast::Matcher::Regex { .. },
             ..
         } => false,  // Regex constraints need actual matching
-        crate::compiler::ast::Constraint::Negated(_) 
-        | crate::compiler::ast::Constraint::Conjunctive(_) 
-        | crate::compiler::ast::Constraint::Disjunctive(_) 
-        | crate::compiler::ast::Constraint::Wildcard 
-        | crate::compiler::ast::Constraint::Fuzzy { .. } => false,
+        crate::query::ast::Constraint::Negated(_) 
+        | crate::query::ast::Constraint::Conjunctive(_) 
+        | crate::query::ast::Constraint::Disjunctive(_) 
+        | crate::query::ast::Constraint::Wildcard 
+        | crate::query::ast::Constraint::Fuzzy { .. } => false,
     }
 }
 
@@ -2100,7 +2525,7 @@ impl OptimizedGraphTraversalScorer {
                 
                 let is_wildcard = matches!(
                     unwrapped,
-                    Pattern::Constraint(crate::compiler::ast::Constraint::Wildcard)
+                    Pattern::Constraint(crate::query::ast::Constraint::Wildcard)
                 );
 
                 // Odinson position handoff: check if we can use driver positions from allowed_positions
@@ -2169,25 +2594,28 @@ impl OptimizedGraphTraversalScorer {
         }
         
         // #region agent log
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
-            use std::io::Write;
-            let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2157","message":"Checking lazy iterator availability","data":{{"doc_id":{},"src_positions_count":{},"has_driver_iter":{}}},"timestamp":{}}}"#, doc_id, src_positions_slice.len(), self.src_driver.matching_positions_iter().is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-        }
+        // Debug logging disabled
+        // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+        //     use std::io::Write;
+        //     let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2157","message":"Checking lazy iterator availability","data":{{"doc_id":{},"src_positions_count":{},"has_driver_iter":{}}},"timestamp":{}}}"#, doc_id, src_positions_slice.len(), self.src_driver.matching_positions_iter().is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+        // }
         // #endregion
         
         // Create lazy iterator from driver positions if available (avoid materialization)
         // Otherwise use cached positions as iterator
         let src_positions_iter: Box<dyn Iterator<Item = usize> + '_> = if let Some(iter) = self.src_driver.matching_positions_iter() {
             // #region agent log
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2164","message":"Using lazy iterator from driver","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
+            // Debug logging disabled
+            // let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            // write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2164","message":"Using lazy iterator from driver","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
             // #endregion
             // Use lazy iterator from driver (no materialization) - Odinson-style
             Box::new(iter.map(|p| p as usize))
         } else {
             // #region agent log
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-            write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2168","message":"Using fallback cached positions","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
+            // Debug logging disabled
+            // let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            // write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2168","message":"Using fallback cached positions","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
             // #endregion
             // Fallback to cached positions (already materialized, but use as iterator)
             Box::new(src_positions_slice.iter().copied())
@@ -2213,16 +2641,18 @@ impl OptimizedGraphTraversalScorer {
                 // Check if we should use parallel processing
                 if estimated_size >= PARALLEL_START_POSITIONS_THRESHOLD {
                     // #region agent log
-                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2190","message":"Using parallel path - materializing positions","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
+                    // Debug logging disabled
+                    // let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    // write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2190","message":"Using parallel path - materializing positions","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
                     // #endregion
                     // Materialize positions only for parallel processing (required by rayon)
                     let src_positions: Vec<usize> = src_positions_iter.collect();
                     // #region agent log
-                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
-                        use std::io::Write;
-                        let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H4","location":"graph_traversal.rs:2192","message":"Materialized positions for parallel processing","data":{{"doc_id":{},"materialized_count":{}}},"timestamp":{}}}"#, doc_id, src_positions.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-                    }
+                    // Debug logging disabled
+                    // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+                    //     use std::io::Write;
+                    //     let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H4","location":"graph_traversal.rs:2192","message":"Materialized positions for parallel processing","data":{{"doc_id":{},"materialized_count":{}}},"timestamp":{}}}"#, doc_id, src_positions.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+                    // }
                     // #endregion
                     
                     // Pre-load all tokens for thread-safety before parallel processing
@@ -2257,8 +2687,9 @@ impl OptimizedGraphTraversalScorer {
                     }
                 } else {
                     // #region agent log
-                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2224","message":"Using sequential lazy path","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
+                    // Debug logging disabled
+                    // let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    // write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2224","message":"Using sequential lazy path","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
                     // #endregion
                     // Sequential processing with lazy iterator (Odinson-style one-step approach)
                     let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
@@ -2316,18 +2747,20 @@ impl OptimizedGraphTraversalScorer {
                         }
                         matches_per_position.push(matches_this_position);
                         // #region agent log
-                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
-                            use std::io::Write;
-                            let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2","location":"graph_traversal.rs:2246","message":"Processed source position","data":{{"doc_id":{},"src_pos":{},"matches_found":{},"total_positions_processed":{}}},"timestamp":{}}}"#, doc_id, src_pos, matches_this_position, positions_processed, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
-                        }
+                        // Debug logging disabled
+                        // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+                        //     use std::io::Write;
+                        //     let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2","location":"graph_traversal.rs:2246","message":"Processed source position","data":{{"doc_id":{},"src_pos":{},"matches_found":{},"total_positions_processed":{}}},"timestamp":{}}}"#, doc_id, src_pos, matches_this_position, positions_processed, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+                        // }
                         // #endregion
                         // FIXED: Continue processing ALL positions, don't return early
                     }
                     
                     // #region agent log
-                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-                    let matches_per_position_json = format!("[{}]", matches_per_position.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
-                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2,H3","location":"graph_traversal.rs:2277","message":"Completed processing all positions","data":{{"doc_id":{},"total_positions_processed":{},"total_matches":{},"matches_per_position":{}}},"timestamp":{}}}"#, doc_id, positions_processed, all_matches.len(), matches_per_position_json, timestamp));
+                    // Debug logging disabled
+                    // let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    // let matches_per_position_json = format!("[{}]", matches_per_position.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+                    // write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2,H3","location":"graph_traversal.rs:2277","message":"Completed processing all positions","data":{{"doc_id":{},"total_positions_processed":{},"total_matches":{},"matches_per_position":{}}},"timestamp":{}}}"#, doc_id, positions_processed, all_matches.len(), matches_per_position_json, timestamp));
                     // #endregion
                     
                     // Return after processing ALL source positions
@@ -2366,9 +2799,9 @@ impl OptimizedGraphTraversalScorer {
 
     /// Extract the field name from a pattern
     #[allow(dead_code)]
-    fn get_field_name_from_pattern<'a>(&self, pattern: &'a crate::compiler::ast::Pattern) -> &'a str {
+    fn get_field_name_from_pattern<'a>(&self, pattern: &'a crate::query::ast::Pattern) -> &'a str {
         match pattern {
-            crate::compiler::ast::Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, .. }) => {
+            crate::query::ast::Pattern::Constraint(crate::query::ast::Constraint::Field { name, .. }) => {
                 name.as_str()
             }
             _ => "word", // default to word field
@@ -2383,7 +2816,7 @@ impl OptimizedGraphTraversalScorer {
     
     /// Find positions that match a pattern (for backward compatibility)
     #[allow(dead_code)]
-    fn find_positions_matching_pattern(&self, tokens: &[String], pattern: &crate::compiler::ast::Pattern) -> Vec<usize> {
+    fn find_positions_matching_pattern(&self, tokens: &[String], pattern: &crate::query::ast::Pattern) -> Vec<usize> {
         self.find_positions_in_tokens(tokens, pattern)
     }
 
@@ -2405,11 +2838,11 @@ impl OptimizedGraphTraversalScorer {
     }
 
     /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
-    fn find_positions_in_tokens(&self, tokens: &[String], pattern: &crate::compiler::ast::Pattern) -> Vec<usize> {
+    fn find_positions_in_tokens(&self, tokens: &[String], pattern: &crate::query::ast::Pattern) -> Vec<usize> {
         // Unwrap NamedCapture/Repetition to get underlying constraint
         let pattern = self.unwrap_constraint_pattern(pattern);
         
-        use crate::compiler::ast::{Pattern, Constraint, Matcher};
+        use crate::query::ast::{Pattern, Constraint, Matcher};
         let mut positions = Vec::new();
         match pattern {
             Pattern::Constraint(Constraint::Field { name: _, matcher }) => {
@@ -2451,7 +2884,7 @@ impl OptimizedGraphTraversalScorer {
         // Unwrap NamedCapture/Repetition to get underlying constraint
         let pattern = self.unwrap_constraint_pattern(pattern);
         
-        use crate::compiler::ast::{Pattern, Constraint, Matcher};
+        use crate::query::ast::{Pattern, Constraint, Matcher};
         let mut positions = Vec::new();
         
         // Note: allowed is already sorted, so we can iterate directly
@@ -2488,7 +2921,7 @@ impl OptimizedGraphTraversalScorer {
 
 
 /// Flatten a nested Pattern::GraphTraversal AST into a flat Vec<FlatPatternStep>
-pub fn flatten_graph_traversal_pattern(pattern: &crate::compiler::ast::Pattern, steps: &mut Vec<FlatPatternStep>) {
+pub fn flatten_graph_traversal_pattern(pattern: &crate::query::ast::Pattern, steps: &mut Vec<FlatPatternStep>) {
     match pattern {
         Pattern::GraphTraversal { src, traversal, dst } => {
             // Always flatten src first

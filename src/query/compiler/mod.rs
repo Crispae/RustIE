@@ -1,11 +1,11 @@
 pub mod basic_compiler;
 pub mod graph_compiler;
 
-use crate::compiler::ast::Pattern;
+use crate::query::ast::Pattern;
 use anyhow::Result;
 use tantivy::query::Query;
 use tantivy::schema::Schema;
-use crate::compiler::parser::QueryParser;
+use crate::query::parser::QueryParser;
 
 /// Unified compiler that delegates to appropriate specialized compiler
 pub struct QueryCompiler {

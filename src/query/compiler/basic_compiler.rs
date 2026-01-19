@@ -2,7 +2,7 @@ use tantivy::{
     query::{Query, BooleanQuery, Occur, TermQuery, RegexQuery},
     schema::{Term, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
+use crate::query::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, ConcatPlan, ConcatStep};
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
 use crate::tantivy_integration::assertion_query::LookaheadQuery;

@@ -6,21 +6,21 @@ use tantivy::{
     DocSet,
 };
 use crate::digraph::graph::DirectedGraph;
-use crate::compiler::ast::{Pattern, Constraint, Traversal};
+use crate::query::ast::{Pattern, Constraint, Traversal};
 use rand::{distributions::Alphanumeric, Rng};
 
 /// Optimized pattern matching query that provides position-aware matching for concatenated patterns
 #[derive(Debug)]
 pub struct OptimizedPatternMatchingQuery {
     default_field: Field,
-    pattern: crate::compiler::ast::Pattern,
+    pattern: crate::query::ast::Pattern,
     sub_queries: Vec<Box<dyn Query>>,
 }
 
 impl OptimizedPatternMatchingQuery {
     pub fn new(
         default_field: Field,
-        pattern: crate::compiler::ast::Pattern,
+        pattern: crate::query::ast::Pattern,
         sub_queries: Vec<Box<dyn Query>>,
     ) -> Self {
         Self {
@@ -60,7 +60,7 @@ impl tantivy::query::QueryClone for OptimizedPatternMatchingQuery {
 /// Optimized weight for pattern matching queries
 struct OptimizedPatternMatchingWeight {
     sub_weights: Vec<Box<dyn Weight>>,
-    pattern: crate::compiler::ast::Pattern,
+    pattern: crate::query::ast::Pattern,
     default_field: Field,
 }
 
@@ -98,7 +98,7 @@ impl Weight for OptimizedPatternMatchingWeight {
 /// Optimized scorer for pattern matching queries with position awareness
 pub struct OptimizedPatternMatchingScorer {
     sub_scorers: Vec<Box<dyn Scorer>>,
-    pattern: crate::compiler::ast::Pattern,
+    pattern: crate::query::ast::Pattern,
     default_field: Field,
     reader: SegmentReader,
     current_doc: Option<DocId>,
@@ -215,8 +215,8 @@ impl OptimizedPatternMatchingScorer {
 }
 
 /// Find all valid spans in a token sequence for a concatenated pattern (Odinson-style)
-pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern, tokens: &[String]) -> Vec<Vec<crate::types::SpanWithCaptures>> {
-    use crate::compiler::ast::Pattern;
+pub fn find_constraint_spans_in_sequence(pattern: &crate::query::ast::Pattern, tokens: &[String]) -> Vec<Vec<crate::types::SpanWithCaptures>> {
+    use crate::query::ast::Pattern;
     // Only handle Pattern::Concatenated for now
     if let Pattern::Concatenated(patterns) = pattern {
         let mut results = Vec::new();
@@ -229,11 +229,11 @@ pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern
             let mut matched = true;
             for pat in patterns {
                 match pat {
-                    Pattern::Constraint(crate::compiler::ast::Constraint::Field { name, matcher }) => {
+                    Pattern::Constraint(crate::query::ast::Constraint::Field { name, matcher }) => {
                         // Only support "word" field for now
                         if name != "word" { matched = false; break; }
                         match matcher {
-                            crate::compiler::ast::Matcher::String(s) => {
+                            crate::query::ast::Matcher::String(s) => {
                                 if pos < len && &tokens[pos] == s {
                                     let span = crate::types::Span { start: pos, end: pos + 1 };
                                     let capture = crate::types::NamedCapture::new(format!("c{}", pos), span.clone());
@@ -243,7 +243,7 @@ pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern
                                     matched = false; break;
                                 }
                             }
-                            crate::compiler::ast::Matcher::Regex { pattern, .. } => {
+                            crate::query::ast::Matcher::Regex { pattern, .. } => {
                                 if pos < len && regex::Regex::new(pattern).unwrap().is_match(&tokens[pos]) {
                                     let span = crate::types::Span { start: pos, end: pos + 1 };
                                     let capture = crate::types::NamedCapture::new(format!("c{}", pos), span.clone());
@@ -255,7 +255,7 @@ pub fn find_constraint_spans_in_sequence(pattern: &crate::compiler::ast::Pattern
                             }
                         }
                     }
-                    Pattern::Constraint(crate::compiler::ast::Constraint::Wildcard) => {
+                    Pattern::Constraint(crate::query::ast::Constraint::Wildcard) => {
                         // Wildcard matches any single token
                         if pos < len {
                             let span = crate::types::Span { start: pos, end: pos + 1 };

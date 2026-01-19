@@ -1,7 +1,7 @@
-use crate::compiler::ast::Pattern;
+use crate::query::ast::Pattern;
 use anyhow::{Result, anyhow};
 // Integrate pest-based parser
-use crate::compiler::pest_parser::{QueryParser as PestQueryParser, Rule, build_ast};
+use crate::query::pest_parser::{QueryParser as PestQueryParser, Rule, build_ast};
 use pest::Parser;
 use std::panic;
 
@@ -48,7 +48,7 @@ impl QueryParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::ast::{Constraint, Traversal};
+    use crate::query::ast::{Constraint, Traversal};
 
     fn parser() -> QueryParser {
         QueryParser::new("word".to_string())
