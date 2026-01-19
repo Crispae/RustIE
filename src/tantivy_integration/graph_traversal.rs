@@ -45,6 +45,15 @@ static TOKEN_EXTRACTION_SKIPPED: AtomicUsize = AtomicUsize::new(0);
 static REGEX_EXPANSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 static REGEX_EXPANSION_TERMS: AtomicUsize = AtomicUsize::new(0);
 
+// Helper function for debug logging (formats JSON properly)
+#[inline]
+fn write_debug_log(entry: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", entry);
+    }
+}
+
 /// Edge term requirement for position prefiltering
 #[derive(Clone, Debug)]
 struct EdgeTermReq {
@@ -120,6 +129,39 @@ pub struct CollapsedSpec {
     pub constraint_idx: usize,
 }
 
+/// Lazy iterator wrapper for driver positions
+/// Enables on-the-fly consumption without materialization
+#[derive(Clone)]
+struct PositionIterator<'a> {
+    positions: &'a [u32],
+    index: usize,
+}
+
+impl<'a> Iterator for PositionIterator<'a> {
+    type Item = u32;
+    
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index < self.positions.len() {
+            let pos = self.positions[self.index];
+            self.index += 1;
+            Some(pos)
+        } else {
+            None
+        }
+    }
+    
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.positions.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a> ExactSizeIterator for PositionIterator<'a> {
+    fn len(&self) -> usize {
+        self.positions.len().saturating_sub(self.index)
+    }
+}
+
 /// Abstraction for candidate document iteration with optional position access.
 /// Avoids downcasting from Box<dyn Scorer> by making position-aware drivers explicit.
 trait CandidateDriver: Send {
@@ -132,6 +174,15 @@ trait CandidateDriver: Send {
     /// If this driver is position-aware (collapsed constraint + edge),
     /// return the positions that matched (intersection). Otherwise None.
     fn matching_positions(&self) -> Option<&[u32]>;
+    
+    /// Return a lazy iterator over matching positions (Odinson-style)
+    /// Returns None if not position-aware
+    fn matching_positions_iter(&self) -> Option<PositionIterator<'_>> {
+        self.matching_positions().map(|positions| PositionIterator {
+            positions,
+            index: 0,
+        })
+    }
 }
 
 /// EmptyDriver: Immediately returns TERMINATED.
@@ -1902,7 +1953,8 @@ impl OptimizedGraphTraversalScorer {
 
         // Get driver positions for first/last constraints (Odinson-style position handoff)
         // These are already filtered for position overlap between constraint and edge
-        // Clone positions to avoid borrow checker issues (they're small Vec<u32>)
+        // Materialize only when needed for allowed_positions computation (HashSet requires owned data)
+        // But we'll use lazy iterator directly in the traversal phase
         let src_driver_positions = self.src_driver.matching_positions().map(|p| p.to_vec());
         let dst_driver_positions = self.dst_driver.matching_positions().map(|p| p.to_vec());
         
@@ -2109,11 +2161,41 @@ impl OptimizedGraphTraversalScorer {
         GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
         
         // Phase 5: Run traversal
-        let src_positions: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
-        if constraint_count > 0 && src_positions.is_empty() {
+        // Use lazy iterator for source positions (Odinson-style one-step approach)
+        // Get iterator directly from driver if available, otherwise use cached positions
+        let src_positions_slice: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
+        if constraint_count > 0 && src_positions_slice.is_empty() {
             return false;
         }
+        
+        // #region agent log
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+            use std::io::Write;
+            let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2157","message":"Checking lazy iterator availability","data":{{"doc_id":{},"src_positions_count":{},"has_driver_iter":{}}},"timestamp":{}}}"#, doc_id, src_positions_slice.len(), self.src_driver.matching_positions_iter().is_some(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+        }
+        // #endregion
+        
+        // Create lazy iterator from driver positions if available (avoid materialization)
+        // Otherwise use cached positions as iterator
+        let src_positions_iter: Box<dyn Iterator<Item = usize> + '_> = if let Some(iter) = self.src_driver.matching_positions_iter() {
+            // #region agent log
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2164","message":"Using lazy iterator from driver","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
+            // #endregion
+            // Use lazy iterator from driver (no materialization) - Odinson-style
+            Box::new(iter.map(|p| p as usize))
+        } else {
+            // #region agent log
+            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+            write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H1","location":"graph_traversal.rs:2168","message":"Using fallback cached positions","data":{{"doc_id":{}}},"timestamp":{}}}"#, doc_id, timestamp));
+            // #endregion
+            // Fallback to cached positions (already materialized, but use as iterator)
+            Box::new(src_positions_slice.iter().copied())
+        };
 
+        // Estimate size for threshold decision (for parallel processing)
+        let estimated_size = src_positions_slice.len();
+        
         // Extract values we need before mutable borrow
         let constraint_field_names = &self.constraint_field_names;
 
@@ -2129,7 +2211,20 @@ impl OptimizedGraphTraversalScorer {
                 // TRUE ZERO-COPY: Use ZeroCopyGraph directly without conversion
                 use crate::digraph::graph_trait::GraphAccess;
                 // Check if we should use parallel processing
-                if src_positions.len() >= PARALLEL_START_POSITIONS_THRESHOLD {
+                if estimated_size >= PARALLEL_START_POSITIONS_THRESHOLD {
+                    // #region agent log
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2190","message":"Using parallel path - materializing positions","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
+                    // #endregion
+                    // Materialize positions only for parallel processing (required by rayon)
+                    let src_positions: Vec<usize> = src_positions_iter.collect();
+                    // #region agent log
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+                        use std::io::Write;
+                        let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H4","location":"graph_traversal.rs:2192","message":"Materialized positions for parallel processing","data":{{"doc_id":{},"materialized_count":{}}},"timestamp":{}}}"#, doc_id, src_positions.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
+                    }
+                    // #endregion
+                    
                     // Pre-load all tokens for thread-safety before parallel processing
                     for constraint_idx in 0..constraint_field_names.len() {
                         lazy_tokens.ensure_loaded(constraint_idx);
@@ -2161,7 +2256,11 @@ impl OptimizedGraphTraversalScorer {
                         return true;
                     }
                 } else {
-                    // Sequential processing for small number of start positions (preserves lazy loading)
+                    // #region agent log
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H5","location":"graph_traversal.rs:2224","message":"Using sequential lazy path","data":{{"doc_id":{},"estimated_size":{}}},"timestamp":{}}}"#, doc_id, estimated_size, timestamp));
+                    // #endregion
+                    // Sequential processing with lazy iterator (Odinson-style one-step approach)
                     let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
                     // Create closure for token access (wraps lazy_tokens)
                     let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
@@ -2169,8 +2268,13 @@ impl OptimizedGraphTraversalScorer {
                     };
                     
                     let mut all_matches = Vec::new();
+                    let mut positions_processed = 0;
+                    let mut matches_per_position = Vec::new();
                     
-                    for &src_pos in src_positions {
+                    // Lazy consumption: process positions on-the-fly (no materialization)
+                    // FIXED: Collect ALL matches from ALL source positions (no early termination)
+                    for src_pos in src_positions_iter {
+                        positions_processed += 1;
                         let all_paths = traversal_engine.automaton_query_paths(
                             flat_steps, 
                             &[src_pos], 
@@ -2180,8 +2284,11 @@ impl OptimizedGraphTraversalScorer {
                             &constraint_exact_flags,
                         );
                         
+                        // Collect ALL matches from this source position
+                        let mut matches_this_position = 0;
                         for path in &all_paths {
                             if !path.is_empty() {
+                                matches_this_position += 1;
                                 let mut captures = Vec::with_capacity(path.len());
                                 let mut c_idx = 0;
                                 for step in flat_steps.iter() {
@@ -2207,12 +2314,26 @@ impl OptimizedGraphTraversalScorer {
                                 );
                             }
                         }
-                        
-                        if !all_paths.is_empty() {
-                            // Now we can mutate self after the closure is dropped
-                            self.current_doc_matches.extend(all_matches);
-                            return true;
+                        matches_per_position.push(matches_this_position);
+                        // #region agent log
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(".cursor/debug.log") {
+                            use std::io::Write;
+                            let _ = writeln!(file, r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2","location":"graph_traversal.rs:2246","message":"Processed source position","data":{{"doc_id":{},"src_pos":{},"matches_found":{},"total_positions_processed":{}}},"timestamp":{}}}"#, doc_id, src_pos, matches_this_position, positions_processed, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis());
                         }
+                        // #endregion
+                        // FIXED: Continue processing ALL positions, don't return early
+                    }
+                    
+                    // #region agent log
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                    let matches_per_position_json = format!("[{}]", matches_per_position.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));
+                    write_debug_log(&format!(r#"{{"sessionId":"lazy-eval-verify","runId":"run1","hypothesisId":"H2,H3","location":"graph_traversal.rs:2277","message":"Completed processing all positions","data":{{"doc_id":{},"total_positions_processed":{},"total_matches":{},"matches_per_position":{}}},"timestamp":{}}}"#, doc_id, positions_processed, all_matches.len(), matches_per_position_json, timestamp));
+                    // #endregion
+                    
+                    // Return after processing ALL source positions
+                    if !all_matches.is_empty() {
+                        self.current_doc_matches.extend(all_matches);
+                        return true;
                     }
                 }
                 
