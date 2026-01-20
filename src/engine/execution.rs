@@ -3,7 +3,7 @@
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
 use crate::query::parser::QueryParser;
-use crate::results::rustie_results::{RustIeResult, RustieDoc, SentenceResult};
+use crate::results::rustie_results::{RustIeResult, SentenceResult};
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 use crate::tantivy_integration::graph_traversal::{
@@ -32,12 +32,7 @@ impl ExtractorEngine {
 
         let tantivy_query = self.compiler().compile(query)?;
 
-        let is_graph_query = tantivy_query
-            .as_any()
-            .downcast_ref::<OptimizedGraphTraversalQuery>()
-            .is_some();
-
-        self.execute_query(tantivy_query.as_ref(), limit, &pattern, is_graph_query)
+        self.execute_query(tantivy_query.as_ref(), limit, &pattern)
     }
 
     /// Execute a compiled query with the original pattern for match extraction
@@ -46,7 +41,6 @@ impl ExtractorEngine {
         query: &dyn Query,
         limit: usize,
         pattern: &crate::query::ast::Pattern,
-        is_graph_query: bool,
     ) -> Result<RustIeResult> {
         match pattern {
             crate::query::ast::Pattern::GraphTraversal { .. } => {
@@ -153,17 +147,7 @@ impl ExtractorEngine {
 
         all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // DEDUPLICATE
-        let deduplicated = Self::deduplicate_results(all_results, limit);
-        let max_score = deduplicated.first().map(|r| r.score);
-
-
-        Ok(RustIeResult {
-            total_hits: deduplicated.len(),
-            score_docs: Vec::new(),
-            sentence_results: deduplicated,
-            max_score,
-        })
+        Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
     /// Execute pattern matching queries using token sequence matching
@@ -187,12 +171,8 @@ impl ExtractorEngine {
             .map_err(anyhow::Error::from)?;
 
         let mut sentence_results = Vec::new();
-        let mut score_docs = Vec::new();
-        let mut max_score = None;
 
         for (score, doc_address) in top_docs {
-            score_docs.push(RustieDoc::new(doc_address, score));
-
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
                 let tokens = self.extract_field_values(&doc, FIELD_WORD);
@@ -214,11 +194,8 @@ impl ExtractorEngine {
                 sentence_result.matches = pattern_matches;
                 sentence_results.push(sentence_result);
             }
-
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
         }
 
-        // DEDUPLICATE
         let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
             .into_iter()
             .map(|r| {
@@ -226,14 +203,8 @@ impl ExtractorEngine {
                 (r, score)
             })
             .collect();
-        let deduplicated = Self::deduplicate_results(results_with_scores, limit);
 
-        Ok(RustIeResult {
-            total_hits: deduplicated.len(),
-            score_docs,
-            sentence_results: deduplicated,
-            max_score,
-        })
+        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
     }
 
     /// Execute optimized pattern matching queries using custom scorer
@@ -307,16 +278,7 @@ impl ExtractorEngine {
 
         all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let deduplicated = Self::deduplicate_results(all_results, limit);
-        let max_score = deduplicated.first().map(|r| r.score);
-
-
-        Ok(RustIeResult {
-            total_hits: deduplicated.len(),
-            score_docs: Vec::new(),
-            sentence_results: deduplicated,
-            max_score,
-        })
+        Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
     /// Execute named capture pattern matching queries using custom scorer
@@ -332,7 +294,6 @@ impl ExtractorEngine {
             .map_err(anyhow::Error::from)?;
 
         let mut sentence_results = Vec::new();
-        let mut max_score = None;
 
         for (score, doc_address) in top_docs {
             if let Ok(doc) = self.doc(doc_address) {
@@ -360,8 +321,6 @@ impl ExtractorEngine {
 
                 sentence_results.push(sentence_result);
             }
-
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
         }
 
         let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
@@ -371,18 +330,11 @@ impl ExtractorEngine {
                 (r, score)
             })
             .collect();
-        let deduplicated = Self::deduplicate_results(results_with_scores, limit);
-        let max_score = deduplicated.first().map(|r| r.score).or(max_score);
 
-        Ok(RustIeResult {
-            total_hits: deduplicated.len(),
-            score_docs: Vec::new(),
-            sentence_results: deduplicated,
-            max_score,
-        })
+        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
     }
 
-    /// Execute fallback for other pattern types
+    /// Execute fallback for other pattern types (Assertion, Disjunctive, Repetition)
     fn execute_fallback(
         &self,
         query: &dyn Query,
@@ -396,7 +348,6 @@ impl ExtractorEngine {
             .map_err(anyhow::Error::from)?;
 
         let mut sentence_results = Vec::new();
-        let mut max_score = None;
 
         for (score, doc_address) in top_docs {
             if let Ok(doc) = self.doc(doc_address) {
@@ -405,19 +356,13 @@ impl ExtractorEngine {
 
                 let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
 
-                use rand::{distributions::Alphanumeric, Rng};
                 let mut fallback_matches = Vec::new();
-                for start in match_positions {
+                for (i, &start) in match_positions.iter().enumerate() {
                     let span = crate::types::Span {
                         start,
                         end: start + 1,
                     };
-                    let rand_name: String = rand::thread_rng()
-                        .sample_iter(&Alphanumeric)
-                        .take(8)
-                        .map(char::from)
-                        .collect();
-                    let capture = crate::types::NamedCapture::new(rand_name, span.clone());
+                    let capture = crate::types::NamedCapture::new(format!("c{}", i), span.clone());
                     fallback_matches
                         .push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));
                 }
@@ -425,16 +370,33 @@ impl ExtractorEngine {
                 sentence_result.matches = fallback_matches;
                 sentence_results.push(sentence_result);
             }
-
-            max_score = max_score.map(|s: Score| s.max(score)).or(Some(score));
         }
 
-        Ok(RustIeResult {
-            total_hits: sentence_results.len(),
-            score_docs: Vec::new(),
-            sentence_results,
+        let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
+            .into_iter()
+            .map(|r| {
+                let score = r.score;
+                (r, score)
+            })
+            .collect();
+
+        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
+    }
+
+    /// Build result from sentence results with deduplication and max score computation
+    fn build_result_from_sentence_results(
+        results: Vec<(SentenceResult, Score)>,
+        limit: usize,
+    ) -> RustIeResult {
+        let deduplicated = Self::deduplicate_results(results, limit);
+        let max_score = deduplicated.first().map(|r| r.score);
+
+        RustIeResult {
+            total_hits: deduplicated.len(),
+            score_docs: Vec::new(), // Always empty - sentence_results is the primary data structure
+            sentence_results: deduplicated,
             max_score,
-        })
+        }
     }
 
     /// Deduplicate results based on (document_id, sentence_id), keeping highest score
