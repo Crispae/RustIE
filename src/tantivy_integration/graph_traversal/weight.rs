@@ -25,6 +25,7 @@ use super::candidate_driver::{
     CandidateDriver, EmptyDriver, CombinedPositionDriver,
     UnionPositionsIterator, UnionAndIntersectDriver,
     expand_matcher, get_or_compile_regex,
+    IntermediateEdgeFilter,
 };
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
 use super::scorer::{OptimizedGraphTraversalScorer, is_exact_skippable};
@@ -287,8 +288,14 @@ impl Weight for OptimizedGraphTraversalWeight {
             log::warn!("CONSTRAINT PREFILTERING DISABLED: No constraint fields indexed with positions!");
         }
 
+        // Determine which constraint indices are collapsed (src/dst)
+        let src_collapsed_idx = self.src_collapse.as_ref().map(|s| s.constraint_idx);
+        let dst_collapsed_idx = self.dst_collapse.as_ref().map(|s| s.constraint_idx);
+
         // Create postings cursors for edge terms (one per segment)
+        // Also collect intermediate edge postings for document-level filtering
         let mut edge_postings = Vec::new();
+        let mut intermediate_edge_postings = Vec::new();
 
         for req in &self.prefilter_plan.edge_reqs {
             let term = Term::from_field_text(req.field, &req.label);
@@ -301,10 +308,30 @@ impl Weight for OptimizedGraphTraversalWeight {
             };
 
             match postings_result {
-                Ok(Some(postings)) => edge_postings.push(Some(postings)),
+                Ok(Some(postings)) => {
+                    // Check if this is an intermediate edge (not for collapsed src/dst)
+                    let is_intermediate = Some(req.constraint_idx) != src_collapsed_idx
+                        && Some(req.constraint_idx) != dst_collapsed_idx;
+
+                    if is_intermediate {
+                        // Create a separate postings iterator for the intermediate edge filter
+                        // We need to re-read since we can't clone SegmentPostings
+                        let term2 = Term::from_field_text(req.field, &req.label);
+                        if let Ok(inv_idx) = reader.inverted_index(req.field) {
+                            if let Ok(Some(filter_postings)) = inv_idx.read_postings(&term2, IndexRecordOption::WithFreqsAndPositions) {
+                                intermediate_edge_postings.push(filter_postings);
+                            }
+                        }
+                    }
+
+                    edge_postings.push(Some(postings));
+                }
                 _ => edge_postings.push(None),
             }
         }
+
+        // OPTIMIZATION: Build intermediate edge filter for document-level filtering during enumeration
+        let intermediate_edge_filter = IntermediateEdgeFilter::new(intermediate_edge_postings);
 
         // Create postings cursors for constraint terms (one per segment)
         let mut constraint_postings = Vec::new();
@@ -344,6 +371,7 @@ impl Weight for OptimizedGraphTraversalWeight {
             self.src_collapse.clone(),
             self.dst_collapse.clone(),
             self.constraint_exact_flags.clone(),  // OPTIMIZATION: Pass pre-computed flags
+            intermediate_edge_filter,  // OPTIMIZATION: Document-level filtering during enumeration
         );
 
         // Advance to the first document

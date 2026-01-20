@@ -28,7 +28,7 @@ use super::types::{
     PREFILTER_SKIPPED_ALL_COLLAPSED,
     ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
 };
-use super::candidate_driver::CandidateDriver;
+use super::candidate_driver::{CandidateDriver, IntermediateEdgeFilter};
 
 /// Optimized scorer for graph traversal queries
 /// Uses CandidateDriver abstraction for Odinson-style collapsed query optimization
@@ -75,6 +75,9 @@ pub struct OptimizedGraphTraversalScorer {
     /// Reusable HashSet buffers for allowed_positions_hashset
     /// OPTIMIZATION: Avoids allocating new HashSets per document
     pub(crate) allowed_positions_hashset_buf: Vec<Option<HashSet<u32>>>,
+    /// OPTIMIZATION: Intermediate edge filter for document-level filtering during enumeration
+    /// Enables Odinson-style filtering where ALL edges participate in document selection
+    pub(crate) intermediate_edge_filter: IntermediateEdgeFilter,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -99,6 +102,7 @@ impl OptimizedGraphTraversalScorer {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
         constraint_exact_flags: Vec<bool>,
+        intermediate_edge_filter: IntermediateEdgeFilter,
     ) -> Self {
         let num_constraints = prefilter_plan.num_constraints;
         // OPTIMIZATION: Pre-allocate HashSet buffers for reuse across documents
@@ -128,6 +132,7 @@ impl OptimizedGraphTraversalScorer {
             dst_collapse,
             constraint_exact_flags,
             allowed_positions_hashset_buf,
+            intermediate_edge_filter,
         }
     }
 }
@@ -755,12 +760,57 @@ impl OptimizedGraphTraversalScorer {
         Some(allowed)
     }
 
+    /// OPTIMIZATION: Check if document has all intermediate edges (doc-level, not position-level)
+    /// This is called BEFORE any expensive position cloning to quickly reject documents
+    /// that don't have required intermediate edges.
+    fn has_all_intermediate_edges(&mut self, doc_id: DocId) -> bool {
+        let src_collapsed_idx = self.src_collapse.as_ref().map(|s| s.constraint_idx);
+        let dst_collapsed_idx = self.dst_collapse.as_ref().map(|s| s.constraint_idx);
+
+        for (req_idx, req) in self.prefilter_plan.edge_reqs.iter().enumerate() {
+            // Skip edge requirements for collapsed constraints (already handled by drivers)
+            if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
+                continue;
+            }
+
+            // Check if this intermediate edge exists in the document
+            match self.edge_postings.get_mut(req_idx) {
+                Some(Some(postings)) => {
+                    if postings.doc() < doc_id {
+                        postings.seek(doc_id);
+                    }
+                    if postings.doc() != doc_id {
+                        // Document doesn't have this intermediate edge - reject early
+                        return false;
+                    }
+                }
+                Some(None) => {
+                    // Edge term doesn't exist in this segment at all - no document can match
+                    return false;
+                }
+                None => {
+                    // Index out of bounds - shouldn't happen but handle defensively
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Check if a document has valid graph traversal from source to destination
     pub(crate) fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {
         let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
         self.current_doc_matches.clear();
 
         let num_constraints = self.prefilter_plan.num_constraints;
+
+        // OPTIMIZATION: Early check for intermediate edges BEFORE any expensive work
+        // This avoids position cloning for documents that will be rejected anyway
+        if num_constraints > 2 && !self.has_all_intermediate_edges(doc_id) {
+            PREFILTER_KILLED.fetch_add(1, Ordering::Relaxed);
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
 
         // Optimization: Check if all constraints are collapsed first (avoids cloning in fast path)
         // We need to check driver positions availability before deciding the path
@@ -1230,6 +1280,24 @@ impl DocSet for OptimizedGraphTraversalScorer {
             debug_assert_eq!(candidate, dst_doc);
             DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
 
+            // OPTIMIZATION: Check intermediate edges during document enumeration
+            // This filters out documents early, before any expensive graph traversal work
+            if !self.intermediate_edge_filter.is_empty() {
+                if !self.intermediate_edge_filter.document_matches(candidate) {
+                    // Document doesn't have all intermediate edges - skip it
+                    // Use seek_to_matching_doc to find next document with all edges
+                    let next_edge_doc = self.intermediate_edge_filter.seek_to_matching_doc(candidate + 1);
+                    if next_edge_doc == tantivy::TERMINATED {
+                        self.current_doc = None;
+                        self.log_final_stats();
+                        return tantivy::TERMINATED;
+                    }
+                    // Seek src_driver to the next document that has all intermediate edges
+                    candidate = self.src_driver.seek(next_edge_doc);
+                    continue;
+                }
+            }
+
             if let Some(src_pos) = self.src_driver.matching_positions() {
                 DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
                 DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1285,6 +1353,19 @@ impl DocSet for OptimizedGraphTraversalScorer {
                     }
                 }
                 continue;
+            }
+
+            // OPTIMIZATION: Check intermediate edges during document enumeration
+            if !self.intermediate_edge_filter.is_empty() {
+                if !self.intermediate_edge_filter.document_matches(candidate) {
+                    let next_edge_doc = self.intermediate_edge_filter.seek_to_matching_doc(candidate + 1);
+                    if next_edge_doc == tantivy::TERMINATED {
+                        self.current_doc = None;
+                        return tantivy::TERMINATED;
+                    }
+                    candidate = self.src_driver.seek(next_edge_doc);
+                    continue;
+                }
             }
 
             if self.check_graph_traversal(candidate) {

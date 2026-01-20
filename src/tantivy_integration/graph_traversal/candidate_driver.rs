@@ -676,3 +676,117 @@ impl CandidateDriver for UnionAndIntersectDriver {
         Some(&self.intersection)
     }
 }
+
+// =============================================================================
+// IntermediateEdgeFilter: Document-level filtering for intermediate edges
+// =============================================================================
+
+/// Filter that checks document-level presence of intermediate edges.
+/// Used during document enumeration to skip documents that can't possibly match.
+/// This enables Odinson-style filtering where ALL edges participate in document selection.
+pub(crate) struct IntermediateEdgeFilter {
+    /// Postings for intermediate edges (edges not collapsed into src/dst drivers)
+    edge_postings: Vec<SegmentPostings>,
+    /// Current minimum document across all postings (for efficient intersection)
+    current_min_doc: DocId,
+}
+
+impl IntermediateEdgeFilter {
+    /// Create a new filter from intermediate edge postings
+    pub fn new(edge_postings: Vec<SegmentPostings>) -> Self {
+        let current_min_doc = if edge_postings.is_empty() {
+            tantivy::TERMINATED
+        } else {
+            // Find minimum doc across all postings
+            edge_postings.iter()
+                .map(|p| p.doc())
+                .filter(|&d| d != tantivy::TERMINATED)
+                .min()
+                .unwrap_or(tantivy::TERMINATED)
+        };
+
+        Self {
+            edge_postings,
+            current_min_doc,
+        }
+    }
+
+    /// Check if filter has any postings (if empty, all documents pass)
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.edge_postings.is_empty()
+    }
+
+    /// Check if a document has ALL intermediate edges.
+    /// Returns true if document passes the filter (has all edges).
+    /// Seeks all postings to the target document.
+    pub fn document_matches(&mut self, doc_id: DocId) -> bool {
+        if self.edge_postings.is_empty() {
+            return true; // No intermediate edges to check
+        }
+
+        for postings in &mut self.edge_postings {
+            // Seek to doc_id if not already there or past
+            if postings.doc() < doc_id {
+                postings.seek(doc_id);
+            }
+
+            // If this postings doesn't have doc_id, document fails the filter
+            if postings.doc() != doc_id {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Find the next document >= target that has ALL intermediate edges.
+    /// Uses adaptive seeking for efficiency.
+    /// Returns TERMINATED if no such document exists.
+    pub fn seek_to_matching_doc(&mut self, target: DocId) -> DocId {
+        if self.edge_postings.is_empty() {
+            return target; // No filter, any target is valid
+        }
+
+        let mut candidate = target;
+
+        loop {
+            // Seek all postings to candidate
+            let mut max_doc = candidate;
+            let mut all_match = true;
+
+            for postings in &mut self.edge_postings {
+                if postings.doc() < candidate {
+                    postings.seek(candidate);
+                }
+
+                let doc = postings.doc();
+                if doc == tantivy::TERMINATED {
+                    self.current_min_doc = tantivy::TERMINATED;
+                    return tantivy::TERMINATED;
+                }
+
+                if doc != candidate {
+                    all_match = false;
+                    if doc > max_doc {
+                        max_doc = doc;
+                    }
+                }
+            }
+
+            if all_match {
+                self.current_min_doc = candidate;
+                return candidate;
+            }
+
+            // At least one posting is ahead - advance candidate to max_doc
+            candidate = max_doc;
+        }
+    }
+
+    /// Get the current minimum document (for skip-ahead optimization)
+    #[inline]
+    pub fn current_doc(&self) -> DocId {
+        self.current_min_doc
+    }
+}
