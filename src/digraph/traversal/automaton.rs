@@ -136,19 +136,34 @@ impl<G: GraphAccess> GraphTraversal<G> {
         let field_name = &constraint_field_names[constraint_idx];
 
         if let crate::query::ast::Pattern::Constraint(constraint) = constraint_pat {
-            // Optimization: Check if exact constraint + prefilter confirmed
-            let is_exact = constraint_exact_flags.get(constraint_idx).copied().unwrap_or(false);
+            // Check if position is in allowed_positions (pre-verified by postings/drivers)
             let prefilter_confirmed = allowed_positions.get(constraint_idx)
                 .and_then(|opt| opt.as_ref())
                 .map(|set| set.contains(&(node as u32)))  // O(1) HashSet lookup
                 .unwrap_or(false);
 
-            if is_exact && prefilter_confirmed {
+            // OPTIMIZATION: For collapsed constraints (src/dst with driver positions),
+            // the driver already verified constraint + edge match via postings intersection.
+            // If prefilter_confirmed is true, we can skip constraint.matches() entirely.
+            //
+            // For exact constraints, postings directly confirm the match.
+            // For regex constraints in collapsed positions, the driver expanded the regex
+            // and verified via postings - so prefilter_confirmed means it matches.
+            //
+            // Only need to call constraint.matches() if:
+            // 1. No prefilter available (allowed_positions is None for this constraint)
+            // 2. Position is NOT in allowed_positions (prefilter_confirmed is false)
+            if prefilter_confirmed {
                 // Skip BOTH get_token() AND constraint.matches()
-                // Postings already confirmed exact match - zero work needed
-                log::debug!("Skipping token fetch and matches() for exact prefilter-confirmed constraint at node: {}", node);
+                // Postings/driver already confirmed match - zero work needed
+                log::trace!("Skipping constraint check for prefilter-confirmed position at node: {}", node);
+            } else if allowed_positions.get(constraint_idx).and_then(|opt| opt.as_ref()).is_some() {
+                // Prefilter exists but position not in it - definite non-match
+                log::trace!("Position {} not in allowed_positions for constraint {}", node, constraint_idx);
+                memo[idx] = false;
+                return;
             } else {
-                // Need token for matching (regex/wildcard) or verification
+                // No prefilter - need to verify via token matching
                 let token = match get_token(constraint_idx, node) {
                     Some(t) => t,
                     None => {
