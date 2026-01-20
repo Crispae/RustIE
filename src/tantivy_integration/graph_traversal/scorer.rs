@@ -696,26 +696,36 @@ impl OptimizedGraphTraversalScorer {
         let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
         self.current_doc_matches.clear();
 
-        let src_driver_positions = self.src_driver.matching_positions().map(|p| p.to_vec());
-        let dst_driver_positions = self.dst_driver.matching_positions().map(|p| p.to_vec());
-
         let num_constraints = self.prefilter_plan.num_constraints;
+
+        // Optimization: Check if all constraints are collapsed first (avoids cloning in fast path)
+        // We need to check driver positions availability before deciding the path
+        let src_has_positions = self.src_driver.matching_positions().is_some();
+        let dst_has_positions = self.dst_driver.matching_positions().is_some();
         let all_collapsed = num_constraints == 2
             && self.src_collapse.is_some()
             && self.dst_collapse.is_some()
-            && src_driver_positions.is_some()
-            && dst_driver_positions.is_some();
+            && src_has_positions
+            && dst_has_positions;
 
         PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
+
+        // Clone positions once - needed for both branches due to mutable borrow in compute_allowed_positions
+        // In the all_collapsed branch, this is the only clone needed
+        // In the non-collapsed branch, compute_allowed_positions needs &mut self, so we must clone first
+        let src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
+        let dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
+
         let allowed_positions = if all_collapsed {
             PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
 
             let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
-            if let Some(ref positions) = src_driver_positions {
-                allowed[0] = Some(positions.clone());
+            // Move positions directly instead of cloning again
+            if let Some(positions) = src_driver_positions.clone() {
+                allowed[0] = Some(positions);
             }
-            if let Some(ref positions) = dst_driver_positions {
-                allowed[num_constraints - 1] = Some(positions.clone());
+            if let Some(positions) = dst_driver_positions.clone() {
+                allowed[num_constraints - 1] = Some(positions);
             }
             allowed
         } else {
