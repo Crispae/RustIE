@@ -15,13 +15,11 @@ impl<G: GraphAccess> GraphTraversal<G> {
     pub(crate) fn concatenated_traversal(&self, start_nodes: &[usize], traversals: &[Traversal]) -> TraversalResult {
         let mut current_nodes = start_nodes.to_vec();
         for (i, traversal) in traversals.iter().enumerate() {
-            log::debug!("Step {}: Traversal {:?} from nodes {:?}", i, traversal, current_nodes);
             match self.execute(traversal, &current_nodes) {
                 TraversalResult::Success(nodes) => {
                     current_nodes = nodes;
                 }
                 TraversalResult::FailTraversal => {
-                    log::debug!("Step {} failed", i);
                     return TraversalResult::FailTraversal;
                 }
                 TraversalResult::NoTraversal => {

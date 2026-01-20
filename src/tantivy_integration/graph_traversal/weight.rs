@@ -179,11 +179,6 @@ impl OptimizedGraphTraversalWeight {
                                             if count > 0 {
                                                 REGEX_EXPANSION_COUNT.fetch_add(1, Ordering::Relaxed);
                                                 REGEX_EXPANSION_TERMS.fetch_add(count, Ordering::Relaxed);
-                                            } else {
-                                                log::warn!(
-                                                    "Regex constraint '{}' expanded to 0 terms - pattern may not match any terms in segment",
-                                                    pattern
-                                                );
                                             }
                                         }
                                     }
@@ -259,7 +254,6 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         // Log warning if no constraint prefiltering available
         if constraint_reqs.is_empty() {
-            log::warn!("CONSTRAINT PREFILTERING DISABLED: No constraint fields indexed with positions!");
         }
 
         // Create postings cursors for edge terms (one per segment)

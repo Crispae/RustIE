@@ -279,8 +279,7 @@ pub(crate) fn expand_with_automaton(
 ) -> Option<Vec<SegmentPostings>> {
     let mut stream = match term_dict.search(automaton).into_stream() {
         Ok(s) => s,
-        Err(e) => {
-            log::warn!("Failed to search term dict: {:?}", e);
+        Err(_e) => {
             return None;
         }
     };
@@ -290,10 +289,6 @@ pub(crate) fn expand_with_automaton(
 
     while stream.advance() {
         if count >= max_expansions {
-            log::warn!(
-                "collapse regex disabled: expanded_terms={} > max={}",
-                count, max_expansions
-            );
             return None;
         }
 
@@ -336,13 +331,12 @@ pub(crate) fn get_or_compile_regex(
     }
 
     // Compile and cache
-    let regex = match Regex::new(pattern) {
-        Ok(r) => Arc::new(r),
-        Err(e) => {
-            log::warn!("Invalid regex pattern '{}': {}", pattern, e);
-            return None;
-        }
-    };
+        let regex = match Regex::new(pattern) {
+            Ok(r) => Arc::new(r),
+            Err(_e) => {
+                return None;
+            }
+        };
     write_guard.insert(pattern.to_string(), Arc::clone(&regex));
     Some(regex)
 }

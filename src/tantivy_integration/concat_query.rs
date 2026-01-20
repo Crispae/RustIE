@@ -166,10 +166,6 @@ fn compile_constraint_sources(
                     
                     if !is_simple_gap {
                         // Complex repetition (non-wildcard inner pattern) - fallback needed
-                        log::debug!(
-                            "Pattern contains complex Repetition element (non-wildcard), \
-                             falling back to stored-field path"
-                        );
                         return Ok(Vec::new());
                     }
                     // Simple wildcard gap - continue, will be handled by ConcatPlan
@@ -183,10 +179,6 @@ fn compile_constraint_sources(
                             Pattern::Constraint(Constraint::Wildcard)
                         );
                         if !is_simple_gap {
-                            log::debug!(
-                                "Pattern contains complex Repetition inside NamedCapture, \
-                                 falling back to stored-field path"
-                            );
                             return Ok(Vec::new());
                         }
                     }
@@ -261,7 +253,6 @@ fn expand_regex_terms_with_automaton(
     
     while stream.advance() {
         if count >= MAX_REGEX_EXPANSION {
-            log::warn!("Regex pattern '{}' exceeds expansion cap ({}), truncating", pattern, MAX_REGEX_EXPANSION);
             break;
         }
         
@@ -271,10 +262,7 @@ fn expand_regex_terms_with_automaton(
         count += 1;
     }
     
-    if terms.is_empty() {
-        log::debug!("Regex pattern '{}' matched 0 terms in segment", pattern);
-    } else {
-        log::debug!("Regex pattern '{}' expanded to {} terms", pattern, terms.len());
+    if !terms.is_empty() {
         regex_cache.insert(cache_key.to_string(), terms.clone());
     }
     
@@ -455,16 +443,8 @@ impl Weight for RustieConcatWeight {
 
         // Compile constraint sources for postings-based Phase 2
         let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field, self.regex_automaton_cache.clone()) {
-            Ok(sources) => {
-                if sources.is_empty() {
-                    log::debug!("compile_constraint_sources returned empty sources for pattern={:?}, postings path unavailable", self.pattern);
-                } else {
-                    log::debug!("compile_constraint_sources found {} constraint sources for pattern={:?}, postings path available", sources.len(), self.pattern);
-                }
-                sources
-            }
-            Err(e) => {
-                log::warn!("Failed to compile constraint sources, postings path unavailable: {}", e);
+            Ok(sources) => sources,
+            Err(_e) => {
                 Vec::new()  // Empty means postings path cannot run
             }
         };
@@ -637,14 +617,11 @@ impl DocSet for RustieConcatScorer {
 
 impl RustieConcatScorer {
     fn check_pattern_matching(&mut self, doc_id: DocId) -> bool {
-        log::trace!("check_pattern_matching called for doc_id={} with pattern={:?}", doc_id, self.pattern);
         
         self.current_doc_matches.clear();
         
         // Try postings-based path first if constraint sources are available
         if !self.constraint_sources.is_empty() {
-            log::debug!("Using postings path for doc_id={}, {} constraint sources", 
-                        doc_id, self.constraint_sources.len());
             
             // Get doc length and execution plan before mutable borrow
             let doc_len = match self.get_doc_length(doc_id, self.default_field) {
@@ -658,7 +635,6 @@ impl RustieConcatScorer {
             
             match self.get_constraint_positions(doc_id) {
                 Ok(positions_per_constraint) => {
-                    log::trace!("get_constraint_positions succeeded for doc_id={}, {} constraints", doc_id, positions_per_constraint.len());
                     
                     // Use position-based matching
                     let all_spans = find_constraint_spans_from_positions(
@@ -671,18 +647,14 @@ impl RustieConcatScorer {
                     self.current_doc_matches = all_spans;
                     
                     if !self.current_doc_matches.is_empty() {
-                        log::debug!("Postings path found {} matches for doc_id={}", 
-                                    self.current_doc_matches.len(), doc_id);
                         return true;
                     } else {
-                        log::debug!("Postings path found 0 matches for doc_id={}, returning false (no fallback)", doc_id);
                         // Trust the postings path result - if it found 0 matches, return false
                         // Don't fall back to stored-field path which is slower
                         return false;
                     }
                 }
                 Err(e) => {
-                    log::debug!("Postings-based path failed for doc {}: {}, cannot match", doc_id, e);
                     // Fall through to return false
                 }
             }
@@ -1655,11 +1627,6 @@ pub fn generate_all_repetition_matches(
     for count in start_count..=max_count {
         // Performance safeguard: limit total matches generated
         if matches.len() >= MAX_GENERATED_MATCHES {
-            log::warn!(
-                "Match generation limit ({}) reached for repetition pattern at position {}",
-                MAX_GENERATED_MATCHES,
-                pos
-            );
             break;
         }
         
@@ -1701,7 +1668,6 @@ fn match_sequence_recursive(
     // Check iteration limit to prevent exponential blowup
     *iteration_count += 1;
     if *iteration_count > MAX_BACKTRACK_ITERATIONS {
-        log::warn!("Backtracking limit exceeded ({} iterations), aborting match", MAX_BACKTRACK_ITERATIONS);
         return None;
     }
     
@@ -1812,7 +1778,6 @@ fn generate_all_sequence_matches_recursive(
     // Check iteration limit
     *iteration_count += 1;
     if *iteration_count > MAX_BACKTRACK_ITERATIONS {
-        log::warn!("Backtracking limit exceeded in generate_all_sequence_matches");
         return Vec::new();
     }
     

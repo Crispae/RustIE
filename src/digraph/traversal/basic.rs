@@ -24,8 +24,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
     /// Execute a traversal pattern.
     /// Mirrors the Scala GraphTraversal trait and its case classes.
     pub fn execute(&self, traversal: &Traversal, start_nodes: &[usize]) -> TraversalResult {
-        log::debug!("Recursive traversal called (AST: {:?})", traversal);
-        log::debug!("Traversal {:?} from nodes {:?}", traversal, start_nodes);
 
         match traversal {
             Traversal::NoTraversal => TraversalResult::NoTraversal,

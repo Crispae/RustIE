@@ -64,20 +64,17 @@ impl<G: GraphAccess> GraphTraversal<G> {
     ) where
         F: FnMut(usize, usize) -> Option<String>,
     {
-        log::debug!("Recursing - node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
         let num_steps = pattern.len();
         let idx = node * num_steps + step_idx;
 
         // Terminal condition: reached end of pattern
         if step_idx == pattern.len() {
-            log::debug!("Match found! Final path: {:?}", path);
             results.push(path.clone());
             return;
         }
 
         // Cycle detection: skip if already visiting this node at this step in current path
         if memo[idx] {
-            log::debug!("Cycle detected at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
             return;
         }
         memo[idx] = true; // Mark as visiting
@@ -128,7 +125,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
             .count();
 
         if constraint_idx >= constraint_field_names.len() {
-            log::debug!("Constraint index {} out of bounds (len={})", constraint_idx, constraint_field_names.len());
             memo[idx] = false; // Backtrack
             return;
         }
@@ -146,39 +142,33 @@ impl<G: GraphAccess> GraphTraversal<G> {
             if is_exact && prefilter_confirmed {
                 // Skip BOTH get_token() AND constraint.matches()
                 // Postings already confirmed exact match - zero work needed
-                log::debug!("Skipping token fetch and matches() for exact prefilter-confirmed constraint at node: {}", node);
             } else {
                 // Need token for matching (regex/wildcard) or verification
                 let token = match get_token(constraint_idx, node) {
                     Some(t) => t,
                     None => {
-                        log::debug!("No token at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
                         memo[idx] = false; // Backtrack
                         return;
                     }
                 };
                 let matches = constraint.matches(field_name, &token);
                 if !matches {
-                    log::debug!("Failed constraint at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
                     memo[idx] = false; // Backtrack
                     return;
                 }
             }
         } else {
-            log::debug!("Not a constraint pattern at node: {}, step_idx: {}, path: {:?}", node, step_idx, path);
             memo[idx] = false; // Backtrack
             return;
         }
 
         path.push(node);
-        log::debug!("Pushed node {} to path: {:?}", node, path);
         self.automaton_traverse_paths_optimized(
             pattern, node, step_idx + 1, memo, constraint_field_names,
             get_token, allowed_positions, constraint_exact_flags,
             resolved_matchers, path, results
         );
         path.pop();
-        log::debug!("Popped node, path is now: {:?}", path);
     }
 
     /// Handle a traversal step in the automaton traversal.
@@ -711,7 +701,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
         for &start_node in candidate_nodes {
             // Validate start_node is within bounds
             if start_node >= node_count {
-                log::warn!("Start node {} exceeds graph node count {}", start_node, node_count);
                 continue;
             }
             // Clear memo for this iteration (faster than reallocating)
@@ -760,7 +749,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
         for &start_node in candidate_nodes {
             // Validate start_node is within bounds
             if start_node >= node_count {
-                log::warn!("Start node {} exceeds graph node count {}", start_node, node_count);
                 continue;
             }
             // Clear memo for this iteration (faster than reallocating)

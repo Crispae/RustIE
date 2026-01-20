@@ -152,11 +152,6 @@ impl GraphCompiler {
             }
             FlatPatternStep::Traversal(Traversal::Disjunctive(traversals)) => {
                 // Disjunctive traversal: convert labels to regex pattern
-                log::info!(
-                    "Processing DISJUNCTIVE traversal with {} alternatives for {} constraint",
-                    traversals.len(),
-                    if is_first { "first" } else { "last" }
-                );
                 
                 // Extract labels and verify all are same direction
                 let mut labels = Vec::new();
@@ -169,11 +164,9 @@ impl GraphCompiler {
                             all_incoming = false;
                             match matcher {
                                 Matcher::String(s) => {
-                                    log::info!("  - Outgoing edge label (exact): '{}'", s);
                                     labels.push(regex::escape(s));
                                 }
                                 Matcher::Regex { pattern, .. } => {
-                                    log::info!("  - Outgoing edge label (regex): '{}'", pattern);
                                     labels.push(pattern.clone());
                                 }
                             }
@@ -182,28 +175,20 @@ impl GraphCompiler {
                             all_outgoing = false;
                             match matcher {
                                 Matcher::String(s) => {
-                                    log::info!("  - Incoming edge label (exact): '{}'", s);
                                     labels.push(regex::escape(s));
                                 }
                                 Matcher::Regex { pattern, .. } => {
-                                    log::info!("  - Incoming edge label (regex): '{}'", pattern);
                                     labels.push(pattern.clone());
                                 }
                             }
                         }
                         _ => {
-                            log::warn!("  - Nested complex traversal not supported, falling back");
                             return None;
                         }
                     }
                 }
                 
                 if labels.is_empty() || (!all_outgoing && !all_incoming) {
-                    log::warn!(
-                        "Disjunctive traversal cannot be collapsed: empty={} mixed_directions={}",
-                        labels.is_empty(),
-                        !all_outgoing && !all_incoming
-                    );
                     return None; // Mixed directions or empty
                 }
                 
@@ -211,11 +196,6 @@ impl GraphCompiler {
                 // Note: FST regex doesn't support anchors (^ and $), but since we match
                 // against complete terms in the dictionary, anchors aren't needed
                 let regex_pattern = format!("({})", labels.join("|"));
-                log::info!(
-                    "Disjunctive traversal collapsed to regex: '{}' (direction: {})",
-                    regex_pattern,
-                    if all_outgoing { "outgoing" } else { "incoming" }
-                );
                 let edge_matcher = CollapsedMatcher::RegexPattern(regex_pattern);
                 
                 // Determine edge field based on direction and position
@@ -236,14 +216,6 @@ impl GraphCompiler {
         
         // Get constraint field
         let constraint_field = self.schema.get_field(&constraint_field_name).ok()?;
-        
-        log::info!(
-            "Built CollapsedSpec for {} constraint: field='{}' constraint={} edge={}",
-            if is_first { "first" } else { "last" },
-            constraint_field_name,
-            constraint_matcher.display(),
-            edge_matcher.display()
-        );
         
         Some(CollapsedSpec {
             constraint_field,
@@ -296,18 +268,8 @@ impl GraphCompiler {
         );
 
         // Log collapse spec status
-        log::info!(
-            "Odinson-style collapsed query (no BooleanQuery): src_collapse={}, dst_collapse={}",
-            src_collapse.is_some(),
-            dst_collapse.is_some()
-        );
 
         if src_collapse.is_none() && dst_collapse.is_none() {
-            log::warn!(
-                "Neither src nor dst could be collapsed. Query will use EmptyDriver \
-                and may return no results. Consider using exact string constraints \
-                with simple edge traversals for optimal performance."
-            );
         }
 
         // Get remaining schema fields

@@ -17,20 +17,6 @@ pub(crate) fn write_debug_log(entry: &str) {
 
 /// Performance instrumentation helper
 #[inline]
-pub(crate) fn perf_log(session_id: &str, run_id: &str, hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value) {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-    let log_entry = serde_json::json!({
-        "sessionId": session_id,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": timestamp
-    });
-    // Use absolute path to ensure logs are written regardless of working directory
-    let log_path = r"c:\Users\saurav\OneDrive - URV\Escritorio\PARC\tantivy\RustIE\ruste_push\.cursor\debug.log";
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = writeln!(file, "{}", log_entry);
-    }
+pub(crate) fn perf_log(_session_id: &str, _run_id: &str, _hypothesis_id: &str, _location: &str, _message: &str, _data: serde_json::Value) {
+    // Performance logging disabled to avoid file I/O overhead
 }

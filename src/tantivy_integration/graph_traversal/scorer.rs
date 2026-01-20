@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use log::debug;
 use rayon::prelude::*;
 use tantivy::{
     query::Scorer,
@@ -402,14 +401,7 @@ impl OptimizedGraphTraversalScorer {
 
     /// Log final statistics when iteration completes
     fn log_final_stats(&self) {
-        let call_num = CALL_COUNT.load(Ordering::Relaxed);
-        if call_num == 0 {
-            log::warn!(
-                "NO CANDIDATES FOUND! Drivers returned 0 matching documents. \
-                This usually means the index was created with the OLD schema. \
-                You need to RE-INDEX your documents with the new position-aware schema."
-            );
-        }
+        // Logging disabled for performance
     }
 
     /// Build allowed positions combining src_driver, dst_driver, and prefilter positions
@@ -572,7 +564,6 @@ impl OptimizedGraphTraversalScorer {
                         let postings = match postings_opt {
                             Some(p) => p,
                             None => {
-                                log::warn!("EdgeReq[{}] has no postings in segment", req_idx);
                                 return None;
                             }
                         };
@@ -588,7 +579,6 @@ impl OptimizedGraphTraversalScorer {
                         postings.positions(&mut buf);
 
                         if buf.is_empty() {
-                            log::warn!("EdgeReq[{}] doc_id={} has term but ZERO positions!", req_idx, doc_id);
                             return None;
                         }
 
@@ -889,7 +879,6 @@ impl OptimizedGraphTraversalScorer {
         let constraint_field_names = &self.constraint_field_names;
 
         if !ZeroCopyGraph::is_valid_format(binary_data) {
-            log::error!("Query-time: Invalid graph format - expected zero-copy format (magic number mismatch). Skipping document.");
             GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -979,8 +968,7 @@ impl OptimizedGraphTraversalScorer {
 
                 false
             }
-            Err(e) => {
-                log::error!("Query-time: ZeroCopyGraph::from_bytes failed: {:?}. Skipping document.", e);
+            Err(_e) => {
                 GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 false
             }
@@ -1014,8 +1002,6 @@ impl OptimizedGraphTraversalScorer {
     }
 
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
-        debug!("get_current_doc_matches called, current_doc_matches.len() = {}", self.current_doc_matches.len());
-        debug!("current_doc_matches = {:?}", self.current_doc_matches);
         &self.current_doc_matches
     }
 

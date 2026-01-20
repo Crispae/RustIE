@@ -75,6 +75,8 @@ impl GraphTraversalStats {
     }
 
     pub fn print_summary(&self) {
+        // Printing disabled for performance
+        return;
         println!("\n=== Graph Traversal Performance Statistics ===");
 
         let skip_rate = if self.call_count > 0 {
