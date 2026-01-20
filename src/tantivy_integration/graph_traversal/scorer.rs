@@ -28,7 +28,7 @@ use super::types::{
     PREFILTER_SKIPPED_ALL_COLLAPSED,
     ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
 };
-use super::candidate_driver::{CandidateDriver, IntermediateEdgeFilter};
+use super::candidate_driver::CandidateDriver;
 
 /// Optimized scorer for graph traversal queries
 /// Uses CandidateDriver abstraction for Odinson-style collapsed query optimization
@@ -75,9 +75,29 @@ pub struct OptimizedGraphTraversalScorer {
     /// Reusable HashSet buffers for allowed_positions_hashset
     /// OPTIMIZATION: Avoids allocating new HashSets per document
     pub(crate) allowed_positions_hashset_buf: Vec<Option<HashSet<u32>>>,
-    /// OPTIMIZATION: Intermediate edge filter for document-level filtering during enumeration
-    /// Enables Odinson-style filtering where ALL edges participate in document selection
-    pub(crate) intermediate_edge_filter: IntermediateEdgeFilter,
+    
+    // === NEW: Reusable buffers for compute_allowed_positions() ===
+    /// Reusable buffer for requirements grouped by constraint index
+    /// OPTIMIZATION: Avoids allocating new HashMap per document
+    reqs_by_constraint_buf: HashMap<usize, Vec<PositionRequirement>>,
+    /// Reusable buffer for tracking constraint indices with requirements
+    /// OPTIMIZATION: Avoids allocating new HashSet per document
+    constraint_indices_buf: HashSet<usize>,
+    /// Reusable buffer for position collection during postings iteration
+    /// OPTIMIZATION: Avoids allocating new Vec per postings read
+    positions_buf: Vec<u32>,
+    /// Reusable buffer for edge position intersection
+    /// OPTIMIZATION: Avoids allocating during intersection operations
+    edge_intersection_buf: Vec<u32>,
+    /// Reusable buffer for constraint position union
+    /// OPTIMIZATION: Avoids allocating during union operations
+    constraint_union_buf: Vec<u32>,
+    /// Reusable buffer for allowed positions result
+    /// OPTIMIZATION: Avoids allocating new Vec<Option<Vec<u32>>> per document
+    allowed_positions_buf: Vec<Option<Vec<u32>>>,
+    /// Reusable temporary buffer for intersection operations
+    /// OPTIMIZATION: Avoids allocating new Vec during intersections
+    intersection_temp_buf: Vec<u32>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -102,7 +122,6 @@ impl OptimizedGraphTraversalScorer {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
         constraint_exact_flags: Vec<bool>,
-        intermediate_edge_filter: IntermediateEdgeFilter,
     ) -> Self {
         let num_constraints = prefilter_plan.num_constraints;
         // OPTIMIZATION: Pre-allocate HashSet buffers for reuse across documents
@@ -132,7 +151,14 @@ impl OptimizedGraphTraversalScorer {
             dst_collapse,
             constraint_exact_flags,
             allowed_positions_hashset_buf,
-            intermediate_edge_filter,
+            // Initialize reusable buffers
+            reqs_by_constraint_buf: HashMap::with_capacity(num_constraints),
+            constraint_indices_buf: HashSet::with_capacity(num_constraints),
+            positions_buf: Vec::with_capacity(64),
+            edge_intersection_buf: Vec::with_capacity(64),
+            constraint_union_buf: Vec::with_capacity(64),
+            allowed_positions_buf: vec![None; num_constraints],
+            intersection_temp_buf: Vec::with_capacity(64),
         }
     }
 }
@@ -558,41 +584,74 @@ impl OptimizedGraphTraversalScorer {
         out
     }
 
-    /// Compute allowed positions for each constraint, using driver positions for collapsed constraints
+    /// OPTIMIZATION: Intersect into a provided buffer to avoid allocation
+    fn intersect_sorted_into_buf(a: &[u32], b: &[u32], buf: &mut Vec<u32>) {
+        buf.clear();
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    buf.push(a[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    }
+
+    /// OPTIMIZED: Compute allowed positions with buffer reuse
+    /// Uses pre-allocated buffers from the scorer to avoid per-document allocations
     pub(crate) fn compute_allowed_positions(
         &mut self,
         doc_id: DocId,
         src_driver_positions: Option<&[u32]>,
         dst_driver_positions: Option<&[u32]>,
     ) -> Option<Vec<Option<Vec<u32>>>> {
-        let mut allowed: Vec<Option<Vec<u32>>> = vec![None; self.prefilter_plan.num_constraints];
+        let num_constraints = self.prefilter_plan.num_constraints;
+        
+        // OPTIMIZATION: Clear and reuse the allowed positions buffer
+        if self.allowed_positions_buf.len() != num_constraints {
+            self.allowed_positions_buf.resize_with(num_constraints, || None);
+        }
+        for slot in &mut self.allowed_positions_buf {
+            if let Some(ref mut v) = slot {
+                v.clear();
+            }
+            *slot = None;
+        }
 
         let src_collapsed_idx = self.src_collapse.as_ref().map(|s| s.constraint_idx);
         let dst_collapsed_idx = self.dst_collapse.as_ref().map(|s| s.constraint_idx);
-        let last_constraint_idx = self.prefilter_plan.num_constraints.saturating_sub(1);
+        let last_constraint_idx = num_constraints.saturating_sub(1);
         let dst_is_last = dst_collapsed_idx.map(|idx| idx == last_constraint_idx).unwrap_or(false);
 
+        // Handle collapsed driver positions
         if let Some(src_positions) = src_driver_positions {
             if let Some(idx) = src_collapsed_idx {
-                allowed[idx] = Some(src_positions.to_vec());
+                self.allowed_positions_buf[idx] = Some(src_positions.to_vec());
             }
         }
         if let Some(dst_positions) = dst_driver_positions {
             if dst_is_last {
                 if let Some(idx) = dst_collapsed_idx {
-                    allowed[idx] = Some(dst_positions.to_vec());
+                    self.allowed_positions_buf[idx] = Some(dst_positions.to_vec());
                 }
             }
         }
 
-        let mut requirements_by_constraint: HashMap<usize, Vec<PositionRequirement>> = HashMap::new();
+        // OPTIMIZATION: Clear and reuse the requirements buffer
+        self.reqs_by_constraint_buf.clear();
+        self.constraint_indices_buf.clear();
 
+        // Group edge requirements by constraint index
         for (req_idx, req) in self.prefilter_plan.edge_reqs.iter().enumerate() {
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
                 continue;
             }
 
-            requirements_by_constraint
+            self.reqs_by_constraint_buf
                 .entry(req.constraint_idx)
                 .or_insert_with(Vec::new)
                 .push(PositionRequirement::Edge {
@@ -602,16 +661,15 @@ impl OptimizedGraphTraversalScorer {
                 });
         }
 
-        let mut constraint_indices_with_reqs: HashSet<usize> = HashSet::new();
-
+        // Group constraint requirements by constraint index
         for (req_idx, req) in self.constraint_reqs.iter().enumerate() {
             if Some(req.constraint_idx) == src_collapsed_idx || Some(req.constraint_idx) == dst_collapsed_idx {
                 continue;
             }
 
-            constraint_indices_with_reqs.insert(req.constraint_idx);
+            self.constraint_indices_buf.insert(req.constraint_idx);
 
-            requirements_by_constraint
+            self.reqs_by_constraint_buf
                 .entry(req.constraint_idx)
                 .or_insert_with(Vec::new)
                 .push(PositionRequirement::Constraint {
@@ -621,20 +679,27 @@ impl OptimizedGraphTraversalScorer {
                 });
         }
 
-        let mut buf: Vec<u32> = Vec::with_capacity(32);
+        // Process each constraint's requirements
+        // We need to drain the map to get owned values since we need &mut self for postings
+        let requirements_vec: Vec<_> = self.reqs_by_constraint_buf.drain().collect();
+        // OPTIMIZATION: Avoid cloning HashSet - use reference instead
+        let constraint_indices_with_reqs = &self.constraint_indices_buf;
 
-        for (constraint_idx, mut requirements) in requirements_by_constraint {
+        for (constraint_idx, mut requirements) in requirements_vec {
+            // Sort: edge requirements first (they typically have fewer matches)
             requirements.sort_by_key(|req| match req {
                 PositionRequirement::Edge { .. } => 0,
                 PositionRequirement::Constraint { .. } => 1,
             });
 
-            let mut edge_intersection: Option<Vec<u32>> = None;
-            let mut constraint_union: Vec<u32> = Vec::with_capacity(64);
+            // OPTIMIZATION: Use reusable buffers
+            self.edge_intersection_buf.clear();
+            self.constraint_union_buf.clear();
+            let mut edge_intersection_initialized = false;
             let mut has_constraint_reqs = false;
 
             for req in requirements {
-                buf.clear();
+                self.positions_buf.clear();
 
                 match req {
                     PositionRequirement::Edge { req_idx, .. } => {
@@ -653,25 +718,33 @@ impl OptimizedGraphTraversalScorer {
                         }
 
                         if postings.doc() != doc_id {
+                            // EARLY EXIT: Document doesn't have this edge term
                             return None;
                         }
 
-                        postings.positions(&mut buf);
+                        postings.positions(&mut self.positions_buf);
 
-                        if buf.is_empty() {
+                        if self.positions_buf.is_empty() {
                             log::warn!("EdgeReq[{}] doc_id={} has term but ZERO positions!", req_idx, doc_id);
                             return None;
                         }
 
-                        match &mut edge_intersection {
-                            None => {
-                                edge_intersection = Some(std::mem::take(&mut buf));
-                            }
-                            Some(existing) => {
-                                Self::intersect_sorted_in_place(existing, &buf);
-                                if existing.is_empty() {
-                                    return None;
-                                }
+                        if !edge_intersection_initialized {
+                            self.edge_intersection_buf.clear();
+                            self.edge_intersection_buf.extend_from_slice(&self.positions_buf);
+                            edge_intersection_initialized = true;
+                        } else {
+                            // OPTIMIZATION: Reuse temp buffer instead of allocating
+                            Self::intersect_sorted_into_buf(
+                                &self.edge_intersection_buf,
+                                &self.positions_buf,
+                                &mut self.intersection_temp_buf
+                            );
+                            std::mem::swap(&mut self.edge_intersection_buf, &mut self.intersection_temp_buf);
+                            
+                            if self.edge_intersection_buf.is_empty() {
+                                // EARLY EXIT: No common edge positions
+                                return None;
                             }
                         }
                     }
@@ -695,69 +768,81 @@ impl OptimizedGraphTraversalScorer {
                             continue;
                         }
 
-                        postings.positions(&mut buf);
+                        postings.positions(&mut self.positions_buf);
 
-                        if !buf.is_empty() {
-                            if let Some(ref edge_positions) = edge_intersection {
-                                let filtered = Self::intersect_sorted_slices(&buf, edge_positions);
+                        if !self.positions_buf.is_empty() {
+                            if edge_intersection_initialized {
+                                // Intersect with edge positions and add to union
+                                let mut filtered = Vec::new();
+                                Self::intersect_sorted_into_buf(
+                                    &self.positions_buf,
+                                    &self.edge_intersection_buf,
+                                    &mut filtered
+                                );
                                 if !filtered.is_empty() {
-                                    constraint_union.extend_from_slice(&filtered);
+                                    self.constraint_union_buf.extend_from_slice(&filtered);
                                 }
                             } else {
-                                constraint_union.extend_from_slice(&buf);
+                                self.constraint_union_buf.extend_from_slice(&self.positions_buf);
                             }
                         }
                     }
                 }
             }
 
-            if constraint_indices_with_reqs.contains(&constraint_idx) && constraint_union.is_empty() {
+            // EARLY EXIT: If we have constraint requirements but no matches
+            if constraint_indices_with_reqs.contains(&constraint_idx) && self.constraint_union_buf.is_empty() {
                 return None;
             }
 
+            // Compute final positions for this constraint
             let final_positions = if has_constraint_reqs {
-                if !constraint_union.is_empty() {
-                    constraint_union.sort_unstable();
-                    constraint_union.dedup();
+                if !self.constraint_union_buf.is_empty() {
+                    self.constraint_union_buf.sort_unstable();
+                    self.constraint_union_buf.dedup();
                 }
 
-                if constraint_union.is_empty() {
+                if self.constraint_union_buf.is_empty() {
                     return None;
                 }
 
-                match edge_intersection {
-                    None => {
-                        constraint_union
+                if edge_intersection_initialized {
+                    // OPTIMIZATION: Reuse temp buffer instead of allocating
+                    Self::intersect_sorted_into_buf(
+                        &self.edge_intersection_buf,
+                        &self.constraint_union_buf,
+                        &mut self.intersection_temp_buf
+                    );
+                    if self.intersection_temp_buf.is_empty() {
+                        return None;
                     }
-                    Some(mut edge_positions) => {
-                        Self::intersect_sorted_in_place(&mut edge_positions, &constraint_union);
-                        if edge_positions.is_empty() {
-                            return None;
-                        }
-                        edge_positions
-                    }
+                    std::mem::take(&mut self.intersection_temp_buf)
+                } else {
+                    std::mem::take(&mut self.constraint_union_buf)
                 }
+            } else if edge_intersection_initialized {
+                std::mem::take(&mut self.edge_intersection_buf)
             } else {
-                match edge_intersection {
-                    None => {
-                        continue;
-                    }
-                    Some(edge_positions) => edge_positions,
-                }
+                continue;
             };
 
-            allowed[constraint_idx] = Some(final_positions);
+            self.allowed_positions_buf[constraint_idx] = Some(final_positions);
         }
 
-        for constraint_idx in &constraint_indices_with_reqs {
+        // Final validation: all constraints with requirements must have positions
+        // OPTIMIZATION: Iterate over HashSet directly instead of cloning
+        for constraint_idx in constraint_indices_with_reqs {
             if Some(*constraint_idx) != src_collapsed_idx && Some(*constraint_idx) != dst_collapsed_idx {
-                if allowed[*constraint_idx].is_none() || allowed[*constraint_idx].as_ref().unwrap().is_empty() {
+                if self.allowed_positions_buf[*constraint_idx].is_none() 
+                    || self.allowed_positions_buf[*constraint_idx].as_ref().unwrap().is_empty() 
+                {
                     return None;
                 }
             }
         }
 
-        Some(allowed)
+        // Return a clone of the buffer (we could optimize this further with mem::take)
+        Some(std::mem::take(&mut self.allowed_positions_buf))
     }
 
     /// OPTIMIZATION: Check if document has all intermediate edges (doc-level, not position-level)
@@ -797,13 +882,32 @@ impl OptimizedGraphTraversalScorer {
         true
     }
 
+    /// OPTIMIZATION: Lightweight check for position availability without cloning
+    /// Returns (src_has_positions, dst_has_positions) tuple
+    #[inline]
+    fn check_position_availability(&self) -> (bool, bool) {
+        (
+            self.src_driver.matching_positions().is_some(),
+            self.dst_driver.matching_positions().is_some(),
+        )
+    }
+
     /// Check if a document has valid graph traversal from source to destination
+    /// 
+    /// OPTIMIZED: Follows lazy evaluation pattern:
+    /// 1. Early rejection checks (no allocations)
+    /// 2. Deferred position cloning (only when needed)
+    /// 3. Position validation before document loading
+    /// 4. Lazy token parsing
+    /// 5. Graph deserialization last
     pub(crate) fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {
         let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
         self.current_doc_matches.clear();
 
         let num_constraints = self.prefilter_plan.num_constraints;
 
+        // ========== PHASE 1: Early Rejection (No Allocations) ==========
+        
         // OPTIMIZATION: Early check for intermediate edges BEFORE any expensive work
         // This avoids position cloning for documents that will be rejected anyway
         if num_constraints > 2 && !self.has_all_intermediate_edges(doc_id) {
@@ -812,10 +916,15 @@ impl OptimizedGraphTraversalScorer {
             return false;
         }
 
-        // Optimization: Check if all constraints are collapsed first (avoids cloning in fast path)
-        // We need to check driver positions availability before deciding the path
-        let src_has_positions = self.src_driver.matching_positions().is_some();
-        let dst_has_positions = self.dst_driver.matching_positions().is_some();
+        // OPTIMIZATION: Cache positions once to avoid multiple calls to matching_positions()
+        // This avoids repeated lookups in the driver
+        let src_driver_positions_cached: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
+        let dst_driver_positions_cached: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
+        
+        let src_has_positions = src_driver_positions_cached.is_some();
+        let dst_has_positions = dst_driver_positions_cached.is_some();
+        
+        // Check if all constraints are collapsed (fast path determination)
         let all_collapsed = num_constraints == 2
             && self.src_collapse.is_some()
             && self.dst_collapse.is_some()
@@ -824,29 +933,30 @@ impl OptimizedGraphTraversalScorer {
 
         PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
 
-        // OPTIMIZATION: Clone positions only once - use take() pattern to avoid double clone
-        // In the all_collapsed branch, we move positions directly
-        // In the non-collapsed branch, compute_allowed_positions needs &mut self, so we must clone first
-        let mut src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
-        let mut dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
-
+        // ========== PHASE 2: Deferred Position Cloning ==========
+        
+        // OPTIMIZATION: Reuse cached positions instead of calling matching_positions() again
+        // For all_collapsed path: use cached positions directly
+        // For non-collapsed path: use cached positions for compute_allowed_positions
+        
         let allowed_positions = if all_collapsed {
             PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
 
+            // OPTIMIZATION: Use cached positions directly for collapsed path
             let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
-            // OPTIMIZATION: Move positions directly using take() instead of clone()
-            if let Some(positions) = src_driver_positions.take() {
+            if let Some(positions) = src_driver_positions_cached {
                 allowed[0] = Some(positions);
             }
-            if let Some(positions) = dst_driver_positions.take() {
+            if let Some(positions) = dst_driver_positions_cached {
                 allowed[num_constraints - 1] = Some(positions);
             }
             allowed
         } else {
+            // Non-collapsed path: use cached positions for compute_allowed_positions
             match self.compute_allowed_positions(
                 doc_id,
-                src_driver_positions.as_deref(),
-                dst_driver_positions.as_deref(),
+                src_driver_positions_cached.as_deref(),
+                dst_driver_positions_cached.as_deref(),
             ) {
                 Some(ap) => ap,
                 None => {
@@ -857,6 +967,9 @@ impl OptimizedGraphTraversalScorer {
             }
         };
 
+        // ========== PHASE 3: Position Validation (Before Document Loading) ==========
+        
+        // Record statistics
         for ap in &allowed_positions {
             if let Some(ref positions) = ap {
                 PREFILTER_ALLOWED_POS_SUM.fetch_add(positions.len(), Ordering::Relaxed);
@@ -864,6 +977,7 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
+        // OPTIMIZATION: Validate allowed_positions are non-empty BEFORE loading document
         for ap in &allowed_positions {
             if let Some(ref positions) = ap {
                 if positions.is_empty() {
@@ -873,30 +987,43 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
-        // OPTIMIZATION: Reuse HashSet buffers instead of allocating new ones
-        // Must be done before borrowing flat_steps to avoid borrow conflicts
+        // Check flat_steps before document loading (temporary borrow that ends immediately)
+        if self.flat_steps.is_empty() {
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // OPTIMIZATION: Build HashSet buffer from already-computed allowed_positions
+        // Extract positions directly from allowed_positions to avoid re-cloning
+        let src_positions_for_buf = allowed_positions.get(0).and_then(|ap| ap.as_ref().map(|v| v.as_slice()));
+        let dst_positions_for_buf = allowed_positions.get(num_constraints.saturating_sub(1))
+            .and_then(|ap| ap.as_ref().map(|v| v.as_slice()));
+
+        // Mutable borrow of self - now safe because no outstanding immutable borrows
         self.build_allowed_positions_into_buf(
-            src_driver_positions.as_deref(),
-            dst_driver_positions.as_deref(),
+            src_positions_for_buf,
+            dst_positions_for_buf,
             &allowed_positions,
             num_constraints,
         );
 
+        // NOW we can create the long-lived borrow of flat_steps (after mutable operations are done)
         let flat_steps = &self.flat_steps;
-        if flat_steps.is_empty() {
-            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
 
         let total_constraints = flat_steps.iter()
             .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
             .count();
 
+        // ========== PHASE 4: Deferred Document Loading ==========
+        
+        // OPTIMIZATION: Load document only after all position validations pass
         let doc = match self.store_reader.get(doc_id) {
             Ok(doc) => doc,
             Err(_) => return false,
         };
 
+        // ========== PHASE 5: Lazy Token Parsing ==========
+        
         let mut lazy_tokens = LazyConstraintTokens::new(
             &doc,
             &self.constraint_field_names,
@@ -904,17 +1031,41 @@ impl OptimizedGraphTraversalScorer {
         );
 
         // OPTIMIZATION: Use pre-computed constraint_exact_flags from Weight
-        // (computed once at query creation, not per document)
         let constraint_exact_flags = &self.constraint_exact_flags;
 
         let mut constraint_count = 0;
         let mut cached_positions: Vec<Vec<usize>> = Vec::new();
 
+        // OPTIMIZATION: Only parse tokens for constraints with non-empty allowed_positions
         for step in flat_steps.iter() {
             if let FlatPatternStep::Constraint(constraint_pat) = step {
                 if constraint_count >= self.constraint_field_names.len() {
                     GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return false;
+                }
+
+                // OPTIMIZATION: Check if this constraint has positions before parsing tokens
+                let has_allowed = allowed_positions.get(constraint_count)
+                    .and_then(|ap| ap.as_ref())
+                    .map(|p| !p.is_empty())
+                    .unwrap_or(false);
+
+                // For collapsed constraints or those with allowed positions, we need tokens
+                let is_first_constraint = constraint_count == 0;
+                let is_last_constraint = constraint_count == total_constraints - 1;
+                let is_collapsed = (is_first_constraint && self.src_collapse.is_some())
+                    || (is_last_constraint && self.dst_collapse.is_some());
+
+                // OPTIMIZATION: Skip token parsing if no allowed positions and not collapsed
+                if !has_allowed && !is_collapsed {
+                    let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
+                    let is_wildcard = matches!(unwrapped, Pattern::Constraint(Constraint::Wildcard));
+                    if !is_wildcard {
+                        // No positions and not wildcard - skip this constraint
+                        cached_positions.push(Vec::new());
+                        constraint_count += 1;
+                        continue;
+                    }
                 }
 
                 let tokens = match lazy_tokens.get_all_tokens(constraint_count) {
@@ -926,14 +1077,7 @@ impl OptimizedGraphTraversalScorer {
                 };
 
                 let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
-
-                let is_wildcard = matches!(
-                    unwrapped,
-                    Pattern::Constraint(Constraint::Wildcard)
-                );
-
-                let is_first_constraint = constraint_count == 0;
-                let is_last_constraint = constraint_count == total_constraints - 1;
+                let is_wildcard = matches!(unwrapped, Pattern::Constraint(Constraint::Wildcard));
 
                 let positions = if is_first_constraint && self.src_collapse.is_some() {
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
@@ -968,6 +1112,9 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
+        // ========== PHASE 6: Deferred Graph Deserialization ==========
+        
+        // OPTIMIZATION: Get binary data and validate format BEFORE deserialization
         let binary_data = match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
             Some(data) => data,
             None => {
@@ -975,6 +1122,13 @@ impl OptimizedGraphTraversalScorer {
                 return false;
             }
         };
+
+        // OPTIMIZATION: Format validation check before deserialization
+        if !ZeroCopyGraph::is_valid_format(binary_data) {
+            log::error!("Query-time: Invalid graph format - expected zero-copy format (magic number mismatch). Skipping document.");
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
 
         GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
 
@@ -991,12 +1145,6 @@ impl OptimizedGraphTraversalScorer {
 
         let estimated_size = src_positions_slice.len();
         let constraint_field_names = &self.constraint_field_names;
-
-        if !ZeroCopyGraph::is_valid_format(binary_data) {
-            log::error!("Query-time: Invalid graph format - expected zero-copy format (magic number mismatch). Skipping document.");
-            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
 
         let traversal_result = match ZeroCopyGraph::from_bytes(binary_data) {
             Ok(zc_graph) => {
@@ -1216,175 +1364,145 @@ impl Scorer for OptimizedGraphTraversalScorer {
 }
 
 impl DocSet for OptimizedGraphTraversalScorer {
-    fn advance(&mut self) -> DocId {
-        let current_doc = self.doc();
-
-        let mut candidate = if current_doc == tantivy::TERMINATED {
-            self.src_driver.seek(0)
-        } else {
-            self.src_driver.advance()
-        };
-
-        loop {
-            if candidate == tantivy::TERMINATED {
-                self.current_doc = None;
-                self.log_final_stats();
-                return tantivy::TERMINATED;
-            }
-
-            let dst_current = self.dst_driver.doc();
-
-            const SEEK_THRESHOLD: DocId = 10;
-            let dst_doc = if dst_current < candidate {
-                let gap = candidate - dst_current;
-                if gap >= SEEK_THRESHOLD {
-                    self.dst_driver.seek(candidate)
-                } else {
-                    let mut doc = dst_current;
-                    while doc < candidate {
-                        doc = self.dst_driver.advance();
-                        if doc == tantivy::TERMINATED {
-                            break;
-                        }
-                    }
-                    doc
-                }
+        fn advance(&mut self) -> DocId {
+            let current_doc = self.doc();
+    
+            let mut candidate = if current_doc == tantivy::TERMINATED {
+                self.src_driver.seek(0)
             } else {
-                dst_current
+                self.src_driver.advance()
             };
-
-            if dst_doc == tantivy::TERMINATED {
-                self.current_doc = None;
-                self.log_final_stats();
-                return tantivy::TERMINATED;
-            }
-
-            if dst_doc > candidate {
-                DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
-                let gap = dst_doc - candidate;
-
+    
+            loop {
+                if candidate == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    self.log_final_stats();
+                    return tantivy::TERMINATED;
+                }
+    
+                let dst_current = self.dst_driver.doc();
+    
                 const SEEK_THRESHOLD: DocId = 10;
-                if gap >= SEEK_THRESHOLD {
-                    candidate = self.src_driver.seek(dst_doc);
+                let dst_doc = if dst_current < candidate {
+                    let gap = candidate - dst_current;
+                    if gap >= SEEK_THRESHOLD {
+                        self.dst_driver.seek(candidate)
+                    } else {
+                        let mut doc = dst_current;
+                        while doc < candidate {
+                            doc = self.dst_driver.advance();
+                            if doc == tantivy::TERMINATED {
+                                break;
+                            }
+                        }
+                        doc
+                    }
                 } else {
-                    while candidate < dst_doc {
-                        candidate = self.src_driver.advance();
-                        if candidate == tantivy::TERMINATED {
-                            break;
+                    dst_current
+                };
+    
+                if dst_doc == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    self.log_final_stats();
+                    return tantivy::TERMINATED;
+                }
+    
+                if dst_doc > candidate {
+                    DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
+                    let gap = dst_doc - candidate;
+    
+                    const SEEK_THRESHOLD: DocId = 10;
+                    if gap >= SEEK_THRESHOLD {
+                        candidate = self.src_driver.seek(dst_doc);
+                    } else {
+                        while candidate < dst_doc {
+                            candidate = self.src_driver.advance();
+                            if candidate == tantivy::TERMINATED {
+                                break;
+                            }
                         }
                     }
-                }
-                continue;
-            }
-
-            debug_assert_eq!(candidate, dst_doc);
-            DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
-
-            // OPTIMIZATION: Check intermediate edges during document enumeration
-            // This filters out documents early, before any expensive graph traversal work
-            if !self.intermediate_edge_filter.is_empty() {
-                if !self.intermediate_edge_filter.document_matches(candidate) {
-                    // Document doesn't have all intermediate edges - skip it
-                    // Use seek_to_matching_doc to find next document with all edges
-                    let next_edge_doc = self.intermediate_edge_filter.seek_to_matching_doc(candidate + 1);
-                    if next_edge_doc == tantivy::TERMINATED {
-                        self.current_doc = None;
-                        self.log_final_stats();
-                        return tantivy::TERMINATED;
-                    }
-                    // Seek src_driver to the next document that has all intermediate edges
-                    candidate = self.src_driver.seek(next_edge_doc);
                     continue;
                 }
+    
+                debug_assert_eq!(candidate, dst_doc);
+                DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
+    
+                if let Some(src_pos) = self.src_driver.matching_positions() {
+                    DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
+                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(dst_pos) = self.dst_driver.matching_positions() {
+                    DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
+                    DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+    
+                if self.check_graph_traversal(candidate) {
+                    self.current_doc = Some(candidate);
+                    let score = self.compute_odinson_score();
+                    self.current_matches.push((candidate, score));
+                    self.match_index = self.current_matches.len() - 1;
+                    return candidate;
+                }
+                candidate = self.src_driver.advance();
             }
-
-            if let Some(src_pos) = self.src_driver.matching_positions() {
-                DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
-                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some(dst_pos) = self.dst_driver.matching_positions() {
-                DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
-                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-
-            if self.check_graph_traversal(candidate) {
-                self.current_doc = Some(candidate);
-                let score = self.compute_odinson_score();
-                self.current_matches.push((candidate, score));
-                self.match_index = self.current_matches.len() - 1;
-                return candidate;
-            }
-            candidate = self.src_driver.advance();
         }
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        let current = self.doc();
-        if current != tantivy::TERMINATED && current >= target {
-            return current;
-        }
-
-        let mut candidate = self.src_driver.seek(target);
-
-        loop {
-            if candidate == tantivy::TERMINATED {
-                self.current_doc = None;
-                return tantivy::TERMINATED;
+    
+        fn seek(&mut self, target: DocId) -> DocId {
+            let current = self.doc();
+            if current != tantivy::TERMINATED && current >= target {
+                return current;
             }
-
-            let dst_doc = self.dst_driver.seek(candidate);
-
-            if dst_doc == tantivy::TERMINATED {
-                self.current_doc = None;
-                return tantivy::TERMINATED;
-            }
-
-            if dst_doc > candidate {
-                const SEEK_THRESHOLD: DocId = 10;
-                let gap = dst_doc - candidate;
-                if gap >= SEEK_THRESHOLD {
-                    candidate = self.src_driver.seek(dst_doc);
-                } else {
-                    while candidate < dst_doc {
-                        candidate = self.src_driver.advance();
-                        if candidate == tantivy::TERMINATED {
-                            break;
+    
+            let mut candidate = self.src_driver.seek(target);
+    
+            loop {
+                if candidate == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
+                }
+    
+                let dst_doc = self.dst_driver.seek(candidate);
+    
+                if dst_doc == tantivy::TERMINATED {
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
+                }
+    
+                if dst_doc > candidate {
+                    const SEEK_THRESHOLD: DocId = 10;
+                    let gap = dst_doc - candidate;
+                    if gap >= SEEK_THRESHOLD {
+                        candidate = self.src_driver.seek(dst_doc);
+                    } else {
+                        while candidate < dst_doc {
+                            candidate = self.src_driver.advance();
+                            if candidate == tantivy::TERMINATED {
+                                break;
+                            }
                         }
                     }
-                }
-                continue;
-            }
-
-            // OPTIMIZATION: Check intermediate edges during document enumeration
-            if !self.intermediate_edge_filter.is_empty() {
-                if !self.intermediate_edge_filter.document_matches(candidate) {
-                    let next_edge_doc = self.intermediate_edge_filter.seek_to_matching_doc(candidate + 1);
-                    if next_edge_doc == tantivy::TERMINATED {
-                        self.current_doc = None;
-                        return tantivy::TERMINATED;
-                    }
-                    candidate = self.src_driver.seek(next_edge_doc);
                     continue;
                 }
+    
+                if self.check_graph_traversal(candidate) {
+                    self.current_doc = Some(candidate);
+                    let score = self.compute_odinson_score();
+                    self.current_matches.push((candidate, score));
+                    self.match_index = self.current_matches.len() - 1;
+                    return candidate;
+                }
+    
+                candidate = self.src_driver.advance();
             }
-
-            if self.check_graph_traversal(candidate) {
-                self.current_doc = Some(candidate);
-                let score = self.compute_odinson_score();
-                self.current_matches.push((candidate, score));
-                self.match_index = self.current_matches.len() - 1;
-                return candidate;
-            }
-
-            candidate = self.src_driver.advance();
+        }
+    
+        fn doc(&self) -> DocId {
+            self.current_doc.unwrap_or(tantivy::TERMINATED)
+        }
+    
+        fn size_hint(&self) -> u32 {
+            0
         }
     }
-
-    fn doc(&self) -> DocId {
-        self.current_doc.unwrap_or(tantivy::TERMINATED)
-    }
-
-    fn size_hint(&self) -> u32 {
-        0
-    }
-}
+    
