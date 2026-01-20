@@ -27,7 +27,6 @@ use super::candidate_driver::{
     expand_matcher, get_or_compile_regex,
 };
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
-use super::logging::perf_log;
 use super::scorer::OptimizedGraphTraversalScorer;
 
 /// Optimized weight for graph traversal queries using Odinson-style collapsed optimization.
@@ -208,27 +207,21 @@ impl Weight for OptimizedGraphTraversalWeight {
 
         let src_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.src_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "src_driver_type", serde_json::json!({"type": "CombinedPositionDriver"}));
                 driver
             } else {
-                perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "src_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "build_combined_driver_failed"}));
                 Box::new(EmptyDriver)
             }
         } else {
-            perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "src_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "no_src_collapse"}));
             Box::new(EmptyDriver)
         };
 
         let dst_driver: Box<dyn CandidateDriver> = if let Some(ref spec) = self.dst_collapse {
             if let Some(driver) = self.build_combined_driver(reader, spec) {
-                perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "dst_driver_type", serde_json::json!({"type": "CombinedPositionDriver"}));
                 driver
             } else {
-                perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "dst_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "build_combined_driver_failed"}));
                 Box::new(EmptyDriver)
             }
         } else {
-            perf_log("debug-session", "run1", "H3", "weight.rs:scorer", "dst_driver_type", serde_json::json!({"type": "EmptyDriver", "reason": "no_dst_collapse"}));
             Box::new(EmptyDriver)
         };
 

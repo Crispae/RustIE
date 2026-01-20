@@ -5,7 +5,6 @@
 
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tantivy::{
     DocId, DocSet,
@@ -18,7 +17,6 @@ use tantivy_fst::Regex;
 
 use super::types::CollapsedMatcher;
 use super::intersection::{PositionIterator, intersect_sorted_into};
-use super::logging::perf_log;
 
 // =============================================================================
 // CandidateDriver Trait and Implementations (Odinson-style collapsed queries)
@@ -139,7 +137,6 @@ impl CombinedPositionDriver {
             }
 
             // Same doc - compute position intersection
-            let pos_intersect_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             self.constraint_buf.clear();
             self.edge_buf.clear();
             self.constraint_postings.positions(&mut self.constraint_buf);
@@ -147,8 +144,6 @@ impl CombinedPositionDriver {
 
             self.intersection.clear();
             intersect_sorted_into(&self.constraint_buf, &self.edge_buf, &mut self.intersection);
-            let pos_intersect_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-            perf_log("debug-session", "run1", "H6", "candidate_driver.rs:advance", "position_intersection_time_advance", serde_json::json!({"doc": d1, "constraint_pos_count": self.constraint_buf.len(), "edge_pos_count": self.edge_buf.len(), "intersection_count": self.intersection.len(), "time_ms": pos_intersect_end - pos_intersect_start}));
 
             let doc = d1;
 
@@ -198,7 +193,6 @@ impl CombinedPositionDriver {
             }
 
             // Same doc - compute position intersection
-            let pos_intersect_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             self.constraint_buf.clear();
             self.edge_buf.clear();
             self.constraint_postings.positions(&mut self.constraint_buf);
@@ -206,26 +200,12 @@ impl CombinedPositionDriver {
 
             self.intersection.clear();
             intersect_sorted_into(&self.constraint_buf, &self.edge_buf, &mut self.intersection);
-            let pos_intersect_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-            perf_log("debug-session", "run1", "H6", "candidate_driver.rs:seek", "position_intersection_time", serde_json::json!({"doc": d1, "constraint_pos_count": self.constraint_buf.len(), "edge_pos_count": self.edge_buf.len(), "intersection_count": self.intersection.len(), "time_ms": pos_intersect_end - pos_intersect_start}));
 
             let doc = d1;
 
             // Advance both for next iteration
-            let constraint_doc_before = self.constraint_postings.doc();
-            let edge_doc_before = self.edge_postings.doc();
-            perf_log("debug-session", "run1", "H1", "candidate_driver.rs:seek", "advance_call_in_seek_to_next_match_v2", serde_json::json!({"constraint_doc": constraint_doc_before, "edge_doc": edge_doc_before, "doc": doc}));
             self.constraint_postings.advance();
             self.edge_postings.advance();
-            let constraint_doc_after = self.constraint_postings.doc();
-            let edge_doc_after = self.edge_postings.doc();
-            let constraint_gap = if constraint_doc_after != tantivy::TERMINATED && constraint_doc_before != tantivy::TERMINATED {
-                constraint_doc_after - constraint_doc_before
-            } else { 0 };
-            let edge_gap = if edge_doc_after != tantivy::TERMINATED && edge_doc_before != tantivy::TERMINATED {
-                edge_doc_after - edge_doc_before
-            } else { 0 };
-            perf_log("debug-session", "run1", "H1", "candidate_driver.rs:seek", "advance_result_in_seek_to_next_match_v2", serde_json::json!({"constraint_doc_after": constraint_doc_after, "edge_doc_after": edge_doc_after, "constraint_gap": constraint_gap, "edge_gap": edge_gap}));
 
             if !self.intersection.is_empty() {
                 self.current_doc = doc;
@@ -253,11 +233,6 @@ impl CandidateDriver for CombinedPositionDriver {
 
         // OPTIMIZATION: Adaptive seeking
         const SEEK_THRESHOLD: DocId = 10;
-        let constraint_doc_before = self.constraint_postings.doc();
-        let edge_doc_before = self.edge_postings.doc();
-        let constraint_gap = if constraint_doc_before < target { target - constraint_doc_before } else { 0 };
-        let edge_gap = if edge_doc_before < target { target - edge_doc_before } else { 0 };
-        perf_log("debug-session", "run1", "H1", "candidate_driver.rs:seek", "combined_driver_seek_start", serde_json::json!({"target": target, "constraint_doc": constraint_doc_before, "edge_doc": edge_doc_before, "constraint_gap": constraint_gap, "edge_gap": edge_gap}));
 
         if self.constraint_postings.doc() < target {
             let gap = target - self.constraint_postings.doc();
@@ -279,9 +254,6 @@ impl CandidateDriver for CombinedPositionDriver {
                 }
             }
         }
-        let constraint_doc_after = self.constraint_postings.doc();
-        let edge_doc_after = self.edge_postings.doc();
-        perf_log("debug-session", "run1", "H1", "candidate_driver.rs:seek", "combined_driver_seek_end", serde_json::json!({"constraint_doc_after": constraint_doc_after, "edge_doc_after": edge_doc_after}));
 
         // Now find the next matching document (with position intersection)
         self.seek_to_next_match()

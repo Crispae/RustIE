@@ -15,7 +15,6 @@ use tantivy::{
     store::StoreReader,
     postings::{SegmentPostings, Postings},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::query::ast::{FlatPatternStep, Pattern, Constraint, Matcher};
 use crate::digraph::zero_copy::ZeroCopyGraph;
@@ -29,7 +28,6 @@ use super::types::{
     PREFILTER_SKIPPED_ALL_COLLAPSED,
     ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
 };
-use super::logging::perf_log;
 use super::candidate_driver::CandidateDriver;
 
 /// Optimized scorer for graph traversal queries
@@ -1115,11 +1113,7 @@ impl Scorer for OptimizedGraphTraversalScorer {
 
 impl DocSet for OptimizedGraphTraversalScorer {
     fn advance(&mut self) -> DocId {
-        let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-
         let current_doc = self.doc();
-        let seek_target = if current_doc == tantivy::TERMINATED { 0 } else { current_doc.saturating_add(1) };
-        perf_log("debug-session", "run1", "H1", "scorer.rs:advance", "advance_start", serde_json::json!({"current_doc": current_doc, "seek_target": seek_target}));
 
         let mut candidate = if current_doc == tantivy::TERMINATED {
             self.src_driver.seek(0)
@@ -1135,8 +1129,6 @@ impl DocSet for OptimizedGraphTraversalScorer {
             }
 
             let dst_current = self.dst_driver.doc();
-            let dst_gap = if dst_current < candidate { candidate - dst_current } else { 0 };
-            perf_log("debug-session", "run1", "H1", "scorer.rs:advance", "dst_seek_call", serde_json::json!({"candidate": candidate, "dst_current": dst_current, "dst_gap": dst_gap}));
 
             const SEEK_THRESHOLD: DocId = 10;
             let dst_doc = if dst_current < candidate {
@@ -1166,7 +1158,6 @@ impl DocSet for OptimizedGraphTraversalScorer {
             if dst_doc > candidate {
                 DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
                 let gap = dst_doc - candidate;
-                perf_log("debug-session", "run1", "H2", "scorer.rs:advance", "src_seek_after_dst_ahead", serde_json::json!({"candidate": candidate, "dst_doc": dst_doc, "gap": gap}));
 
                 const SEEK_THRESHOLD: DocId = 10;
                 if gap >= SEEK_THRESHOLD {
@@ -1194,25 +1185,13 @@ impl DocSet for OptimizedGraphTraversalScorer {
                 DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
             }
 
-            let graph_check_start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
             if self.check_graph_traversal(candidate) {
-                let graph_check_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-                perf_log("debug-session", "run1", "H5", "scorer.rs:check_graph_traversal", "graph_traversal_match", serde_json::json!({"candidate": candidate, "check_time_ms": graph_check_end - graph_check_start}));
-
                 self.current_doc = Some(candidate);
                 let score = self.compute_odinson_score();
                 self.current_matches.push((candidate, score));
                 self.match_index = self.current_matches.len() - 1;
-
-                let total_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() - start_time;
-                perf_log("debug-session", "run1", "H1", "scorer.rs:advance", "advance_success", serde_json::json!({"candidate": candidate, "total_time_ms": total_time}));
                 return candidate;
             }
-
-            let graph_check_end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
-            perf_log("debug-session", "run1", "H5", "scorer.rs:check_graph_traversal", "graph_traversal_no_match", serde_json::json!({"candidate": candidate, "check_time_ms": graph_check_end - graph_check_start}));
-
-            perf_log("debug-session", "run1", "H1", "scorer.rs:advance", "src_advance_next_after_no_match", serde_json::json!({"candidate": candidate}));
             candidate = self.src_driver.advance();
         }
     }
