@@ -193,7 +193,6 @@ impl RustieDoc {
     }
 }
 
-/// Results from an Odinson query with complete sentence information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RustIeResult {
     pub total_hits: usize,
