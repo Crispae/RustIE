@@ -27,7 +27,7 @@ use super::candidate_driver::{
     expand_matcher, get_or_compile_regex,
 };
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
-use super::scorer::OptimizedGraphTraversalScorer;
+use super::scorer::{OptimizedGraphTraversalScorer, is_exact_skippable};
 
 /// Optimized weight for graph traversal queries using Odinson-style collapsed optimization.
 /// No BooleanQuery weights - candidate generation driven exclusively by CombinedPositionDriver.
@@ -53,6 +53,11 @@ pub(crate) struct OptimizedGraphTraversalWeight {
     dst_collapse: Option<CollapsedSpec>,
     /// Cached compiled regex automata (shared across segments, thread-safe)
     regex_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    /// Pre-computed constraint exact flags (true if constraint is exact string match)
+    /// OPTIMIZATION: Computed once at query creation, not per document
+    constraint_exact_flags: Vec<bool>,
+    /// Pre-extracted constraint field names (computed once, not per document)
+    constraint_field_names: Vec<String>,
 }
 
 impl OptimizedGraphTraversalWeight {
@@ -68,6 +73,42 @@ impl OptimizedGraphTraversalWeight {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
     ) -> Self {
+        // OPTIMIZATION: Pre-compute constraint_exact_flags ONCE at query creation
+        let constraint_exact_flags: Vec<bool> = flat_steps.iter()
+            .filter_map(|step| {
+                if let FlatPatternStep::Constraint(constraint_pat) = step {
+                    let unwrapped = unwrap_constraint_pattern_static(constraint_pat);
+                    if let Pattern::Constraint(constraint) = unwrapped {
+                        Some(is_exact_skippable(constraint))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // OPTIMIZATION: Pre-extract constraint field names ONCE at query creation
+        fn extract_field_name(pat: &Pattern) -> String {
+            match pat {
+                Pattern::NamedCapture { pattern, .. } => extract_field_name(pattern),
+                Pattern::Repetition { pattern, .. } => extract_field_name(pattern),
+                Pattern::Constraint(Constraint::Field { name, .. }) => name.clone(),
+                _ => "word".to_string(),
+            }
+        }
+
+        let constraint_field_names: Vec<String> = flat_steps.iter()
+            .filter_map(|step| {
+                if let FlatPatternStep::Constraint(pat) = step {
+                    Some(extract_field_name(pat))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         Self {
             src_pattern,
             dst_pattern,
@@ -80,6 +121,8 @@ impl OptimizedGraphTraversalWeight {
             src_collapse,
             dst_collapse,
             regex_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            constraint_exact_flags,
+            constraint_field_names,
         }
     }
 
@@ -228,26 +271,8 @@ impl Weight for OptimizedGraphTraversalWeight {
         // Cache the store reader (created once, reused for all documents in this segment)
         let store_reader = reader.get_store_reader(1)?;
 
-        // Pre-extract constraint field names from flat_steps (computed once, not per document)
-        fn unwrap_pattern_for_field_name(pat: &crate::query::ast::Pattern) -> String {
-            use crate::query::ast::Pattern;
-            match pat {
-                Pattern::NamedCapture { pattern, .. } => unwrap_pattern_for_field_name(pattern),
-                Pattern::Repetition { pattern, .. } => unwrap_pattern_for_field_name(pattern),
-                Pattern::Constraint(crate::query::ast::Constraint::Field { name, .. }) => name.clone(),
-                _ => "word".to_string(),
-            }
-        }
-
-        let constraint_field_names: Vec<String> = self.flat_steps.iter()
-            .filter_map(|step| {
-                if let FlatPatternStep::Constraint(pat) = step {
-                    Some(unwrap_pattern_for_field_name(pat))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // OPTIMIZATION: Use pre-computed constraint_field_names from Weight (computed once at query creation)
+        // No need to re-compute per segment
 
         // Build constraint requirements from flat_steps (need schema from reader)
         let schema = reader.schema();
@@ -311,13 +336,14 @@ impl Weight for OptimizedGraphTraversalWeight {
             self.dst_pattern.clone(),
             boost,
             self.flat_steps.clone(),
-            constraint_field_names,
+            self.constraint_field_names.clone(),  // OPTIMIZATION: Use pre-computed from Weight
             self.prefilter_plan.clone(),
             edge_postings,
             constraint_reqs,
             constraint_postings,
             self.src_collapse.clone(),
             self.dst_collapse.clone(),
+            self.constraint_exact_flags.clone(),  // OPTIMIZATION: Pass pre-computed flags
         );
 
         // Advance to the first document

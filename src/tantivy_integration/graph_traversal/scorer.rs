@@ -69,6 +69,12 @@ pub struct OptimizedGraphTraversalScorer {
     pub(crate) src_collapse: Option<CollapsedSpec>,
     /// Optional collapse spec for dst (for position handoff)
     pub(crate) dst_collapse: Option<CollapsedSpec>,
+    /// Pre-computed constraint exact flags (from Weight, computed once per query)
+    /// OPTIMIZATION: Avoids recomputing per document
+    pub(crate) constraint_exact_flags: Vec<bool>,
+    /// Reusable HashSet buffers for allowed_positions_hashset
+    /// OPTIMIZATION: Avoids allocating new HashSets per document
+    pub(crate) allowed_positions_hashset_buf: Vec<Option<HashSet<u32>>>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -92,7 +98,12 @@ impl OptimizedGraphTraversalScorer {
         constraint_postings: Vec<Option<SegmentPostings>>,
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
+        constraint_exact_flags: Vec<bool>,
     ) -> Self {
+        let num_constraints = prefilter_plan.num_constraints;
+        // OPTIMIZATION: Pre-allocate HashSet buffers for reuse across documents
+        let allowed_positions_hashset_buf = vec![None; num_constraints];
+
         Self {
             src_driver,
             dst_driver,
@@ -115,6 +126,8 @@ impl OptimizedGraphTraversalScorer {
             constraint_postings,
             src_collapse,
             dst_collapse,
+            constraint_exact_flags,
+            allowed_positions_hashset_buf,
         }
     }
 }
@@ -449,6 +462,59 @@ impl OptimizedGraphTraversalScorer {
         result
     }
 
+    /// OPTIMIZATION: Build allowed positions directly into the reusable buffer
+    /// Avoids allocating new HashSets per document
+    pub(crate) fn build_allowed_positions_into_buf(
+        &mut self,
+        src_driver_positions: Option<&[u32]>,
+        dst_driver_positions: Option<&[u32]>,
+        prefilter_positions: &[Option<Vec<u32>>],
+        num_constraints: usize,
+    ) {
+        // Ensure buffer is the right size
+        if self.allowed_positions_hashset_buf.len() != num_constraints {
+            self.allowed_positions_hashset_buf.resize_with(num_constraints, || None);
+        }
+
+        // Clear and reuse existing HashSets where possible
+        for hs in &mut self.allowed_positions_hashset_buf {
+            if let Some(ref mut set) = hs {
+                set.clear();
+            }
+        }
+
+        if let Some(src_positions) = src_driver_positions {
+            if num_constraints > 0 {
+                if let Some(ref mut set) = self.allowed_positions_hashset_buf[0] {
+                    set.extend(src_positions.iter().copied());
+                } else {
+                    self.allowed_positions_hashset_buf[0] = Some(src_positions.iter().copied().collect());
+                }
+            }
+        }
+
+        if let Some(dst_positions) = dst_driver_positions {
+            let last_idx = num_constraints.saturating_sub(1);
+            if last_idx > 0 && last_idx < num_constraints {
+                if let Some(ref mut set) = self.allowed_positions_hashset_buf[last_idx] {
+                    set.extend(dst_positions.iter().copied());
+                } else {
+                    self.allowed_positions_hashset_buf[last_idx] = Some(dst_positions.iter().copied().collect());
+                }
+            }
+        }
+
+        for (idx, prefilter) in prefilter_positions.iter().enumerate() {
+            if idx < num_constraints {
+                if self.allowed_positions_hashset_buf[idx].is_none() {
+                    if let Some(positions) = prefilter {
+                        self.allowed_positions_hashset_buf[idx] = Some(positions.iter().copied().collect());
+                    }
+                }
+            }
+        }
+    }
+
     /// Intersect two sorted vectors of u32, storing result in the first vector
     /// O(n+m) time using two-pointer merge
     fn intersect_sorted_in_place(a: &mut Vec<u32>, b: &[u32]) {
@@ -708,21 +774,21 @@ impl OptimizedGraphTraversalScorer {
 
         PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
 
-        // Clone positions once - needed for both branches due to mutable borrow in compute_allowed_positions
-        // In the all_collapsed branch, this is the only clone needed
+        // OPTIMIZATION: Clone positions only once - use take() pattern to avoid double clone
+        // In the all_collapsed branch, we move positions directly
         // In the non-collapsed branch, compute_allowed_positions needs &mut self, so we must clone first
-        let src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
-        let dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
+        let mut src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
+        let mut dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
 
         let allowed_positions = if all_collapsed {
             PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
 
             let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
-            // Move positions directly instead of cloning again
-            if let Some(positions) = src_driver_positions.clone() {
+            // OPTIMIZATION: Move positions directly using take() instead of clone()
+            if let Some(positions) = src_driver_positions.take() {
                 allowed[0] = Some(positions);
             }
-            if let Some(positions) = dst_driver_positions.clone() {
+            if let Some(positions) = dst_driver_positions.take() {
                 allowed[num_constraints - 1] = Some(positions);
             }
             allowed
@@ -757,6 +823,15 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
+        // OPTIMIZATION: Reuse HashSet buffers instead of allocating new ones
+        // Must be done before borrowing flat_steps to avoid borrow conflicts
+        self.build_allowed_positions_into_buf(
+            src_driver_positions.as_deref(),
+            dst_driver_positions.as_deref(),
+            &allowed_positions,
+            num_constraints,
+        );
+
         let flat_steps = &self.flat_steps;
         if flat_steps.is_empty() {
             GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -778,30 +853,9 @@ impl OptimizedGraphTraversalScorer {
             self.reader.schema(),
         );
 
-        let allowed_positions_hashset = self.build_allowed_positions(
-            src_driver_positions.as_deref(),
-            dst_driver_positions.as_deref(),
-            &allowed_positions,
-            num_constraints,
-        );
-
-        let mut constraint_idx_counter = 0;
-        let constraint_exact_flags: Vec<bool> = flat_steps.iter()
-            .filter_map(|step| {
-                if let FlatPatternStep::Constraint(constraint_pat) = step {
-                    let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
-                    if let Pattern::Constraint(constraint) = unwrapped {
-                        let is_exact = is_exact_skippable(constraint);
-                        constraint_idx_counter += 1;
-                        Some(is_exact)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // OPTIMIZATION: Use pre-computed constraint_exact_flags from Weight
+        // (computed once at query creation, not per document)
+        let constraint_exact_flags = &self.constraint_exact_flags;
 
         let mut constraint_count = 0;
         let mut cached_positions: Vec<Vec<usize>> = Vec::new();
@@ -914,8 +968,8 @@ impl OptimizedGraphTraversalScorer {
                                 src_pos,
                                 constraint_field_names,
                                 &token_accessor,
-                                &allowed_positions_hashset,
-                                &constraint_exact_flags,
+                                &self.allowed_positions_hashset_buf,
+                                constraint_exact_flags,
                             )
                         })
                         .collect();
@@ -938,8 +992,8 @@ impl OptimizedGraphTraversalScorer {
                             &[src_pos],
                             constraint_field_names,
                             &mut get_token,
-                            &allowed_positions_hashset,
-                            &constraint_exact_flags,
+                            &self.allowed_positions_hashset_buf,
+                            constraint_exact_flags,
                         );
 
                         for path in &all_paths {
