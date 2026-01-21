@@ -104,7 +104,9 @@ fn add_u64_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldConf
 }
 
 fn add_bytes_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldConfig) {
-    builder.add_bytes_field(&field.name, STORED);
+    // Use FAST for columnar O(1) access - avoids document store decompression overhead
+    // STORED is kept for retrieving original bytes in search results if needed
+    builder.add_bytes_field(&field.name, STORED | FAST);
 }
 
 fn get_output_fields(config: &SchemaConfig) -> Vec<String> {

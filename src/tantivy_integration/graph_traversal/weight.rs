@@ -220,7 +220,17 @@ impl Weight for OptimizedGraphTraversalWeight {
             Box::new(EmptyDriver)
         };
 
-        // Cache the store reader (created once, reused for all documents in this segment)
+        // Get fast field column for O(1) access to dependency graph bytes
+        // This avoids document store decompression overhead for each graph access
+        let schema = reader.schema();
+        let field_name = schema.get_field_name(self.dependencies_binary_field);
+        let dependencies_fast_field = reader
+            .fast_fields()
+            .bytes(field_name)
+            .ok()
+            .flatten();
+
+        // Cache the store reader (still needed for constraint token extraction)
         let store_reader = reader.get_store_reader(1)?;
 
         // Pre-extract constraint field names from flat_steps (computed once, not per document)
@@ -300,6 +310,7 @@ impl Weight for OptimizedGraphTraversalWeight {
             self.traversal.clone(),
             self.dependencies_binary_field,
             reader.clone(),
+            dependencies_fast_field,
             store_reader,
             self.src_pattern.clone(),
             self.dst_pattern.clone(),

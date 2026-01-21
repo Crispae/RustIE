@@ -13,6 +13,7 @@ use tantivy::{
     DocSet, SegmentReader,
     store::StoreReader,
     postings::{SegmentPostings, Postings},
+    columnar::BytesColumn,
 };
 
 use crate::query::ast::{FlatPatternStep, Pattern, Constraint, Matcher};
@@ -38,9 +39,13 @@ pub struct OptimizedGraphTraversalScorer {
     pub(crate) dst_driver: Box<dyn CandidateDriver>,
     #[allow(dead_code)]
     pub(crate) traversal: crate::query::ast::Traversal,
+    #[allow(dead_code)]
     pub(crate) dependencies_binary_field: Field,
     pub(crate) reader: SegmentReader,
-    /// Cached store reader (created once, reused for all documents)
+    /// Fast field column for O(1) access to dependency graph bytes (columnar storage)
+    /// This avoids document store decompression overhead for graph access
+    pub(crate) dependencies_fast_field: Option<BytesColumn>,
+    /// Store reader for constraint token extraction (still needed for lazy token loading)
     pub(crate) store_reader: StoreReader,
     pub(crate) current_doc: Option<DocId>,
     pub(crate) current_matches: Vec<(DocId, Score)>,
@@ -79,6 +84,7 @@ impl OptimizedGraphTraversalScorer {
         traversal: crate::query::ast::Traversal,
         dependencies_binary_field: Field,
         reader: SegmentReader,
+        dependencies_fast_field: Option<BytesColumn>,
         store_reader: StoreReader,
         src_pattern: crate::query::ast::Pattern,
         dst_pattern: crate::query::ast::Pattern,
@@ -98,6 +104,7 @@ impl OptimizedGraphTraversalScorer {
             traversal,
             dependencies_binary_field,
             reader,
+            dependencies_fast_field,
             store_reader,
             current_doc: None,
             current_matches: Vec::new(),
@@ -290,6 +297,92 @@ pub(crate) fn is_exact_skippable(constraint: &Constraint) -> bool {
         | Constraint::Wildcard
         | Constraint::Fuzzy { .. } => false,
     }
+}
+
+/// Build an inverted index mapping destination positions to their SpanWithCaptures.
+/// This enables O(1) lookup after graph traversal instead of O(E) per source.
+///
+/// Odinson-style optimization: pre-compute destination spans before traversal,
+/// then use HashMap lookup instead of repeated traversals.
+#[inline]
+pub(crate) fn build_dst_inverted_index(
+    dst_positions: &[u32],
+) -> HashMap<u32, ()> {
+    dst_positions.iter().map(|&pos| (pos, ())).collect()
+}
+
+/// Process all source positions in a single batch traversal using destination index.
+///
+/// This implements the Odinson-style optimization:
+/// 1. Pre-build destination position set for O(1) membership check
+/// 2. Single traversal from all sources (O(E) total, not O(S×E))
+/// 3. O(1) destination validation at traversal endpoints
+///
+/// Returns all matching SpanWithCaptures for paths that reach valid destinations.
+pub(crate) fn process_batch_with_dst_index(
+    graph_bytes: &[u8],
+    flat_steps: &[FlatPatternStep],
+    src_positions: &[usize],
+    dst_positions: &HashSet<u32>,
+    constraint_field_names: &[String],
+    token_accessor: &ImmutableTokenAccessor,
+    allowed_positions: &[Option<HashSet<u32>>],
+    constraint_exact_flags: &[bool],
+) -> Vec<crate::types::SpanWithCaptures> {
+    // Recreate ZeroCopyGraph from bytes (zero-copy, no allocation)
+    let graph = match ZeroCopyGraph::from_bytes(graph_bytes) {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+
+    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
+
+    // Create mutable closure for token access
+    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
+        token_accessor.get(constraint_idx, position)
+    };
+
+    // Single batch traversal from ALL source positions
+    let all_paths = traversal_engine.automaton_query_paths_batch(
+        flat_steps,
+        src_positions,
+        dst_positions,
+        constraint_field_names,
+        &mut get_token,
+        allowed_positions,
+        constraint_exact_flags,
+    );
+
+    // Convert paths to SpanWithCaptures
+    let mut matches = Vec::with_capacity(all_paths.len());
+    for path in &all_paths {
+        if !path.is_empty() {
+            let mut captures = Vec::with_capacity(path.len());
+            let mut c_idx = 0;
+            for step in flat_steps.iter() {
+                if let FlatPatternStep::Constraint(ref pat) = step {
+                    if let Some(&node_idx) = path.get(c_idx) {
+                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                        let name = match pat {
+                            Pattern::NamedCapture { name, .. } => name.clone(),
+                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                        };
+                        captures.push(crate::types::NamedCapture::new(name, span));
+                    }
+                    c_idx += 1;
+                }
+            }
+            let min_pos = *path.iter().min().unwrap();
+            let max_pos = *path.iter().max().unwrap();
+            matches.push(
+                crate::types::SpanWithCaptures::with_captures(
+                    crate::types::Span { start: min_pos, end: max_pos + 1 },
+                    captures
+                )
+            );
+        }
+    }
+    matches
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -854,11 +947,35 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
-        let binary_data = match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
-            Some(data) => data,
-            None => {
+        // Get graph bytes from fast field (O(1) columnar access) instead of document store
+        // This avoids decompressing the entire document just to get the graph bytes
+        let graph_bytes_buffer: Vec<u8>;
+        let binary_data: &[u8] = if let Some(ref bytes_col) = self.dependencies_fast_field {
+            let mut buffer = Vec::new();
+            let mut term_ords = bytes_col.term_ords(doc_id);
+            if let Some(ord) = term_ords.next() {
+                match bytes_col.ord_to_bytes(ord, &mut buffer) {
+                    Ok(true) => {
+                        graph_bytes_buffer = buffer;
+                        &graph_bytes_buffer
+                    }
+                    _ => {
+                        GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                }
+            } else {
                 GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 return false;
+            }
+        } else {
+            // Fallback to document store if fast field not available
+            match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
+                Some(data) => data,
+                None => {
+                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
             }
         };
 
