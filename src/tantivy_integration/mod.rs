@@ -1,7 +1,5 @@
-pub mod spans;
 pub mod utils;
 pub mod collector;
-// pub mode pattern_query;
 pub mod boolean_query;
 pub mod concat_query;
 pub mod graph_traversal;
@@ -10,7 +8,6 @@ pub mod named_capture_query;
 pub mod position_tokenizer;
 pub mod match_selector;
 
-pub use spans::*;
 pub use collector::*;
 pub use concat_query::*;
 pub use graph_traversal::*;

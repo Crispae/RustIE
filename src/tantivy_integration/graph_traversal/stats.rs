@@ -76,7 +76,8 @@ impl GraphTraversalStats {
 
     pub fn print_summary(&self) {
         // Printing disabled for performance
-        return;
+        // Uncomment the code below to enable detailed statistics printing
+        /*
         println!("\n=== Graph Traversal Performance Statistics ===");
 
         let skip_rate = if self.call_count > 0 {
@@ -139,5 +140,6 @@ impl GraphTraversalStats {
             println!("  Graph deserialization rate: {:.1}% (lower is better)", deser_rate);
             println!("  Prefilter effectiveness: {:.1}% documents filtered out", prefilter_kill_rate);
         }
+        */
     }
 }

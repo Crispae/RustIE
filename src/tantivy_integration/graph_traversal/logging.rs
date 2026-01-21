@@ -1,9 +1,5 @@
 //! Debug and performance logging helpers.
 
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Helper function for debug logging (formats JSON properly)
 #[inline]
 pub(crate) fn write_debug_log(entry: &str) {

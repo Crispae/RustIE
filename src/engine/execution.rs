@@ -91,14 +91,14 @@ impl ExtractorEngine {
                     statistics_provider: &searcher,
                 }) {
                     Ok(w) => w,
-                    Err(e) => {
+                    Err(_e) => {
                         return None;
                     }
                 };
 
                 let mut scorer = match weight.scorer(segment_reader, 1.0) {
                     Ok(s) => s,
-                    Err(e) => {
+                    Err(_e) => {
                         return None;
                     }
                 };
@@ -228,14 +228,14 @@ impl ExtractorEngine {
                     statistics_provider: &searcher,
                 }) {
                     Ok(w) => w,
-                    Err(e) => {
+                    Err(_e) => {
                         return None;
                     }
                 };
 
                 let mut scorer = match weight.scorer(segment_reader, 1.0) {
                     Ok(s) => s,
-                    Err(e) => {
+                    Err(_e) => {
                         return None;
                     }
                 };

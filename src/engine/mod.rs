@@ -13,7 +13,6 @@ pub mod constants;
 pub mod core;
 pub mod document;
 pub mod execution;
-pub mod extractor_engine;
 pub mod schema;
 
 // Re-export main types for convenience

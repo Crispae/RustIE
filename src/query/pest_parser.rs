@@ -1,4 +1,3 @@
-use pest::Parser;
 use pest_derive::Parser;
 use crate::query::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
 

@@ -9,7 +9,6 @@ pub mod api;
 
 pub use engine::ExtractorEngine;
 pub use query::{QueryCompiler, QueryParser};
-pub use query::ast::Ast;
 pub use types::{Span, SpanWithCaptures, NamedCapture};
 pub use results::{RustIeResult, RustieDoc, SentenceResult};
 pub use data::{Document, DocumentParser};
