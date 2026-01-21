@@ -4,7 +4,7 @@
 //! the actual document matching and scoring during query execution.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use rayon::prelude::*;
 use tantivy::{
     query::Scorer,
@@ -214,9 +214,59 @@ impl<'a> LazyConstraintTokens<'a> {
     }
 }
 
+/// Build destination inverted index (HashMap) from destination positions.
+/// This matches Odinson's mkInvIndex(getAllSpansWithCaptures(dstSpans)) approach.
+/// 
+/// Destination positions come from Tantivy's inverted index (via CombinedPositionDriver),
+/// then we build a HashMap on-the-fly for O(1) span lookup.
+/// 
+/// Returns HashMap mapping position (u32) to pre-computed SpanWithCaptures.
+fn build_dst_inverted_index(
+    dst_positions: &[u32],
+    flat_steps: &[FlatPatternStep],
+) -> HashMap<u32, Vec<crate::types::SpanWithCaptures>> {
+    let mut index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> = HashMap::new();
+    
+    if dst_positions.is_empty() {
+        return index;
+    }
+    
+    // Find the last constraint step (destination constraint)
+    let dst_constraint_step = flat_steps.iter()
+        .rev()
+        .find(|step| matches!(step, FlatPatternStep::Constraint(_)));
+    
+    let capture_name = if let Some(FlatPatternStep::Constraint(ref pat)) = dst_constraint_step {
+        // Extract capture name from pattern
+        match pat {
+            Pattern::NamedCapture { name, .. } => name.clone(),
+            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+        }
+    } else {
+        // Fallback if no constraint found (shouldn't happen in valid patterns)
+        format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    };
+    
+    // Pre-compute SpanWithCaptures for each destination position
+    for &dst_pos in dst_positions {
+        let span = crate::types::Span {
+            start: dst_pos as usize,
+            end: dst_pos as usize + 1,
+        };
+        let capture = crate::types::NamedCapture::new(capture_name.clone(), span.clone());
+        let span_with_captures = crate::types::SpanWithCaptures::with_captures(span, vec![capture]);
+        
+        index.entry(dst_pos).or_default().push(span_with_captures);
+    }
+    
+    index
+}
+
 /// Process a single start position and return all matching paths as spans
 /// This is used for parallel processing where each thread processes one start position
 /// graph_bytes: The raw bytes of the graph (zero-copy, can be shared across threads)
+/// dst_set: Pre-computed destination positions for O(1) endpoint validation (Odinson-style)
+/// dst_index: Optional pre-built destination inverted index for O(1) span lookup
 pub(crate) fn process_single_start_position(
     graph_bytes: &[u8],
     flat_steps: &[FlatPatternStep],
@@ -225,6 +275,32 @@ pub(crate) fn process_single_start_position(
     token_accessor: &ImmutableTokenAccessor,
     allowed_positions: &[Option<HashSet<u32>>],
     constraint_exact_flags: &[bool],
+    dst_set: &HashSet<u32>,
+) -> Vec<crate::types::SpanWithCaptures> {
+    process_single_start_position_with_index(
+        graph_bytes,
+        flat_steps,
+        start_pos,
+        constraint_field_names,
+        token_accessor,
+        allowed_positions,
+        constraint_exact_flags,
+        dst_set,
+        None,
+    )
+}
+
+/// Internal function that accepts optional destination inverted index
+fn process_single_start_position_with_index(
+    graph_bytes: &[u8],
+    flat_steps: &[FlatPatternStep],
+    start_pos: usize,
+    constraint_field_names: &[String],
+    token_accessor: &ImmutableTokenAccessor,
+    allowed_positions: &[Option<HashSet<u32>>],
+    constraint_exact_flags: &[bool],
+    dst_set: &HashSet<u32>,
+    dst_index_opt: Option<&Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>>>,
 ) -> Vec<crate::types::SpanWithCaptures> {
     // Recreate ZeroCopyGraph from bytes for this thread (zero-copy, no allocation)
     let graph = match ZeroCopyGraph::from_bytes(graph_bytes) {
@@ -239,33 +315,64 @@ pub(crate) fn process_single_start_position(
         token_accessor.get(constraint_idx, position)
     };
 
-    let all_paths = traversal_engine.automaton_query_paths(
-        flat_steps,
-        &[start_pos],
-        constraint_field_names,
-        &mut get_token,
-        allowed_positions,
-        constraint_exact_flags,
-    );
+    // Count total constraints to identify destination constraint index
+    let total_constraints: usize = flat_steps.iter()
+        .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
+        .count();
+    let dst_constraint_idx = total_constraints.saturating_sub(1);
 
-    let mut matches = Vec::new();
-    for path in &all_paths {
-        if !path.is_empty() {
+    // Use optimized traversal if inverted index is available, otherwise use batch traversal
+    let matches = if let Some(dst_index) = dst_index_opt {
+        // OPTIMIZED: Use inverted index for O(1) destination lookup
+        let reachable_pairs = traversal_engine.automaton_find_reachable_destinations(
+            flat_steps,
+            &[start_pos],
+            dst_set,
+            constraint_field_names,
+            &mut get_token,
+            allowed_positions,
+            constraint_exact_flags,
+        );
+
+        let mut matches = Vec::with_capacity(reachable_pairs.len());
+        for (_src_pos, dst_pos, path) in &reachable_pairs {
+            if path.is_empty() {
+                continue;
+            }
+
             let mut captures = Vec::with_capacity(path.len());
             let mut c_idx = 0;
+            let mut dst_capture_added = false;
+            
             for step in flat_steps.iter() {
                 if let FlatPatternStep::Constraint(ref pat) = step {
                     if let Some(&node_idx) = path.get(c_idx) {
-                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                        let name = match pat {
-                            Pattern::NamedCapture { name, .. } => name.clone(),
-                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
-                        };
-                        captures.push(crate::types::NamedCapture::new(name, span));
+                        let is_dst_constraint = c_idx == dst_constraint_idx && node_idx == *dst_pos;
+                        
+                        if is_dst_constraint {
+                            // Use pre-built destination span from inverted index (O(1) lookup)
+                            if let Some(dst_spans) = dst_index.get(&(*dst_pos as u32)) {
+                                if let Some(dst_span) = dst_spans.first() {
+                                    captures.extend(dst_span.captures.iter().cloned());
+                                    dst_capture_added = true;
+                                }
+                            }
+                        }
+                        
+                        // Build capture if not using inverted index or for intermediate constraints
+                        if !is_dst_constraint || !dst_capture_added {
+                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                            let name = match pat {
+                                Pattern::NamedCapture { name, .. } => name.clone(),
+                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                            };
+                            captures.push(crate::types::NamedCapture::new(name, span));
+                        }
                     }
                     c_idx += 1;
                 }
             }
+            
             let min_pos = *path.iter().min().unwrap();
             let max_pos = *path.iter().max().unwrap();
             matches.push(
@@ -275,7 +382,50 @@ pub(crate) fn process_single_start_position(
                 )
             );
         }
-    }
+        matches
+    } else {
+        // FALLBACK: Use batch traversal and build from paths (backward compatibility)
+        let all_paths = traversal_engine.automaton_query_paths_batch(
+            flat_steps,
+            &[start_pos],
+            dst_set,
+            constraint_field_names,
+            &mut get_token,
+            allowed_positions,
+            constraint_exact_flags,
+        );
+
+        let mut matches = Vec::new();
+        for path in &all_paths {
+            if !path.is_empty() {
+                let mut captures = Vec::with_capacity(path.len());
+                let mut c_idx = 0;
+                for step in flat_steps.iter() {
+                    if let FlatPatternStep::Constraint(ref pat) = step {
+                        if let Some(&node_idx) = path.get(c_idx) {
+                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                            let name = match pat {
+                                Pattern::NamedCapture { name, .. } => name.clone(),
+                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                            };
+                            captures.push(crate::types::NamedCapture::new(name, span));
+                        }
+                        c_idx += 1;
+                    }
+                }
+                let min_pos = *path.iter().min().unwrap();
+                let max_pos = *path.iter().max().unwrap();
+                matches.push(
+                    crate::types::SpanWithCaptures::with_captures(
+                        crate::types::Span { start: min_pos, end: max_pos + 1 },
+                        captures
+                    )
+                );
+            }
+        }
+        matches
+    };
+    
     matches
 }
 
@@ -297,92 +447,6 @@ pub(crate) fn is_exact_skippable(constraint: &Constraint) -> bool {
         | Constraint::Wildcard
         | Constraint::Fuzzy { .. } => false,
     }
-}
-
-/// Build an inverted index mapping destination positions to their SpanWithCaptures.
-/// This enables O(1) lookup after graph traversal instead of O(E) per source.
-///
-/// Odinson-style optimization: pre-compute destination spans before traversal,
-/// then use HashMap lookup instead of repeated traversals.
-#[inline]
-pub(crate) fn build_dst_inverted_index(
-    dst_positions: &[u32],
-) -> HashMap<u32, ()> {
-    dst_positions.iter().map(|&pos| (pos, ())).collect()
-}
-
-/// Process all source positions in a single batch traversal using destination index.
-///
-/// This implements the Odinson-style optimization:
-/// 1. Pre-build destination position set for O(1) membership check
-/// 2. Single traversal from all sources (O(E) total, not O(S×E))
-/// 3. O(1) destination validation at traversal endpoints
-///
-/// Returns all matching SpanWithCaptures for paths that reach valid destinations.
-pub(crate) fn process_batch_with_dst_index(
-    graph_bytes: &[u8],
-    flat_steps: &[FlatPatternStep],
-    src_positions: &[usize],
-    dst_positions: &HashSet<u32>,
-    constraint_field_names: &[String],
-    token_accessor: &ImmutableTokenAccessor,
-    allowed_positions: &[Option<HashSet<u32>>],
-    constraint_exact_flags: &[bool],
-) -> Vec<crate::types::SpanWithCaptures> {
-    // Recreate ZeroCopyGraph from bytes (zero-copy, no allocation)
-    let graph = match ZeroCopyGraph::from_bytes(graph_bytes) {
-        Ok(g) => g,
-        Err(_) => return Vec::new(),
-    };
-
-    let traversal_engine = crate::digraph::traversal::GraphTraversal::new(graph);
-
-    // Create mutable closure for token access
-    let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
-        token_accessor.get(constraint_idx, position)
-    };
-
-    // Single batch traversal from ALL source positions
-    let all_paths = traversal_engine.automaton_query_paths_batch(
-        flat_steps,
-        src_positions,
-        dst_positions,
-        constraint_field_names,
-        &mut get_token,
-        allowed_positions,
-        constraint_exact_flags,
-    );
-
-    // Convert paths to SpanWithCaptures
-    let mut matches = Vec::with_capacity(all_paths.len());
-    for path in &all_paths {
-        if !path.is_empty() {
-            let mut captures = Vec::with_capacity(path.len());
-            let mut c_idx = 0;
-            for step in flat_steps.iter() {
-                if let FlatPatternStep::Constraint(ref pat) = step {
-                    if let Some(&node_idx) = path.get(c_idx) {
-                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                        let name = match pat {
-                            Pattern::NamedCapture { name, .. } => name.clone(),
-                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
-                        };
-                        captures.push(crate::types::NamedCapture::new(name, span));
-                    }
-                    c_idx += 1;
-                }
-            }
-            let min_pos = *path.iter().min().unwrap();
-            let max_pos = *path.iter().max().unwrap();
-            matches.push(
-                crate::types::SpanWithCaptures::with_captures(
-                    crate::types::Span { start: min_pos, end: max_pos + 1 },
-                    captures
-                )
-            );
-        }
-    }
-    matches
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -1011,10 +1075,29 @@ impl OptimizedGraphTraversalScorer {
 
                     let token_accessor = ImmutableTokenAccessor::new(&lazy_tokens);
 
+                    // OPTIMIZATION: Build destination set once, share across all parallel threads
+                    // Odinson-style: O(1) destination validation at traversal endpoints
+                    let dst_set: HashSet<u32> = dst_driver_positions
+                        .as_ref()
+                        .map(|positions| positions.iter().copied().collect())
+                        .unwrap_or_default();
+
+                    // OPTIMIZATION: Pre-build destination inverted index once, share across threads
+                    // This enables O(1) destination span lookup in each thread
+                    // OPTIMIZATION: Pre-build destination inverted index once, share across threads
+                    // This enables O(1) destination span lookup in each thread
+                    // Use Arc for thread-safe sharing in parallel iterator
+                    let dst_index: Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>> = 
+                        Arc::new(if let Some(ref positions) = dst_driver_positions {
+                            build_dst_inverted_index(positions, flat_steps)
+                        } else {
+                            HashMap::new()
+                        });
+
                     let all_matches: Vec<crate::types::SpanWithCaptures> = src_positions
                         .par_iter()
                         .flat_map(|&src_pos| {
-                            process_single_start_position(
+                            process_single_start_position_with_index(
                                 binary_data,
                                 flat_steps,
                                 src_pos,
@@ -1022,6 +1105,8 @@ impl OptimizedGraphTraversalScorer {
                                 &token_accessor,
                                 &allowed_positions_hashset,
                                 &constraint_exact_flags,
+                                &dst_set,
+                                Some(&dst_index),
                             )
                         })
                         .collect();
@@ -1031,50 +1116,107 @@ impl OptimizedGraphTraversalScorer {
                         return true;
                     }
                 } else {
+                    // OPTIMIZATION: Odinson-style batch traversal with destination index
+                    // Instead of O(S×E) per-source traversals, do O(E+S) total:
+                    // 1. Pre-build destination set for O(1) endpoint validation
+                    // 2. Single batch traversal from all sources
+                    // 3. O(1) destination check at pattern completion
+
                     let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
                     let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
                         lazy_tokens.get(constraint_idx, position)
                     };
 
-                    let mut all_matches = Vec::new();
+                    // Collect all source positions for batch processing
+                    let src_positions: Vec<usize> = src_positions_iter.collect();
 
-                    for src_pos in src_positions_iter {
-                        let all_paths = traversal_engine.automaton_query_paths(
-                            flat_steps,
-                            &[src_pos],
-                            constraint_field_names,
-                            &mut get_token,
-                            &allowed_positions_hashset,
-                            &constraint_exact_flags,
-                        );
+                    // Build destination set for O(1) membership check during traversal
+                    // If dst_driver has positions, use them; otherwise use empty set (no filtering)
+                    let dst_set: HashSet<u32> = dst_driver_positions
+                        .as_ref()
+                        .map(|positions| positions.iter().copied().collect())
+                        .unwrap_or_default();
 
-                        for path in &all_paths {
-                            if !path.is_empty() {
-                                let mut captures = Vec::with_capacity(path.len());
-                                let mut c_idx = 0;
-                                for step in flat_steps.iter() {
-                                    if let FlatPatternStep::Constraint(ref pat) = step {
-                                        if let Some(&node_idx) = path.get(c_idx) {
-                                            let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                                            let name = match pat {
-                                                Pattern::NamedCapture { name, .. } => name.clone(),
-                                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
-                                            };
-                                            captures.push(crate::types::NamedCapture::new(name, span));
+                    // OPTIMIZATION: Pre-build destination inverted index for O(1) span lookup
+                    // This matches Odinson's mkInvIndex(getAllSpansWithCaptures(dstSpans)) approach
+                    let dst_index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> = 
+                        if let Some(ref positions) = dst_driver_positions {
+                            build_dst_inverted_index(positions, flat_steps)
+                        } else {
+                            HashMap::new()
+                        };
+
+                    // Single batch traversal returning (src, dst, path) tuples
+                    let reachable_pairs = traversal_engine.automaton_find_reachable_destinations(
+                        flat_steps,
+                        &src_positions,
+                        &dst_set,
+                        constraint_field_names,
+                        &mut get_token,
+                        &allowed_positions_hashset,
+                        &constraint_exact_flags,
+                    );
+
+                    // Convert to SpanWithCaptures using inverted index for destination + path for intermediates
+                    let mut all_matches = Vec::with_capacity(reachable_pairs.len());
+                    
+                    // Count total constraints to identify destination constraint index
+                    let total_constraints: usize = flat_steps.iter()
+                        .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
+                        .count();
+                    let dst_constraint_idx = total_constraints.saturating_sub(1);
+                    
+                    for (src_pos, dst_pos, path) in &reachable_pairs {
+                        if path.is_empty() {
+                            continue;
+                        }
+
+                        // Build captures for all constraints in the path
+                        let mut captures = Vec::with_capacity(path.len());
+                        let mut c_idx = 0;
+                        let mut dst_capture_added = false;
+                        
+                        for step in flat_steps.iter() {
+                            if let FlatPatternStep::Constraint(ref pat) = step {
+                                if let Some(&node_idx) = path.get(c_idx) {
+                                    // Check if this is the destination constraint (last constraint in pattern)
+                                    let is_dst_constraint = c_idx == dst_constraint_idx && 
+                                        node_idx == *dst_pos;
+                                    
+                                    if is_dst_constraint && !dst_index.is_empty() {
+                                        // Use pre-built destination span from inverted index (O(1) lookup)
+                                        if let Some(dst_spans) = dst_index.get(&(*dst_pos as u32)) {
+                                            // Extract captures from pre-built destination span
+                                            if let Some(dst_span) = dst_spans.first() {
+                                                captures.extend(dst_span.captures.iter().cloned());
+                                                dst_capture_added = true;
+                                            }
                                         }
-                                        c_idx += 1;
+                                    }
+                                    
+                                    // If we didn't use inverted index, or for intermediate constraints,
+                                    // build capture from path position
+                                    if !is_dst_constraint || !dst_capture_added {
+                                        let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
+                                        let name = match pat {
+                                            Pattern::NamedCapture { name, .. } => name.clone(),
+                                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                        };
+                                        captures.push(crate::types::NamedCapture::new(name, span));
                                     }
                                 }
-                                let min_pos = *path.iter().min().unwrap();
-                                let max_pos = *path.iter().max().unwrap();
-                                all_matches.push(
-                                    crate::types::SpanWithCaptures::with_captures(
-                                        crate::types::Span { start: min_pos, end: max_pos + 1 },
-                                        captures
-                                    )
-                                );
+                                c_idx += 1;
                             }
                         }
+                        
+                        let min_pos = *path.iter().min().unwrap();
+                        let max_pos = *path.iter().max().unwrap();
+                        all_matches.push(
+                            crate::types::SpanWithCaptures::with_captures(
+                                crate::types::Span { start: min_pos, end: max_pos + 1 },
+                                captures
+                            )
+                        );
                     }
 
                     if !all_matches.is_empty() {
