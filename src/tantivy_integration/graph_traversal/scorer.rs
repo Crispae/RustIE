@@ -23,20 +23,22 @@ use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
 use super::types::{
     CAPTURE_COUNTER, CALL_COUNT, GRAPH_DESER_COUNT, GRAPH_DESER_SKIPPED,
     PREFILTER_DOCS, PREFILTER_KILLED, PREFILTER_ALLOWED_POS_SUM, PREFILTER_ALLOWED_POS_COUNT,
-    DST_DRIVER_DOCS, DRIVER_ALIGNMENT_DOCS,
-    DRIVER_INTERSECTION_SUM, DRIVER_INTERSECTION_COUNT,
+    DRIVER_ALIGNMENT_DOCS, DRIVER_INTERSECTION_SUM, DRIVER_INTERSECTION_COUNT,
     PREFILTER_SKIPPED_ALL_COLLAPSED,
     ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
 };
 use super::candidate_driver::CandidateDriver;
+use super::intersection::TwoPhaseIntersection;
 
 /// Optimized scorer for graph traversal queries
 /// Uses CandidateDriver abstraction for Odinson-style collapsed query optimization
+/// and TwoPhaseIntersection for efficient document-level alignment (Lucene TwoPhaseIterator pattern)
 pub struct OptimizedGraphTraversalScorer {
-    /// Source candidate driver (may be CombinedPositionDriver or GenericDriver)
-    pub(crate) src_driver: Box<dyn CandidateDriver>,
-    /// Destination candidate driver (may be CombinedPositionDriver or GenericDriver)
-    pub(crate) dst_driver: Box<dyn CandidateDriver>,
+    /// Two-phase intersection of src/dst drivers
+    /// Implements Lucene's ConjunctionDISI.intersectSpans() pattern:
+    /// Phase 1: Document alignment via skip-list optimized intersection
+    /// Phase 2: Graph traversal verification (check_graph_traversal)
+    pub(crate) intersection: TwoPhaseIntersection,
     #[allow(dead_code)]
     pub(crate) traversal: crate::query::ast::Traversal,
     #[allow(dead_code)]
@@ -98,9 +100,11 @@ impl OptimizedGraphTraversalScorer {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
     ) -> Self {
+        // Wrap drivers in TwoPhaseIntersection for Lucene-style document alignment
+        let intersection = TwoPhaseIntersection::new(src_driver, dst_driver);
+
         Self {
-            src_driver,
-            dst_driver,
+            intersection,
             traversal,
             dependencies_binary_field,
             reader,
@@ -845,8 +849,9 @@ impl OptimizedGraphTraversalScorer {
 
         // Optimization: Check if all constraints are collapsed first (avoids cloning in fast path)
         // We need to check driver positions availability before deciding the path
-        let src_has_positions = self.src_driver.matching_positions().is_some();
-        let dst_has_positions = self.dst_driver.matching_positions().is_some();
+        // Access drivers via TwoPhaseIntersection
+        let src_has_positions = self.intersection.src_driver().matching_positions().is_some();
+        let dst_has_positions = self.intersection.dst_driver().matching_positions().is_some();
         let all_collapsed = num_constraints == 2
             && self.src_collapse.is_some()
             && self.dst_collapse.is_some()
@@ -858,8 +863,9 @@ impl OptimizedGraphTraversalScorer {
         // Clone positions once - needed for both branches due to mutable borrow in compute_allowed_positions
         // In the all_collapsed branch, this is the only clone needed
         // In the non-collapsed branch, compute_allowed_positions needs &mut self, so we must clone first
-        let src_driver_positions: Option<Vec<u32>> = self.src_driver.matching_positions().map(|p| p.to_vec());
-        let dst_driver_positions: Option<Vec<u32>> = self.dst_driver.matching_positions().map(|p| p.to_vec());
+        // Access drivers via TwoPhaseIntersection
+        let src_driver_positions: Option<Vec<u32>> = self.intersection.src_driver().matching_positions().map(|p| p.to_vec());
+        let dst_driver_positions: Option<Vec<u32>> = self.intersection.dst_driver().matching_positions().map(|p| p.to_vec());
 
         let allowed_positions = if all_collapsed {
             PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
@@ -1050,7 +1056,7 @@ impl OptimizedGraphTraversalScorer {
             return false;
         }
 
-        let src_positions_iter: Box<dyn Iterator<Item = usize> + '_> = if let Some(iter) = self.src_driver.matching_positions_iter() {
+        let src_positions_iter: Box<dyn Iterator<Item = usize> + '_> = if let Some(iter) = self.intersection.src_driver().matching_positions_iter() {
             Box::new(iter.map(|p| p as usize))
         } else {
             Box::new(src_positions_slice.iter().copied())
@@ -1357,79 +1363,35 @@ impl Scorer for OptimizedGraphTraversalScorer {
 }
 
 impl DocSet for OptimizedGraphTraversalScorer {
+    /// Advance to the next matching document using TwoPhaseIntersection.
+    ///
+    /// This implements the Lucene TwoPhaseIterator pattern:
+    /// - Phase 1: TwoPhaseIntersection.advance() finds candidates where both drivers align
+    /// - Phase 2: check_graph_traversal() verifies actual graph path exists
     fn advance(&mut self) -> DocId {
-        let current_doc = self.doc();
-
-        let mut candidate = if current_doc == tantivy::TERMINATED {
-            self.src_driver.seek(0)
-        } else {
-            self.src_driver.advance()
-        };
-
         loop {
+            // Phase 1: Get next candidate from TwoPhaseIntersection
+            let candidate = self.intersection.advance();
+
             if candidate == tantivy::TERMINATED {
                 self.current_doc = None;
                 self.log_final_stats();
                 return tantivy::TERMINATED;
             }
 
-            let dst_current = self.dst_driver.doc();
-
-            const SEEK_THRESHOLD: DocId = 10;
-            let dst_doc = if dst_current < candidate {
-                let gap = candidate - dst_current;
-                if gap >= SEEK_THRESHOLD {
-                    self.dst_driver.seek(candidate)
-                } else {
-                    let mut doc = dst_current;
-                    while doc < candidate {
-                        doc = self.dst_driver.advance();
-                        if doc == tantivy::TERMINATED {
-                            break;
-                        }
-                    }
-                    doc
-                }
-            } else {
-                dst_current
-            };
-
-            if dst_doc == tantivy::TERMINATED {
-                self.current_doc = None;
-                self.log_final_stats();
-                return tantivy::TERMINATED;
-            }
-
-            if dst_doc > candidate {
-                DST_DRIVER_DOCS.fetch_add(1, Ordering::Relaxed);
-                let gap = dst_doc - candidate;
-
-                const SEEK_THRESHOLD: DocId = 10;
-                if gap >= SEEK_THRESHOLD {
-                    candidate = self.src_driver.seek(dst_doc);
-                } else {
-                    while candidate < dst_doc {
-                        candidate = self.src_driver.advance();
-                        if candidate == tantivy::TERMINATED {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            debug_assert_eq!(candidate, dst_doc);
+            // Statistics tracking
             DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
 
-            if let Some(src_pos) = self.src_driver.matching_positions() {
+            if let Some(src_pos) = self.intersection.src_driver().matching_positions() {
                 DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
                 DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
             }
-            if let Some(dst_pos) = self.dst_driver.matching_positions() {
+            if let Some(dst_pos) = self.intersection.dst_driver().matching_positions() {
                 DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
                 DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
             }
 
+            // Phase 2: Expensive verification - check if graph traversal succeeds
             if self.check_graph_traversal(candidate) {
                 self.current_doc = Some(candidate);
                 let score = self.compute_odinson_score();
@@ -1437,17 +1399,23 @@ impl DocSet for OptimizedGraphTraversalScorer {
                 self.match_index = self.current_matches.len() - 1;
                 return candidate;
             }
-            candidate = self.src_driver.advance();
+            // Verification failed, continue to next candidate
         }
     }
 
+    /// Seek to the first matching document >= target using TwoPhaseIntersection.
+    ///
+    /// This implements the Lucene TwoPhaseIterator pattern with a target hint:
+    /// - Phase 1: TwoPhaseIntersection.seek() finds candidates >= target where both drivers align
+    /// - Phase 2: check_graph_traversal() verifies actual graph path exists
     fn seek(&mut self, target: DocId) -> DocId {
         let current = self.doc();
         if current != tantivy::TERMINATED && current >= target {
             return current;
         }
 
-        let mut candidate = self.src_driver.seek(target);
+        // Phase 1: Seek to first candidate >= target
+        let mut candidate = self.intersection.seek(target);
 
         loop {
             if candidate == tantivy::TERMINATED {
@@ -1455,29 +1423,7 @@ impl DocSet for OptimizedGraphTraversalScorer {
                 return tantivy::TERMINATED;
             }
 
-            let dst_doc = self.dst_driver.seek(candidate);
-
-            if dst_doc == tantivy::TERMINATED {
-                self.current_doc = None;
-                return tantivy::TERMINATED;
-            }
-
-            if dst_doc > candidate {
-                const SEEK_THRESHOLD: DocId = 10;
-                let gap = dst_doc - candidate;
-                if gap >= SEEK_THRESHOLD {
-                    candidate = self.src_driver.seek(dst_doc);
-                } else {
-                    while candidate < dst_doc {
-                        candidate = self.src_driver.advance();
-                        if candidate == tantivy::TERMINATED {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-
+            // Phase 2: Expensive verification - check if graph traversal succeeds
             if self.check_graph_traversal(candidate) {
                 self.current_doc = Some(candidate);
                 let score = self.compute_odinson_score();
@@ -1486,7 +1432,8 @@ impl DocSet for OptimizedGraphTraversalScorer {
                 return candidate;
             }
 
-            candidate = self.src_driver.advance();
+            // Verification failed, advance to next candidate
+            candidate = self.intersection.advance_past_current();
         }
     }
 
