@@ -78,8 +78,16 @@ fn add_string_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldC
     if field.stored {
         options = options.set_stored();
     }
+    // Add FAST flag for constraint fields (word, lemma, pos, tag, etc.) for O(1) columnar access
+    // Text fields use StrColumn with dictionary encoding for fast field access
+    // set_fast() requires tokenizer name (None uses default tokenizer for the field)
+    if TOKEN_FIELDS.contains(&field.name.as_str()) {
+        options = options.set_fast(None);
+        log::debug!("Added string field '{}' with position-aware tokenizer and FAST flag", field.name);
+    } else {
+        log::debug!("Added string field '{}' with position-aware tokenizer", field.name);
+    }
     builder.add_text_field(&field.name, options);
-    log::debug!("Added string field '{}' with position-aware tokenizer", field.name);
 }
 
 fn add_edge_positions_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldConfig) {

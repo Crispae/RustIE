@@ -8,12 +8,12 @@ use std::sync::{Arc, atomic::Ordering};
 use rayon::prelude::*;
 use tantivy::{
     query::Scorer,
-    schema::{Field, Value},
+    schema::Field,
     DocId, Score,
     DocSet, SegmentReader,
     store::StoreReader,
     postings::{SegmentPostings, Postings},
-    columnar::BytesColumn,
+    columnar::{BytesColumn, StrColumn},
 };
 
 use crate::query::ast::{FlatPatternStep, Pattern, Constraint, Matcher};
@@ -24,8 +24,8 @@ use super::types::{
     CAPTURE_COUNTER, CALL_COUNT, GRAPH_DESER_COUNT, GRAPH_DESER_SKIPPED,
     PREFILTER_DOCS, PREFILTER_KILLED, PREFILTER_ALLOWED_POS_SUM, PREFILTER_ALLOWED_POS_COUNT,
     DRIVER_ALIGNMENT_DOCS, DRIVER_INTERSECTION_SUM, DRIVER_INTERSECTION_COUNT,
-    PREFILTER_SKIPPED_ALL_COLLAPSED,
-    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
+    PREFILTER_SKIPPED_ALL_COLLAPSED, TOKEN_EXTRACTION_SKIPPED,
+    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec, CollapsedMatcher,
 };
 use super::candidate_driver::CandidateDriver;
 use super::intersection::TwoPhaseIntersection;
@@ -75,6 +75,14 @@ pub struct OptimizedGraphTraversalScorer {
     pub(crate) src_collapse: Option<CollapsedSpec>,
     /// Optional collapse spec for dst (for position handoff)
     pub(crate) dst_collapse: Option<CollapsedSpec>,
+    /// Tracks which constraints are fully covered by postings intersection
+    /// and can skip token parsing entirely. True = positions from postings are sufficient,
+    /// no need to parse tokens from document store.
+    pub(crate) constraints_covered_by_postings: Vec<bool>,
+    /// Fast field columns for O(1) access to constraint field tokens (columnar storage)
+    /// One entry per constraint field name, None if fast field not available
+    /// Text fields use StrColumn with dictionary encoding for fast field access
+    pub(crate) constraint_fast_fields: Vec<Option<StrColumn>>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -99,9 +107,88 @@ impl OptimizedGraphTraversalScorer {
         constraint_postings: Vec<Option<SegmentPostings>>,
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
+        constraint_fast_fields: Vec<Option<StrColumn>>,
     ) -> Self {
         // Wrap drivers in TwoPhaseIntersection for Lucene-style document alignment
         let intersection = TwoPhaseIntersection::new(src_driver, dst_driver);
+
+        // Compute which constraints are fully covered by postings intersection and
+        // DON'T need token verification. A constraint is covered ONLY if:
+        // 1. It's an EXACT string match (not regex!) with postings, OR
+        // 2. It's src/dst with a collapse spec that's exact (positions come from CombinedPositionDriver), OR
+        // 3. It's a wildcard (any position is valid - positions come from edges)
+        //
+        // IMPORTANT: Regex constraints CANNOT be marked as covered even if they have
+        // constraint_reqs, because the traversal engine still needs to verify the token
+        // actually matches the regex pattern (term expansion may include false positives).
+        let num_constraints = prefilter_plan.num_constraints;
+        let mut constraints_covered_by_postings = vec![false; num_constraints];
+
+        // First, determine which constraints are exact string matches (not regex)
+        let mut constraint_is_exact = vec![false; num_constraints];
+        let mut constraint_idx = 0;
+        for step in &flat_steps {
+            if let FlatPatternStep::Constraint(pat) = step {
+                if constraint_idx < num_constraints {
+                    let inner = unwrap_constraint_pattern_for_coverage(pat);
+                    constraint_is_exact[constraint_idx] = match inner {
+                        Pattern::Constraint(Constraint::Field { matcher, .. }) => {
+                            matches!(matcher, Matcher::String(_))
+                        }
+                        Pattern::Constraint(Constraint::Wildcard) => true, // Wildcards don't need verification
+                        _ => false,
+                    };
+                }
+                constraint_idx += 1;
+            }
+        }
+
+        // Mark constraints covered by constraint_reqs ONLY if they're exact string matches
+        for req in &constraint_reqs {
+            if req.constraint_idx < num_constraints && constraint_is_exact[req.constraint_idx] {
+                constraints_covered_by_postings[req.constraint_idx] = true;
+            }
+        }
+
+        // Mark src/dst constraints covered by collapse specs ONLY if they're exact
+        if let Some(ref spec) = src_collapse {
+            if spec.constraint_idx < num_constraints {
+                // Check if the collapse spec constraint matcher is exact (String, not Regex)
+                let is_exact = match &spec.constraint_matcher {
+                    CollapsedMatcher::Exact(_) => true,
+                    CollapsedMatcher::RegexPattern(_) => false,
+                };
+                if is_exact {
+                    constraints_covered_by_postings[spec.constraint_idx] = true;
+                }
+            }
+        }
+        if let Some(ref spec) = dst_collapse {
+            if spec.constraint_idx < num_constraints {
+                // Check if the collapse spec constraint matcher is exact (String, not Regex)
+                let is_exact = match &spec.constraint_matcher {
+                    CollapsedMatcher::Exact(_) => true,
+                    CollapsedMatcher::RegexPattern(_) => false,
+                };
+                if is_exact {
+                    constraints_covered_by_postings[spec.constraint_idx] = true;
+                }
+            }
+        }
+
+        // Mark wildcard constraints as covered (they don't need token verification)
+        constraint_idx = 0;
+        for step in &flat_steps {
+            if let FlatPatternStep::Constraint(pat) = step {
+                let inner = unwrap_constraint_pattern_for_coverage(pat);
+                if matches!(inner, Pattern::Constraint(Constraint::Wildcard)) {
+                    if constraint_idx < num_constraints {
+                        constraints_covered_by_postings[constraint_idx] = true;
+                    }
+                }
+                constraint_idx += 1;
+            }
+        }
 
         Self {
             intersection,
@@ -125,17 +212,83 @@ impl OptimizedGraphTraversalScorer {
             constraint_postings,
             src_collapse,
             dst_collapse,
+            constraints_covered_by_postings,
+            constraint_fast_fields,
         }
     }
 }
 
+/// Helper to unwrap NamedCapture/Repetition for coverage check
+fn unwrap_constraint_pattern_for_coverage(pat: &Pattern) -> &Pattern {
+    match pat {
+        Pattern::NamedCapture { pattern, .. } => unwrap_constraint_pattern_for_coverage(pattern),
+        Pattern::Repetition { pattern, .. } => unwrap_constraint_pattern_for_coverage(pattern),
+        _ => pat,
+    }
+}
+
+/// Extract tokens from a constraint field using fast fields (O(1) columnar access)
+/// Returns empty vector if fast field not available
+/// Uses StrColumn for text fields with dictionary encoding
+fn extract_constraint_tokens_from_fast_field(
+    constraint_idx: usize,
+    field_name: &str,
+    fast_field_columns: &[Option<StrColumn>],
+    doc_id: DocId,
+) -> Vec<String> {
+    if let Some(Some(str_col)) = fast_field_columns.get(constraint_idx) {
+        // StrColumn uses dictionary encoding - get term ordinal for this document
+        // ords() returns a Column<u64> with term ordinals for each document
+        let ords_col = str_col.ords();
+        let term_ord = ords_col.values.get_val(doc_id);
+        
+        // Get the string value from the dictionary using the term ordinal
+        // ord_to_str() requires a mutable String buffer
+        let mut encoded_buffer = String::new();
+        let ord_to_str_result = str_col.ord_to_str(term_ord, &mut encoded_buffer);
+        if ord_to_str_result.as_ref().map(|b| *b).unwrap_or(false) && !encoded_buffer.is_empty() {
+            let encoded = encoded_buffer;
+            // Decode pipe-separated format (same as extract_field_values)
+            // Token fields are stored as "token1|token2|token3"
+            let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
+            if token_fields.contains(&field_name) {
+                // Decode pipe-separated tokens
+                let token_count = encoded.matches('|').count() + 1;
+                let mut tokens = Vec::with_capacity(token_count);
+                for s in encoded.split('|') {
+                    tokens.push(s.to_string());
+                }
+                return tokens;
+            } else {
+                // Single value, not pipe-separated
+                return vec![encoded];
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Lazy constraint token loader - parses constraint fields only when first accessed
 /// This avoids parsing constraint fields that are never reached during graph traversal
+/// Uses fast fields (columnar storage) for O(1) access
 pub(crate) struct LazyConstraintTokens<'a> {
-    doc: &'a tantivy::schema::TantivyDocument,
     constraint_field_names: &'a [String],
     schema: &'a tantivy::schema::Schema,
     cache: Vec<Option<Vec<String>>>,
+    /// Fast field columns for O(1) columnar access to constraint tokens
+    /// One entry per constraint field name, None if fast field not available
+    /// Text fields use StrColumn with dictionary encoding
+    fast_field_columns: &'a [Option<StrColumn>],
+    /// Current document ID for fast field access
+    doc_id: DocId,
+}
+
+/// Trait for token accessors used in parallel processing.
+/// This allows both ImmutableTokenAccessor (with actual tokens) and
+/// EmptyTokenAccessor (when all constraints are covered by postings) to be used.
+pub(crate) trait TokenAccessor: Sync {
+    /// Get token at a specific position for a constraint (returns owned String)
+    fn get(&self, constraint_idx: usize, position: usize) -> Option<String>;
 }
 
 /// Immutable token accessor for thread-safe parallel processing
@@ -155,10 +308,10 @@ impl<'a> ImmutableTokenAccessor<'a> {
             .collect();
         Self { tokens }
     }
+}
 
-    /// Get token at a specific position for a constraint (returns owned String)
-    /// Returns None if constraint not loaded or position out of bounds
-    pub fn get(&self, constraint_idx: usize, position: usize) -> Option<String> {
+impl<'a> TokenAccessor for ImmutableTokenAccessor<'a> {
+    fn get(&self, constraint_idx: usize, position: usize) -> Option<String> {
         self.tokens
             .get(constraint_idx)?
             .and_then(|tokens| tokens.get(position))
@@ -166,19 +319,41 @@ impl<'a> ImmutableTokenAccessor<'a> {
     }
 }
 
+/// Empty token accessor for when all constraints are covered by postings.
+/// Always returns None - the traversal engine will use allowed_positions_hashset
+/// and constraint_exact_flags to validate positions without token verification.
+pub(crate) struct EmptyTokenAccessor {
+    _num_constraints: usize,
+}
+
+impl EmptyTokenAccessor {
+    /// Create an empty token accessor for the given number of constraints
+    pub fn new(num_constraints: usize) -> Self {
+        Self { _num_constraints: num_constraints }
+    }
+}
+
+impl TokenAccessor for EmptyTokenAccessor {
+    fn get(&self, _constraint_idx: usize, _position: usize) -> Option<String> {
+        None
+    }
+}
+
 impl<'a> LazyConstraintTokens<'a> {
-    /// Create a new lazy token loader
+    /// Create a new lazy token loader with fast field support
     pub fn new(
-        doc: &'a tantivy::schema::TantivyDocument,
         constraint_field_names: &'a [String],
         schema: &'a tantivy::schema::Schema,
+        fast_field_columns: &'a [Option<StrColumn>],
+        doc_id: DocId,
     ) -> Self {
         let cache = vec![None; constraint_field_names.len()];
         Self {
-            doc,
             constraint_field_names,
             schema,
             cache,
+            fast_field_columns,
+            doc_id,
         }
     }
 
@@ -190,7 +365,7 @@ impl<'a> LazyConstraintTokens<'a> {
 
         if self.cache[constraint_idx].is_none() {
             let field_name = &self.constraint_field_names[constraint_idx];
-            let tokens = self.extract_tokens_from_field(field_name);
+            let tokens = self.extract_tokens_from_field(constraint_idx, field_name);
             self.cache[constraint_idx] = Some(tokens);
         }
     }
@@ -212,9 +387,41 @@ impl<'a> LazyConstraintTokens<'a> {
         self.cache[constraint_idx].as_ref().map(|tokens| tokens.as_slice())
     }
 
-    /// Extract tokens from a field (reuses existing logic)
-    fn extract_tokens_from_field(&self, field_name: &str) -> Vec<String> {
-        crate::tantivy_integration::utils::extract_field_values(self.schema, self.doc, field_name)
+    /// Extract tokens from a field using fast fields (O(1) columnar access)
+    /// Uses StrColumn for text fields with dictionary encoding
+    fn extract_tokens_from_field(&self, constraint_idx: usize, field_name: &str) -> Vec<String> {
+        // Use fast field access (O(1) columnar access) with StrColumn
+        if let Some(Some(str_col)) = self.fast_field_columns.get(constraint_idx) {
+            // StrColumn uses dictionary encoding - get term ordinal for this document
+            // ords() returns a Column<u64> with term ordinals for each document
+            let ords_col = str_col.ords();
+            let term_ord = ords_col.values.get_val(self.doc_id);
+            
+            // Get the string value from the dictionary using the term ordinal
+            // ord_to_str() requires a mutable String buffer
+            let mut encoded_buffer = String::new();
+            if str_col.ord_to_str(term_ord, &mut encoded_buffer).is_ok() && !encoded_buffer.is_empty() {
+                let encoded = encoded_buffer;
+                // Decode pipe-separated format (same as extract_field_values)
+                // Token fields are stored as "token1|token2|token3"
+                let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
+                if token_fields.contains(&field_name) {
+                    // Decode pipe-separated tokens
+                    let token_count = encoded.matches('|').count() + 1;
+                    let mut tokens = Vec::with_capacity(token_count);
+                    for s in encoded.split('|') {
+                        tokens.push(s.to_string());
+                    }
+                    return tokens;
+                } else {
+                    // Single value, not pipe-separated
+                    return vec![encoded];
+                }
+            }
+        }
+
+        // Fast field not available - return empty vector (fast fields must be available after reindexing)
+        Vec::new()
     }
 }
 
@@ -271,12 +478,12 @@ fn build_dst_inverted_index(
 /// graph_bytes: The raw bytes of the graph (zero-copy, can be shared across threads)
 /// dst_set: Pre-computed destination positions for O(1) endpoint validation (Odinson-style)
 /// dst_index: Optional pre-built destination inverted index for O(1) span lookup
-pub(crate) fn process_single_start_position(
+pub(crate) fn process_single_start_position<T: TokenAccessor>(
     graph_bytes: &[u8],
     flat_steps: &[FlatPatternStep],
     start_pos: usize,
     constraint_field_names: &[String],
-    token_accessor: &ImmutableTokenAccessor,
+    token_accessor: &T,
     allowed_positions: &[Option<HashSet<u32>>],
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
@@ -295,12 +502,12 @@ pub(crate) fn process_single_start_position(
 }
 
 /// Internal function that accepts optional destination inverted index
-fn process_single_start_position_with_index(
+fn process_single_start_position_with_index<T: TokenAccessor>(
     graph_bytes: &[u8],
     flat_steps: &[FlatPatternStep],
     start_pos: usize,
     constraint_field_names: &[String],
-    token_accessor: &ImmutableTokenAccessor,
+    token_accessor: &T,
     allowed_positions: &[Option<HashSet<u32>>],
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
@@ -920,17 +1127,6 @@ impl OptimizedGraphTraversalScorer {
             .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
             .count();
 
-        let doc = match self.store_reader.get(doc_id) {
-            Ok(doc) => doc,
-            Err(_) => return false,
-        };
-
-        let mut lazy_tokens = LazyConstraintTokens::new(
-            &doc,
-            &self.constraint_field_names,
-            self.reader.schema(),
-        );
-
         let allowed_positions_hashset = self.build_allowed_positions(
             src_driver_positions.as_deref(),
             dst_driver_positions.as_deref(),
@@ -956,6 +1152,21 @@ impl OptimizedGraphTraversalScorer {
             })
             .collect();
 
+        // OPTIMIZATION: Check if all constraints are fully covered by postings intersection.
+        // If so, we can skip document store access entirely for token parsing.
+        // IMPORTANT: Only skip token extraction if ALL constraints are exact matches,
+        // because regex constraints still need token verification even with postings positions.
+        let all_constraints_covered = self.constraints_covered_by_postings.len() == total_constraints
+            && self.constraints_covered_by_postings.iter().all(|&covered| covered)
+            && constraint_exact_flags.len() == total_constraints
+            && constraint_exact_flags.iter().all(|&is_exact| is_exact)
+            && (0..total_constraints).all(|idx| allowed_positions.get(idx).map(|p| p.is_some()).unwrap_or(false));
+
+        // No need to load document - we use fast fields only for both constraint tokens and graph bytes
+        if all_constraints_covered {
+            TOKEN_EXTRACTION_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        }
+
         let mut constraint_count = 0;
         let mut cached_positions: Vec<Vec<usize>> = Vec::new();
 
@@ -965,14 +1176,6 @@ impl OptimizedGraphTraversalScorer {
                     GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
-
-                let tokens = match lazy_tokens.get_all_tokens(constraint_count) {
-                    Some(t) => t,
-                    None => {
-                        GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                        return false;
-                    }
-                };
 
                 let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
 
@@ -984,28 +1187,85 @@ impl OptimizedGraphTraversalScorer {
                 let is_first_constraint = constraint_count == 0;
                 let is_last_constraint = constraint_count == total_constraints - 1;
 
-                let positions = if is_first_constraint && self.src_collapse.is_some() {
+                // OPTIMIZATION: Check if this constraint is covered by postings and has positions
+                let is_covered = self.constraints_covered_by_postings
+                    .get(constraint_count)
+                    .copied()
+                    .unwrap_or(false);
+                let has_postings_positions = allowed_positions
+                    .get(constraint_count)
+                    .map(|p| p.is_some())
+                    .unwrap_or(false);
+
+                // Fast path: Use postings positions directly without token parsing
+                let positions = if is_covered && has_postings_positions {
+                    // Positions come from postings intersection - no token parsing needed
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
                         allowed.iter().map(|&p| p as usize).collect()
                     } else {
-                        self.find_positions_in_tokens(tokens, constraint_pat)
+                        // Should not happen if has_postings_positions is true
+                        Vec::new()
+                    }
+                } else if is_first_constraint && self.src_collapse.is_some() {
+                    // Src collapse provides positions directly
+                    if let Some(ref allowed) = allowed_positions[constraint_count] {
+                        allowed.iter().map(|&p| p as usize).collect()
+                    } else {
+                        // Use fast field for token parsing
+                        let tokens = extract_constraint_tokens_from_fast_field(
+                            constraint_count,
+                            &self.constraint_field_names[constraint_count],
+                            &self.constraint_fast_fields,
+                            doc_id,
+                        );
+                        self.find_positions_in_tokens(&tokens, constraint_pat)
                     }
                 } else if is_last_constraint && self.dst_collapse.is_some() {
+                    // Dst collapse provides positions directly
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
                         allowed.iter().map(|&p| p as usize).collect()
                     } else {
-                        self.find_positions_in_tokens(tokens, constraint_pat)
+                        // Use fast field for token parsing
+                        let tokens = extract_constraint_tokens_from_fast_field(
+                            constraint_count,
+                            &self.constraint_field_names[constraint_count],
+                            &self.constraint_fast_fields,
+                            doc_id,
+                        );
+                        self.find_positions_in_tokens(&tokens, constraint_pat)
                     }
                 } else if is_wildcard {
+                    // Wildcards use edge positions or all positions
                     if let Some(ref allowed) = allowed_positions[constraint_count] {
                         allowed.iter().map(|&p| p as usize).collect()
                     } else {
+                        // Need to know token count for wildcard - use fast field
+                        let tokens = extract_constraint_tokens_from_fast_field(
+                            constraint_count,
+                            &self.constraint_field_names[constraint_count],
+                            &self.constraint_fast_fields,
+                            doc_id,
+                        );
                         (0..tokens.len()).collect()
                     }
                 } else if let Some(ref allowed) = allowed_positions[constraint_count] {
-                    self.find_positions_in_tokens_limited(tokens, constraint_pat, allowed)
+                    // Have prefilter positions but constraint not fully covered - need token verification
+                    let tokens = extract_constraint_tokens_from_fast_field(
+                        constraint_count,
+                        &self.constraint_field_names[constraint_count],
+                        &self.constraint_fast_fields,
+                        doc_id,
+                    );
+                    self.find_positions_in_tokens_limited(&tokens, constraint_pat, allowed)
                 } else {
-                    self.find_positions_in_tokens(tokens, constraint_pat)
+                    // No prefilter positions - full token scan using fast field
+                    let tokens = extract_constraint_tokens_from_fast_field(
+                        constraint_count,
+                        &self.constraint_field_names[constraint_count],
+                        &self.constraint_fast_fields,
+                        doc_id,
+                    );
+                    self.find_positions_in_tokens(&tokens, constraint_pat)
                 };
 
                 if positions.is_empty() {
@@ -1017,7 +1277,7 @@ impl OptimizedGraphTraversalScorer {
             }
         }
 
-        // Get graph bytes from fast field (O(1) columnar access) instead of document store
+        // Get graph bytes from fast field (O(1) columnar access) - no fallback
         // This avoids decompressing the entire document just to get the graph bytes
         let graph_bytes_buffer: Vec<u8>;
         let binary_data: &[u8] = if let Some(ref bytes_col) = self.dependencies_fast_field {
@@ -1039,14 +1299,9 @@ impl OptimizedGraphTraversalScorer {
                 return false;
             }
         } else {
-            // Fallback to document store if fast field not available
-            match doc.get_first(self.dependencies_binary_field).and_then(|v| v.as_bytes()) {
-                Some(data) => data,
-                None => {
-                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
+            // Fast field not available - cannot proceed without fallback
+            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
         };
 
         GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1075,12 +1330,6 @@ impl OptimizedGraphTraversalScorer {
                 if estimated_size >= PARALLEL_START_POSITIONS_THRESHOLD {
                     let src_positions: Vec<usize> = src_positions_iter.collect();
 
-                    for constraint_idx in 0..constraint_field_names.len() {
-                        lazy_tokens.ensure_loaded(constraint_idx);
-                    }
-
-                    let token_accessor = ImmutableTokenAccessor::new(&lazy_tokens);
-
                     // OPTIMIZATION: Build destination set once, share across all parallel threads
                     // Odinson-style: O(1) destination validation at traversal endpoints
                     let dst_set: HashSet<u32> = dst_driver_positions
@@ -1090,32 +1339,64 @@ impl OptimizedGraphTraversalScorer {
 
                     // OPTIMIZATION: Pre-build destination inverted index once, share across threads
                     // This enables O(1) destination span lookup in each thread
-                    // OPTIMIZATION: Pre-build destination inverted index once, share across threads
-                    // This enables O(1) destination span lookup in each thread
                     // Use Arc for thread-safe sharing in parallel iterator
-                    let dst_index: Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>> = 
+                    let dst_index: Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>> =
                         Arc::new(if let Some(ref positions) = dst_driver_positions {
                             build_dst_inverted_index(positions, flat_steps)
                         } else {
                             HashMap::new()
                         });
 
-                    let all_matches: Vec<crate::types::SpanWithCaptures> = src_positions
-                        .par_iter()
-                        .flat_map(|&src_pos| {
-                            process_single_start_position_with_index(
-                                binary_data,
-                                flat_steps,
-                                src_pos,
-                                constraint_field_names,
-                                &token_accessor,
-                                &allowed_positions_hashset,
-                                &constraint_exact_flags,
-                                &dst_set,
-                                Some(&dst_index),
-                            )
-                        })
-                        .collect();
+                    // OPTIMIZATION: Use EmptyTokenAccessor when all constraints are covered by postings
+                    // This eliminates token parsing overhead in the parallel traversal
+                    let all_matches: Vec<crate::types::SpanWithCaptures> = if all_constraints_covered {
+                        let empty_accessor = EmptyTokenAccessor::new(total_constraints);
+                        src_positions
+                            .par_iter()
+                            .flat_map(|&src_pos| {
+                                process_single_start_position_with_index(
+                                    binary_data,
+                                    flat_steps,
+                                    src_pos,
+                                    constraint_field_names,
+                                    &empty_accessor,
+                                    &allowed_positions_hashset,
+                                    &constraint_exact_flags,
+                                    &dst_set,
+                                    Some(&dst_index),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        // Need actual tokens - use fast fields to create token accessor
+                        let mut lazy_tokens = LazyConstraintTokens::new(
+                            &self.constraint_field_names,
+                            self.reader.schema(),
+                            &self.constraint_fast_fields,
+                            doc_id,
+                        );
+                        for constraint_idx in 0..constraint_field_names.len() {
+                            lazy_tokens.ensure_loaded(constraint_idx);
+                        }
+                        let token_accessor = ImmutableTokenAccessor::new(&lazy_tokens);
+
+                        src_positions
+                            .par_iter()
+                            .flat_map(|&src_pos| {
+                                process_single_start_position_with_index(
+                                    binary_data,
+                                    flat_steps,
+                                    src_pos,
+                                    constraint_field_names,
+                                    &token_accessor,
+                                    &allowed_positions_hashset,
+                                    &constraint_exact_flags,
+                                    &dst_set,
+                                    Some(&dst_index),
+                                )
+                            })
+                            .collect()
+                    };
 
                     if !all_matches.is_empty() {
                         self.current_doc_matches.extend(all_matches);
@@ -1129,8 +1410,27 @@ impl OptimizedGraphTraversalScorer {
                     // 3. O(1) destination check at pattern completion
 
                     let traversal_engine = crate::digraph::traversal::GraphTraversal::new(zc_graph);
+
+                    // Create token getter closure - returns None when all constraints covered
+                    let schema = self.reader.schema();
+                    let field_names = &self.constraint_field_names;
+                    let mut lazy_tokens_opt: Option<LazyConstraintTokens> = if all_constraints_covered {
+                        None
+                    } else {
+                        Some(LazyConstraintTokens::new(
+                            field_names,
+                            schema,
+                            &self.constraint_fast_fields,
+                            doc_id,
+                        ))
+                    };
+
                     let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
-                        lazy_tokens.get(constraint_idx, position)
+                        if let Some(ref mut tokens) = lazy_tokens_opt {
+                            tokens.get(constraint_idx, position)
+                        } else {
+                            None
+                        }
                     };
 
                     // Collect all source positions for batch processing

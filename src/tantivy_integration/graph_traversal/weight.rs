@@ -254,6 +254,20 @@ impl Weight for OptimizedGraphTraversalWeight {
             })
             .collect();
 
+        // Get fast field columns for constraint fields (O(1) columnar access)
+        // This avoids document store decompression overhead for constraint token access
+        // Text fields use StrColumn with dictionary encoding for fast field access
+        let constraint_fast_fields: Vec<Option<tantivy::columnar::StrColumn>> = constraint_field_names
+            .iter()
+            .map(|field_name| {
+                reader
+                    .fast_fields()
+                    .str(field_name)
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+
         // Build constraint requirements from flat_steps (need schema from reader)
         let schema = reader.schema();
         let mut constraint_reqs = build_constraint_requirements(&self.flat_steps, schema);
@@ -323,6 +337,7 @@ impl Weight for OptimizedGraphTraversalWeight {
             constraint_postings,
             self.src_collapse.clone(),
             self.dst_collapse.clone(),
+            constraint_fast_fields,
         );
 
         // Advance to the first document
