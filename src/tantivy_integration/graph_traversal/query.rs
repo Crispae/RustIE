@@ -82,12 +82,7 @@ impl Query for OptimizedGraphTraversalQuery {
         );
 
         Ok(Box::new(OptimizedGraphTraversalWeight::new(
-            self.src_pattern.clone(),
-            self.dst_pattern.clone(),
-            self.traversal.clone(),
             self.dependencies_binary_field,
-            self.incoming_edges_field,
-            self.outgoing_edges_field,
             flat_steps,
             prefilter_plan,
             self.src_collapse.clone(),

@@ -33,17 +33,7 @@ use super::scorer::OptimizedGraphTraversalScorer;
 /// Optimized weight for graph traversal queries using Odinson-style collapsed optimization.
 /// No BooleanQuery weights - candidate generation driven exclusively by CombinedPositionDriver.
 pub(crate) struct OptimizedGraphTraversalWeight {
-    #[allow(dead_code)]
-    traversal: crate::query::ast::Traversal,
     dependencies_binary_field: Field,
-    #[allow(dead_code)]
-    incoming_edges_field: Field,
-    #[allow(dead_code)]
-    outgoing_edges_field: Field,
-    #[allow(dead_code)]
-    src_pattern: crate::query::ast::Pattern,
-    #[allow(dead_code)]
-    dst_pattern: crate::query::ast::Pattern,
     /// Pre-computed flattened pattern steps (cached once per query)
     flat_steps: Vec<FlatPatternStep>,
     /// Position prefilter plan for edge-based position restrictions
@@ -58,24 +48,14 @@ pub(crate) struct OptimizedGraphTraversalWeight {
 
 impl OptimizedGraphTraversalWeight {
     pub fn new(
-        src_pattern: crate::query::ast::Pattern,
-        dst_pattern: crate::query::ast::Pattern,
-        traversal: crate::query::ast::Traversal,
         dependencies_binary_field: Field,
-        incoming_edges_field: Field,
-        outgoing_edges_field: Field,
         flat_steps: Vec<FlatPatternStep>,
         prefilter_plan: PositionPrefilterPlan,
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
     ) -> Self {
         Self {
-            src_pattern,
-            dst_pattern,
-            traversal,
             dependencies_binary_field,
-            incoming_edges_field,
-            outgoing_edges_field,
             flat_steps,
             prefilter_plan,
             src_collapse,
@@ -325,13 +305,9 @@ impl Weight for OptimizedGraphTraversalWeight {
         let mut scorer = OptimizedGraphTraversalScorer::new(
             src_driver,
             dst_driver,
-            self.traversal.clone(),
-            self.dependencies_binary_field,
             reader.clone(),
             dependencies_fast_field,
             store_reader,
-            self.src_pattern.clone(),
-            self.dst_pattern.clone(),
             boost,
             self.flat_steps.clone(),
             constraint_field_names,

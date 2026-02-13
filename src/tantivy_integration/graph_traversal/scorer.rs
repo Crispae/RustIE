@@ -8,7 +8,6 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use tantivy::{
     query::Scorer,
-    schema::Field,
     DocId, Score,
     DocSet, SegmentReader,
     store::StoreReader,
@@ -45,10 +44,6 @@ pub struct OptimizedGraphTraversalScorer {
     /// Phase 1: Document alignment via skip-list optimized intersection
     /// Phase 2: Graph traversal verification (check_graph_traversal)
     pub(crate) intersection: TwoPhaseIntersection,
-    #[allow(dead_code)]
-    pub(crate) traversal: crate::query::ast::Traversal,
-    #[allow(dead_code)]
-    pub(crate) dependencies_binary_field: Field,
     pub(crate) reader: SegmentReader,
     /// Fast field column for O(1) access to dependency graph bytes (columnar storage)
     /// This avoids document store decompression overhead for graph access
@@ -58,10 +53,6 @@ pub struct OptimizedGraphTraversalScorer {
     pub(crate) current_doc: Option<DocId>,
     pub(crate) current_matches: Vec<(DocId, Score)>,
     pub(crate) match_index: usize,
-    #[allow(dead_code)]
-    pub(crate) src_pattern: crate::query::ast::Pattern,
-    #[allow(dead_code)]
-    pub(crate) dst_pattern: crate::query::ast::Pattern,
     pub(crate) current_doc_matches: Vec<crate::types::SpanWithCaptures>,
     /// Boost factor from weight creation
     pub(crate) boost: Score,
@@ -107,13 +98,9 @@ impl OptimizedGraphTraversalScorer {
     pub fn new(
         src_driver: Box<dyn CandidateDriver>,
         dst_driver: Box<dyn CandidateDriver>,
-        traversal: crate::query::ast::Traversal,
-        dependencies_binary_field: Field,
         reader: SegmentReader,
         dependencies_fast_field: Option<BytesColumn>,
         store_reader: StoreReader,
-        src_pattern: crate::query::ast::Pattern,
-        dst_pattern: crate::query::ast::Pattern,
         boost: Score,
         flat_steps: Vec<FlatPatternStep>,
         constraint_field_names: Vec<String>,
@@ -230,16 +217,12 @@ impl OptimizedGraphTraversalScorer {
 
         Self {
             intersection,
-            traversal,
-            dependencies_binary_field,
             reader,
             dependencies_fast_field,
             store_reader,
             current_doc: None,
             current_matches: Vec::new(),
             match_index: 0,
-            src_pattern,
-            dst_pattern,
             current_doc_matches: Vec::new(),
             boost,
             flat_steps,
@@ -504,22 +487,19 @@ impl<'a> LazyConstraintTokens<'a> {
 fn build_dst_inverted_index(
     dst_positions: &[u32],
     flat_steps: &[FlatPatternStep],
+    total_constraints: usize,
 ) -> HashMap<u32, Vec<crate::types::SpanWithCaptures>> {
     let mut index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> = HashMap::new();
-    
+
     if dst_positions.is_empty() {
         return index;
     }
-    
+
     // Find the last constraint step (destination constraint)
     let dst_constraint_step = flat_steps.iter()
         .rev()
         .find(|step| matches!(step, FlatPatternStep::Constraint(_)));
-    
-    // Count total constraints to derive the destination constraint index
-    let total_constraints = flat_steps.iter()
-        .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
-        .count();
+
     let dst_constraint_idx = total_constraints.saturating_sub(1);
 
     let cap_name = if let Some(FlatPatternStep::Constraint(ref pat)) = dst_constraint_step {
@@ -560,6 +540,7 @@ pub(crate) fn process_single_start_position<T: TokenAccessor>(
     allowed_positions: &[Option<HashSet<u32>>],
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
+    total_constraints: usize,
 ) -> Vec<crate::types::SpanWithCaptures> {
     process_single_start_position_with_index(
         graph_bytes,
@@ -571,6 +552,7 @@ pub(crate) fn process_single_start_position<T: TokenAccessor>(
         constraint_exact_flags,
         dst_set,
         None,
+        total_constraints,
     )
 }
 
@@ -585,6 +567,7 @@ fn process_single_start_position_with_index<T: TokenAccessor>(
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
     dst_index_opt: Option<&Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>>>,
+    total_constraints: usize,
 ) -> Vec<crate::types::SpanWithCaptures> {
     // Recreate ZeroCopyGraph from bytes for this thread (zero-copy, no allocation)
     let graph = match ZeroCopyGraph::from_bytes(graph_bytes) {
@@ -599,10 +582,6 @@ fn process_single_start_position_with_index<T: TokenAccessor>(
         token_accessor.get(constraint_idx, position)
     };
 
-    // Count total constraints to identify destination constraint index
-    let total_constraints: usize = flat_steps.iter()
-        .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
-        .count();
     let dst_constraint_idx = total_constraints.saturating_sub(1);
 
     // Use optimized traversal if inverted index is available, otherwise use batch traversal
@@ -734,73 +713,6 @@ pub(crate) fn is_exact_skippable(constraint: &Constraint) -> bool {
 }
 
 impl OptimizedGraphTraversalScorer {
-    /// Helper method to run traversal with any GraphTraversal<G: GraphAccess>
-    /// This allows us to use ZeroCopyGraph directly without conversion
-    #[allow(dead_code)]
-    pub(crate) fn run_traversal_with_engine<G: crate::digraph::graph_trait::GraphAccess>(
-        &mut self,
-        traversal_engine: &crate::digraph::traversal::GraphTraversal<G>,
-        flat_steps: &[FlatPatternStep],
-        src_positions: &[usize],
-        lazy_tokens: &mut LazyConstraintTokens,
-        allowed_positions_hashset: &[Option<HashSet<u32>>],
-        constraint_exact_flags: &[bool],
-    ) -> bool {
-        let constraint_field_names = &self.constraint_field_names;
-
-        let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
-            lazy_tokens.get(constraint_idx, position)
-        };
-
-        let mut all_matches = Vec::new();
-
-        for &src_pos in src_positions {
-            let all_paths = traversal_engine.automaton_query_paths(
-                flat_steps,
-                &[src_pos],
-                constraint_field_names,
-                &mut get_token,
-                allowed_positions_hashset,
-                constraint_exact_flags,
-            );
-
-            for path in &all_paths {
-                if !path.is_empty() {
-                    let mut captures = Vec::with_capacity(path.len());
-                    let mut c_idx = 0;
-                    for step in flat_steps.iter() {
-                        if let FlatPatternStep::Constraint(ref pat) = step {
-                            if let Some(&node_idx) = path.get(c_idx) {
-                                let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
-                                let name = match pat {
-                                    Pattern::NamedCapture { name, .. } => name.clone(),
-                                    _ => capture_name(c_idx),
-                                };
-                                captures.push(crate::types::NamedCapture::new(name, span));
-                            }
-                            c_idx += 1;
-                        }
-                    }
-                    let min_pos = *path.iter().min().unwrap();
-                    let max_pos = *path.iter().max().unwrap();
-                    all_matches.push(
-                        crate::types::SpanWithCaptures::with_captures(
-                            crate::types::Span { start: min_pos, end: max_pos + 1 },
-                            captures
-                        )
-                    );
-                }
-            }
-
-            if !all_paths.is_empty() {
-                self.current_doc_matches.extend(all_matches);
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Compute sloppy frequency factor based on span width (Odinson-style)
     /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
     /// Shorter spans get higher scores
@@ -1424,7 +1336,7 @@ impl OptimizedGraphTraversalScorer {
                     // OPTIMIZATION: Pre-build destination inverted index once, share across threads
                     let dst_index: Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>> =
                         Arc::new(if let Some(positions) = dst_driver_positions {
-                            build_dst_inverted_index(positions, flat_steps)
+                            build_dst_inverted_index(positions, flat_steps, total_constraints)
                         } else {
                             HashMap::new()
                         });
@@ -1445,6 +1357,7 @@ impl OptimizedGraphTraversalScorer {
                                     &constraint_exact_flags,
                                     &dst_set,
                                     Some(&dst_index),
+                                    total_constraints,
                                 )
                             })
                             .collect()
@@ -1476,6 +1389,7 @@ impl OptimizedGraphTraversalScorer {
                                     &constraint_exact_flags,
                                     &dst_set,
                                     Some(&dst_index),
+                                    total_constraints,
                                 )
                             })
                             .collect()
@@ -1528,9 +1442,9 @@ impl OptimizedGraphTraversalScorer {
                         .unwrap_or_default();
 
                     // OPTIMIZATION: Pre-build destination inverted index for O(1) span lookup
-                    let dst_index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> = 
+                    let dst_index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> =
                         if let Some(positions) = dst_driver_positions {
-                            build_dst_inverted_index(positions, flat_steps)
+                            build_dst_inverted_index(positions, flat_steps, total_constraints)
                         } else {
                             HashMap::new()
                         };
@@ -1626,37 +1540,9 @@ impl OptimizedGraphTraversalScorer {
         traversal_result
     }
 
-    #[allow(dead_code)]
-    fn get_field_name_from_pattern<'a>(&self, pattern: &'a Pattern) -> &'a str {
-        match pattern {
-            Pattern::Constraint(Constraint::Field { name, .. }) => {
-                name.as_str()
-            }
-            _ => "word",
-        }
-    }
-
-    #[allow(dead_code)]
-    fn extract_tokens_from_field(&self, doc: &tantivy::schema::TantivyDocument, field_name: &str) -> Vec<String> {
-        crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), doc, field_name)
-    }
-
-    #[allow(dead_code)]
-    fn find_positions_matching_pattern(&self, tokens: &[String], pattern: &Pattern) -> Vec<usize> {
-        self.find_positions_in_tokens(tokens, pattern)
-    }
 
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
         &self.current_doc_matches
-    }
-
-    #[allow(dead_code)]
-    fn traversal_to_pattern(&self) -> Pattern {
-        Pattern::GraphTraversal {
-            src: Box::new(self.src_pattern.clone()),
-            traversal: self.traversal.clone(),
-            dst: Box::new(self.dst_pattern.clone()),
-        }
     }
 
     /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)

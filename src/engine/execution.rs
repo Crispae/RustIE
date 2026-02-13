@@ -9,6 +9,7 @@ use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalScorer,
 };
 use anyhow::Result;
+use log;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use tantivy::{
@@ -87,14 +88,16 @@ impl ExtractorEngine {
                     statistics_provider: &searcher,
                 }) {
                     Ok(w) => w,
-                    Err(_e) => {
+                    Err(e) => {
+                        log::warn!("graph traversal: segment {segment_ord} weight creation failed: {e}");
                         return None;
                     }
                 };
 
                 let mut scorer = match weight.scorer(segment_reader, 1.0) {
                     Ok(s) => s,
-                    Err(_e) => {
+                    Err(e) => {
+                        log::warn!("graph traversal: segment {segment_ord} scorer creation failed: {e}");
                         return None;
                     }
                 };
@@ -224,14 +227,16 @@ impl ExtractorEngine {
                     statistics_provider: &searcher,
                 }) {
                     Ok(w) => w,
-                    Err(_e) => {
+                    Err(e) => {
+                        log::warn!("pattern matching: segment {segment_ord} weight creation failed: {e}");
                         return None;
                     }
                 };
 
                 let mut scorer = match weight.scorer(segment_reader, 1.0) {
                     Ok(s) => s,
-                    Err(_e) => {
+                    Err(e) => {
+                        log::warn!("pattern matching: segment {segment_ord} scorer creation failed: {e}");
                         return None;
                     }
                 };
