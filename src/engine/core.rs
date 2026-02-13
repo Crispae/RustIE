@@ -4,7 +4,7 @@ use crate::engine::constants::*;
 use crate::engine::schema::create_schema_from_yaml;
 use crate::query::QueryCompiler;
 use crate::query::parser::QueryParser;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use std::path::Path;
 use tantivy::{
     Index, IndexReader, IndexWriter,
@@ -98,17 +98,13 @@ impl ExtractorEngine {
     }
 
     fn extract_required_fields(schema: &Schema) -> Result<RequiredFields> {
+        use crate::engine::constants::get_required_field;
         Ok(RequiredFields {
-            default: schema.get_field(FIELD_WORD)
-                .map_err(|_| anyhow!("Field '{}' not found", FIELD_WORD))?,
-            sentence_length: schema.get_field(FIELD_SENTENCE_LENGTH)
-                .map_err(|_| anyhow!("Field '{}' not found", FIELD_SENTENCE_LENGTH))?,
-            dependencies_binary: schema.get_field(FIELD_DEPENDENCIES_BINARY)
-                .map_err(|_| anyhow!("Field '{}' not found", FIELD_DEPENDENCIES_BINARY))?,
-            incoming_edges: schema.get_field(FIELD_INCOMING_EDGES)
-                .map_err(|_| anyhow!("Field '{}' not found", FIELD_INCOMING_EDGES))?,
-            outgoing_edges: schema.get_field(FIELD_OUTGOING_EDGES)
-                .map_err(|_| anyhow!("Field '{}' not found", FIELD_OUTGOING_EDGES))?,
+            default: get_required_field(schema, FIELD_WORD)?,
+            sentence_length: get_required_field(schema, FIELD_SENTENCE_LENGTH)?,
+            dependencies_binary: get_required_field(schema, FIELD_DEPENDENCIES_BINARY)?,
+            incoming_edges: get_required_field(schema, FIELD_INCOMING_EDGES)?,
+            outgoing_edges: get_required_field(schema, FIELD_OUTGOING_EDGES)?,
         })
     }
 

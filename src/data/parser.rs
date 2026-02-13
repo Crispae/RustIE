@@ -50,9 +50,7 @@ impl DocumentParser {
 
     /// Get a field from schema with a descriptive error
     fn get_field_checked(&self, field_name: &str) -> Result<tantivy::schema::Field> {
-        self.schema.get_field(field_name).map_err(|_| {
-            anyhow!("Field '{}' not found in schema", field_name)
-        })
+        crate::engine::constants::get_required_field(&self.schema, field_name)
     }
 
     /// Validate document structure before indexing

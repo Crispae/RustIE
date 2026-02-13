@@ -15,3 +15,8 @@ pub const FIELD_OUTGOING_EDGES: &str = "outgoing_edges";
 pub const TOKEN_FIELDS: [&str; 8] = [
     "word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"
 ];
+
+/// Look up a field in the schema, returning a descriptive error on failure.
+pub fn get_required_field(schema: &tantivy::schema::Schema, name: &str) -> anyhow::Result<tantivy::schema::Field> {
+    schema.get_field(name).map_err(|_| anyhow::anyhow!("Field '{}' not found in schema", name))
+}

@@ -144,6 +144,15 @@ impl CollapsedMatcher {
     }
 }
 
+impl From<&crate::query::ast::Matcher> for CollapsedMatcher {
+    fn from(matcher: &crate::query::ast::Matcher) -> Self {
+        match matcher {
+            crate::query::ast::Matcher::String(term) => CollapsedMatcher::Exact(term.clone()),
+            crate::query::ast::Matcher::Regex { pattern, .. } => CollapsedMatcher::RegexPattern(pattern.clone()),
+        }
+    }
+}
+
 /// Specification for collapsing a constraint + edge into a single driver.
 /// Supports both exact string matchers and regex patterns via term enumeration.
 #[derive(Clone, Debug)]

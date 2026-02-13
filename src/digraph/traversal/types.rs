@@ -16,3 +16,17 @@ pub enum TraversalResult {
     /// Successfully found matching nodes
     Success(Vec<usize>),
 }
+
+impl TraversalResult {
+    /// Deduplicate and convert a node list into a TraversalResult.
+    /// Returns `FailTraversal` if the list is empty, `Success` otherwise.
+    pub fn from_nodes(mut nodes: Vec<usize>) -> Self {
+        nodes.sort_unstable();
+        nodes.dedup();
+        if nodes.is_empty() {
+            TraversalResult::FailTraversal
+        } else {
+            TraversalResult::Success(nodes)
+        }
+    }
+}

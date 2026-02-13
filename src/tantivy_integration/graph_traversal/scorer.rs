@@ -22,7 +22,7 @@ use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
 
 use super::types::{
     prof_inc, capture_name,
-    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec, CollapsedMatcher,
+    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec,
 };
 // Profiling counters - only mutated through prof_inc! macro
 #[allow(unused_imports)]
@@ -34,6 +34,7 @@ use super::types::{
 };
 use super::candidate_driver::CandidateDriver;
 use super::intersection::TwoPhaseIntersection;
+use super::pattern_utils::unwrap_constraint_pattern_static;
 
 /// Optimized scorer for graph traversal queries
 /// Uses CandidateDriver abstraction for Odinson-style collapsed query optimization
@@ -144,7 +145,7 @@ impl OptimizedGraphTraversalScorer {
         for step in &flat_steps {
             if let FlatPatternStep::Constraint(pat) = step {
                 if constraint_idx < num_constraints {
-                    let inner = unwrap_constraint_pattern_for_coverage(pat);
+                    let inner = unwrap_constraint_pattern_static(pat);
                     constraint_has_indexed_field[constraint_idx] = match inner {
                         Pattern::Constraint(Constraint::Field { .. }) => true,
                         Pattern::Constraint(Constraint::Wildcard) => true,
@@ -182,7 +183,7 @@ impl OptimizedGraphTraversalScorer {
         constraint_idx = 0;
         for step in &flat_steps {
             if let FlatPatternStep::Constraint(pat) = step {
-                let inner = unwrap_constraint_pattern_for_coverage(pat);
+                let inner = unwrap_constraint_pattern_static(pat);
                 if matches!(inner, Pattern::Constraint(Constraint::Wildcard)) {
                     if constraint_idx < num_constraints {
                         constraints_covered_by_postings[constraint_idx] = true;
@@ -211,7 +212,7 @@ impl OptimizedGraphTraversalScorer {
                 if let FlatPatternStep::Constraint(constraint_pat) = step {
                     if c_idx < num_constraints {
                         let covered = constraints_covered_by_postings[c_idx];
-                        let unwrapped = unwrap_constraint_pattern_for_coverage(constraint_pat);
+                        let unwrapped = unwrap_constraint_pattern_static(constraint_pat);
                         let exact = if let Pattern::Constraint(constraint) = unwrapped {
                             is_exact_skippable(constraint)
                         } else {
@@ -259,14 +260,6 @@ impl OptimizedGraphTraversalScorer {
     }
 }
 
-/// Helper to unwrap NamedCapture/Repetition for coverage check
-fn unwrap_constraint_pattern_for_coverage(pat: &Pattern) -> &Pattern {
-    match pat {
-        Pattern::NamedCapture { pattern, .. } => unwrap_constraint_pattern_for_coverage(pattern),
-        Pattern::Repetition { pattern, .. } => unwrap_constraint_pattern_for_coverage(pattern),
-        _ => pat,
-    }
-}
 
 /// Extract tokens from a constraint field using fast fields (O(1) columnar access)
 /// Returns empty vector if fast field not available
@@ -808,16 +801,6 @@ impl OptimizedGraphTraversalScorer {
         false
     }
 
-    /// Unwrap constraint pattern by removing NamedCapture and Repetition wrappers
-    /// Returns the underlying constraint pattern
-    pub(crate) fn unwrap_constraint_pattern<'a>(&self, pat: &'a Pattern) -> &'a Pattern {
-        match pat {
-            Pattern::NamedCapture { pattern, .. } => self.unwrap_constraint_pattern(pattern),
-            Pattern::Repetition { pattern, .. } => self.unwrap_constraint_pattern(pattern),
-            _ => pat,
-        }
-    }
-
     /// Compute sloppy frequency factor based on span width (Odinson-style)
     /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
     /// Shorter spans get higher scores
@@ -1277,7 +1260,7 @@ impl OptimizedGraphTraversalScorer {
                     return false;
                 }
 
-                let unwrapped = self.unwrap_constraint_pattern(constraint_pat);
+                let unwrapped = unwrap_constraint_pattern_static(constraint_pat);
 
                 let is_wildcard = matches!(
                     unwrapped,
@@ -1678,7 +1661,7 @@ impl OptimizedGraphTraversalScorer {
 
     /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
     pub(crate) fn find_positions_in_tokens(&self, tokens: &[String], pattern: &Pattern) -> Vec<usize> {
-        let pattern = self.unwrap_constraint_pattern(pattern);
+        let pattern = unwrap_constraint_pattern_static(pattern);
 
         let mut positions = Vec::new();
         match pattern {
@@ -1715,7 +1698,7 @@ impl OptimizedGraphTraversalScorer {
         pattern: &Pattern,
         allowed: &[u32],
     ) -> Vec<usize> {
-        let pattern = self.unwrap_constraint_pattern(pattern);
+        let pattern = unwrap_constraint_pattern_static(pattern);
 
         let mut positions = Vec::new();
 

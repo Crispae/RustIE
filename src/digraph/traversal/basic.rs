@@ -50,14 +50,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
-        result_nodes.sort_unstable();
-        result_nodes.dedup();
-        if result_nodes.is_empty() {
-            TraversalResult::FailTraversal
-        } else {
-            TraversalResult::Success(result_nodes)
-        }
+        TraversalResult::from_nodes(result_nodes)
     }
 
     /// Traverse all incoming edges.
@@ -72,14 +65,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
-        result_nodes.sort_unstable();
-        result_nodes.dedup();
-        if result_nodes.is_empty() {
-            TraversalResult::FailTraversal
-        } else {
-            TraversalResult::Success(result_nodes)
-        }
+        TraversalResult::from_nodes(result_nodes)
     }
 
     /// Traverse outgoing edges matching a specific label.
@@ -122,14 +108,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
-        result_nodes.sort_unstable();
-        result_nodes.dedup();
-        if result_nodes.is_empty() {
-            TraversalResult::FailTraversal
-        } else {
-            TraversalResult::Success(result_nodes)
-        }
+        TraversalResult::from_nodes(result_nodes)
     }
 
     /// Traverse incoming edges matching a specific label.
@@ -172,13 +151,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
-        result_nodes.sort_unstable();
-        result_nodes.dedup();
-        if result_nodes.is_empty() {
-            TraversalResult::FailTraversal
-        } else {
-            TraversalResult::Success(result_nodes)
-        }
+        TraversalResult::from_nodes(result_nodes)
     }
 }

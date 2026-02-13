@@ -3,6 +3,46 @@ use crate::engine::ExtractorEngine;
 use crate::api::models::{QueryRequest, QueryResponse, ErrorResponse, DocumentResult, MatchResult, HealthResponse, StatsResponse};
 use std::time::Instant;
 
+/// Validate that the query string is non-empty, returning a BadRequest response if invalid.
+fn validate_query(query: &str) -> Option<HttpResponse> {
+    if query.trim().is_empty() {
+        Some(HttpResponse::BadRequest().json(ErrorResponse {
+            error: "Query cannot be empty".to_string(),
+            error_type: "ValidationError".to_string(),
+        }))
+    } else {
+        None
+    }
+}
+
+/// Execute a query and build the HTTP response.
+fn execute_query(engine: &ExtractorEngine, query: &str, limit: usize) -> HttpResponse {
+    let start_time = Instant::now();
+    match engine.query_with_limit(query, limit) {
+        Ok(odin_results) => {
+            let duration = start_time.elapsed().as_secs_f32();
+            let results = convert_to_detailed_results(engine, odin_results);
+
+            let response = QueryResponse {
+                query: query.to_string(),
+                duration,
+                result_count: results.len(),
+                max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
+                results,
+            };
+
+            HttpResponse::Ok().json(response)
+        }
+        Err(e) => {
+            log::error!("Query execution failed: {}", e);
+            HttpResponse::InternalServerError().json(ErrorResponse {
+                error: format!("Query execution failed: {}", e),
+                error_type: "QueryError".to_string(),
+            })
+        }
+    }
+}
+
 /// Health check endpoint
 #[utoipa::path(
     get,
@@ -35,41 +75,10 @@ pub async fn query_documents(
     engine: web::Data<ExtractorEngine>,
     request: web::Json<QueryRequest>,
 ) -> Result<HttpResponse> {
-    // Validate request
-    if request.query.trim().is_empty() {
-        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
-            error: "Query cannot be empty".to_string(),
-            error_type: "ValidationError".to_string(),
-        }));
+    if let Some(err_response) = validate_query(&request.query) {
+        return Ok(err_response);
     }
-
-    // Execute query with timing
-    let start_time = Instant::now();
-    match engine.query_with_limit(&request.query, request.limit) {
-        Ok(odin_results) => {
-            let duration = start_time.elapsed().as_secs_f32();
-
-            // Convert to detailed response
-            let results = convert_to_detailed_results(&engine, odin_results);
-
-            let response = QueryResponse {
-                query: request.query.clone(),
-                duration,
-                result_count: results.len(),
-                max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-                results,
-            };
-
-            Ok(HttpResponse::Ok().json(response))
-        }
-        Err(e) => {
-            log::error!("Query execution failed: {}", e);
-            Ok(HttpResponse::InternalServerError().json(ErrorResponse {
-                error: format!("Query execution failed: {}", e),
-                error_type: "QueryError".to_string(),
-            }))
-        }
-    }
+    Ok(execute_query(&engine, &request.query, request.limit))
 }
 
 /// Simple query endpoint that accepts query as URL parameter
@@ -92,40 +101,10 @@ pub async fn simple_query(
 ) -> Result<HttpResponse> {
     let query = path.into_inner();
 
-    if query.trim().is_empty() {
-        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
-            error: "Query cannot be empty".to_string(),
-            error_type: "ValidationError".to_string(),
-        }));
+    if let Some(err_response) = validate_query(&query) {
+        return Ok(err_response);
     }
-
-    // Execute query with timing
-    let start_time = Instant::now();
-    match engine.query_with_limit(&query, 10) {
-        Ok(odin_results) => {
-            let duration = start_time.elapsed().as_secs_f32();
-
-            // Convert to detailed response
-            let results = convert_to_detailed_results(&engine, odin_results);
-
-            let response = QueryResponse {
-                query: query.clone(),
-                duration,
-                result_count: results.len(),
-                max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-                results,
-            };
-
-            Ok(HttpResponse::Ok().json(response))
-        }
-        Err(e) => {
-            log::error!("Query execution failed: {}", e);
-            Ok(HttpResponse::InternalServerError().json(ErrorResponse {
-                error: format!("Query execution failed: {}", e),
-                error_type: "QueryError".to_string(),
-            }))
-        }
-    }
+    Ok(execute_query(&engine, &query, 10))
 }
 
 /// Get index statistics
@@ -162,7 +141,7 @@ fn convert_to_detailed_results(engine: &ExtractorEngine, odin_results: crate::re
                 .iter()
                 .map(|m| m.clone().into())
                 .collect();
-            
+
             // Get words from fields
             let words = sentence.fields.get("word").cloned().unwrap_or_default();
 

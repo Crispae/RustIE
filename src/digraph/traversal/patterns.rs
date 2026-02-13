@@ -14,7 +14,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
     /// Scala: Concatenation(List[GraphTraversal])
     pub(crate) fn concatenated_traversal(&self, start_nodes: &[usize], traversals: &[Traversal]) -> TraversalResult {
         let mut current_nodes = start_nodes.to_vec();
-        for (i, traversal) in traversals.iter().enumerate() {
+        for traversal in traversals.iter() {
             match self.execute(traversal, &current_nodes) {
                 TraversalResult::Success(nodes) => {
                     current_nodes = nodes;
@@ -27,7 +27,6 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
         current_nodes.sort_unstable();
         current_nodes.dedup();
         TraversalResult::Success(current_nodes)
@@ -51,35 +50,20 @@ impl<G: GraphAccess> GraphTraversal<G> {
                 }
             }
         }
-        // Deduplicate results as in Scala
-        if all_results.is_empty() {
-            TraversalResult::FailTraversal
-        } else {
-            let mut unique_results: Vec<usize> = all_results.into_iter().collect();
-            unique_results.sort_unstable();
-            unique_results.dedup();
-            TraversalResult::Success(unique_results)
-        }
+        TraversalResult::from_nodes(all_results)
     }
 
     /// Optional traversal (0 or 1 occurrence).
     /// Scala: Optional(GraphTraversal)
     pub(crate) fn optional_traversal(&self, start_nodes: &[usize], traversal: &Traversal) -> TraversalResult {
-        match self.execute(traversal, start_nodes) {
-            TraversalResult::Success(mut nodes) => {
-                // Add start_nodes to the result, deduplicate
-                nodes.extend_from_slice(start_nodes);
-                nodes.sort_unstable();
-                nodes.dedup();
-                TraversalResult::Success(nodes)
-            },
-            TraversalResult::FailTraversal | TraversalResult::NoTraversal => {
-                let mut nodes = start_nodes.to_vec();
-                nodes.sort_unstable();
-                nodes.dedup();
-                TraversalResult::Success(nodes)
-            }
-        }
+        let mut nodes = match self.execute(traversal, start_nodes) {
+            TraversalResult::Success(nodes) => nodes,
+            _ => Vec::new(),
+        };
+        nodes.extend_from_slice(start_nodes);
+        nodes.sort_unstable();
+        nodes.dedup();
+        TraversalResult::Success(nodes)
     }
 
     /// Kleene star traversal (0 or more occurrences).

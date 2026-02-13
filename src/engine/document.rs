@@ -5,10 +5,11 @@ use crate::data::parser::DocumentParser;
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
 use crate::results::rustie_results::SentenceResult;
+use crate::tantivy_integration::utils;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use tantivy::{
-    schema::{TantivyDocument, Value},
+    schema::TantivyDocument,
     DocAddress, Score,
 };
 
@@ -52,48 +53,13 @@ impl ExtractorEngine {
 
     /// Extract a single field value from a Tantivy document
     pub fn extract_field_value(&self, doc: &TantivyDocument, field_name: &str) -> Option<String> {
-        if let Ok(field) = self.schema.get_field(field_name) {
-            doc.get_first(field).and_then(|value| {
-                if let Some(text) = value.as_str() {
-                    Some(text.to_string())
-                } else if let Some(u64_val) = value.as_u64() {
-                    Some(u64_val.to_string())
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        }
+        utils::extract_field_value(&self.schema, doc, field_name)
     }
 
     /// Extract multiple field values from a Tantivy document
     /// For token fields (word, lemma, pos, etc.), decodes the position-aware format
     pub fn extract_field_values(&self, doc: &TantivyDocument, field_name: &str) -> Vec<String> {
-        if let Ok(field) = self.schema.get_field(field_name) {
-            let raw_values: Vec<String> = doc
-                .get_all(field)
-                .filter_map(|value| {
-                    if let Some(text) = value.as_str() {
-                        Some(text.to_string())
-                    } else if let Some(u64_val) = value.as_u64() {
-                        Some(u64_val.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // For token fields stored in position-aware format (e.g., "John|eats|pizza"),
-            // decode by splitting on | to get individual tokens
-            if TOKEN_FIELDS.contains(&field_name) && raw_values.len() == 1 {
-                raw_values[0].split('|').map(|s| s.to_string()).collect()
-            } else {
-                raw_values
-            }
-        } else {
-            Vec::new()
-        }
+        utils::extract_field_values(&self.schema, doc, field_name)
     }
 
     /// Add a document to the index
