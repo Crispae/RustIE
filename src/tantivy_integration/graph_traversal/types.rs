@@ -3,10 +3,33 @@
 use std::sync::atomic::AtomicUsize;
 use tantivy::schema::Field;
 
-// Global counter for generating unique capture names (much faster than rand)
-pub(crate) static CAPTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+// ---------------------------------------------------------------------------
+// Profiling counters: gated behind `profiling` feature to eliminate
+// atomic contention (LOCK XADD / cache-line bouncing) in production builds.
+// ---------------------------------------------------------------------------
 
-// Module-level counters for profiling (shared across all instances)
+/// Increment a profiling counter. Compiles to a no-op unless `--features profiling`.
+#[cfg(feature = "profiling")]
+macro_rules! prof_inc {
+    ($counter:expr) => {
+        $counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    ($counter:expr, $val:expr) => {
+        $counter.fetch_add($val, std::sync::atomic::Ordering::Relaxed)
+    };
+}
+
+#[cfg(not(feature = "profiling"))]
+macro_rules! prof_inc {
+    ($counter:expr) => { 0usize };
+    ($counter:expr, $val:expr) => { 0usize };
+}
+
+// Re-export macro for use in sibling modules
+pub(crate) use prof_inc;
+
+// Counters are always defined (so code referencing them compiles),
+// but only mutated when the `profiling` feature is active.
 pub(crate) static CALL_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static GRAPH_DESER_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static GRAPH_DESER_SKIPPED: AtomicUsize = AtomicUsize::new(0);
@@ -15,18 +38,46 @@ pub(crate) static PREFILTER_KILLED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static PREFILTER_ALLOWED_POS_SUM: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static PREFILTER_ALLOWED_POS_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-// Odinson-style collapsed query metrics
 pub(crate) static SRC_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DST_DRIVER_DOCS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DRIVER_ALIGNMENT_DOCS: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DRIVER_INTERSECTION_SUM: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static DRIVER_INTERSECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
-// Optimization: Skip prefilter when all constraints are collapsed (2-constraint patterns)
 pub(crate) static PREFILTER_SKIPPED_ALL_COLLAPSED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static TOKEN_EXTRACTION_SKIPPED: AtomicUsize = AtomicUsize::new(0);
-// Regex expansion statistics
 pub(crate) static REGEX_EXPANSION_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static REGEX_EXPANSION_TERMS: AtomicUsize = AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// Capture name pre-allocation: avoids format!("c{}", N) heap allocations
+// and the global CAPTURE_COUNTER atomic contention on every match.
+// ---------------------------------------------------------------------------
+
+/// Pre-computed capture names for indices 0..99. Avoids heap allocation for the
+/// overwhelming majority of captures (most patterns have < 10 constraints).
+const PRECOMPUTED_CAPTURE_NAMES: &[&str] = &[
+    "c0","c1","c2","c3","c4","c5","c6","c7","c8","c9",
+    "c10","c11","c12","c13","c14","c15","c16","c17","c18","c19",
+    "c20","c21","c22","c23","c24","c25","c26","c27","c28","c29",
+    "c30","c31","c32","c33","c34","c35","c36","c37","c38","c39",
+    "c40","c41","c42","c43","c44","c45","c46","c47","c48","c49",
+    "c50","c51","c52","c53","c54","c55","c56","c57","c58","c59",
+    "c60","c61","c62","c63","c64","c65","c66","c67","c68","c69",
+    "c70","c71","c72","c73","c74","c75","c76","c77","c78","c79",
+    "c80","c81","c82","c83","c84","c85","c86","c87","c88","c89",
+    "c90","c91","c92","c93","c94","c95","c96","c97","c98","c99",
+];
+
+/// Get a capture name for the given index. Uses pre-computed strings for 0..99,
+/// falls back to format! for larger indices (extremely rare in practice).
+#[inline]
+pub(crate) fn capture_name(idx: usize) -> String {
+    if idx < PRECOMPUTED_CAPTURE_NAMES.len() {
+        PRECOMPUTED_CAPTURE_NAMES[idx].to_string()
+    } else {
+        format!("c{}", idx)
+    }
+}
 
 /// Default maximum number of terms to expand for regex patterns.
 /// Prevents runaway memory/time on broad patterns like `.*`

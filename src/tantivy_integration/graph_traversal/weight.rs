@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::Ordering;
-
 use tantivy::{
     query::{Weight, Scorer},
     schema::{Field, Schema, IndexRecordOption},
@@ -18,9 +16,12 @@ use tantivy_fst::Regex;
 
 use crate::query::ast::{Pattern, FlatPatternStep, Constraint, Matcher};
 use super::types::{
+    prof_inc,
     CollapsedSpec, PositionPrefilterPlan, ConstraintTermReq,
-    DEFAULT_MAX_TERM_EXPANSIONS, REGEX_EXPANSION_COUNT, REGEX_EXPANSION_TERMS,
+    DEFAULT_MAX_TERM_EXPANSIONS,
 };
+#[allow(unused_imports)]
+use super::types::{REGEX_EXPANSION_COUNT, REGEX_EXPANSION_TERMS};
 use super::candidate_driver::{
     CandidateDriver, EmptyDriver, CombinedPositionDriver,
     UnionPositionsIterator, UnionAndIntersectDriver,
@@ -177,8 +178,8 @@ impl OptimizedGraphTraversalWeight {
                                             }
 
                                             if count > 0 {
-                                                REGEX_EXPANSION_COUNT.fetch_add(1, Ordering::Relaxed);
-                                                REGEX_EXPANSION_TERMS.fetch_add(count, Ordering::Relaxed);
+                                                prof_inc!(REGEX_EXPANSION_COUNT);
+                                                prof_inc!(REGEX_EXPANSION_TERMS, count);
                                             }
                                         }
                                     }

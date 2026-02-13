@@ -3,6 +3,7 @@
 use crate::engine::constants::*;
 use crate::engine::schema::create_schema_from_yaml;
 use crate::query::QueryCompiler;
+use crate::query::parser::QueryParser;
 use anyhow::{Result, anyhow};
 use std::path::Path;
 use tantivy::{
@@ -24,6 +25,10 @@ pub struct ExtractorEngine {
     pub(crate) outgoing_edges_field: Field,
     pub(crate) parent_doc_id_field: String,
     pub(crate) output_fields: Vec<String>,
+    /// Cached query compiler (avoids cloning Schema on every query)
+    pub(crate) query_compiler: QueryCompiler,
+    /// Cached query parser (avoids re-creating pest parser on every query)
+    pub(crate) query_parser: QueryParser,
 }
 
 impl ExtractorEngine {
@@ -38,6 +43,9 @@ impl ExtractorEngine {
         let writer = Self::try_create_writer(&index)?;
         let fields = Self::extract_required_fields(&schema)?;
 
+        let query_compiler = QueryCompiler::new(schema.clone());
+        let query_parser = QueryParser::new(FIELD_WORD.to_string());
+
         Ok(Self {
             index,
             reader,
@@ -50,6 +58,8 @@ impl ExtractorEngine {
             outgoing_edges_field: fields.outgoing_edges,
             parent_doc_id_field: FIELD_DOC_ID.to_string(),
             output_fields,
+            query_compiler,
+            query_parser,
         })
     }
 
@@ -139,8 +149,12 @@ impl ExtractorEngine {
         self.output_fields.iter().any(|f| f == field_name)
     }
 
-    pub fn compiler(&self) -> QueryCompiler {
-        QueryCompiler::new(self.schema.clone())
+    pub fn compiler(&self) -> &QueryCompiler {
+        &self.query_compiler
+    }
+
+    pub fn parser(&self) -> &QueryParser {
+        &self.query_parser
     }
 
     /// Create schema from YAML file - wrapper for backward compatibility

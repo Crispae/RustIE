@@ -4,7 +4,7 @@
 //! the actual document matching and scoring during query execution.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 use rayon::prelude::*;
 use tantivy::{
     query::Scorer,
@@ -21,11 +21,16 @@ use crate::digraph::zero_copy::ZeroCopyGraph;
 use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
 
 use super::types::{
-    CAPTURE_COUNTER, CALL_COUNT, GRAPH_DESER_COUNT, GRAPH_DESER_SKIPPED,
+    prof_inc, capture_name,
+    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec, CollapsedMatcher,
+};
+// Profiling counters - only mutated through prof_inc! macro
+#[allow(unused_imports)]
+use super::types::{
+    CALL_COUNT, GRAPH_DESER_COUNT, GRAPH_DESER_SKIPPED,
     PREFILTER_DOCS, PREFILTER_KILLED, PREFILTER_ALLOWED_POS_SUM, PREFILTER_ALLOWED_POS_COUNT,
     DRIVER_ALIGNMENT_DOCS, DRIVER_INTERSECTION_SUM, DRIVER_INTERSECTION_COUNT,
     PREFILTER_SKIPPED_ALL_COLLAPSED, TOKEN_EXTRACTION_SKIPPED,
-    ConstraintTermReq, PositionPrefilterPlan, PositionRequirement, CollapsedSpec, CollapsedMatcher,
 };
 use super::candidate_driver::CandidateDriver;
 use super::intersection::TwoPhaseIntersection;
@@ -83,6 +88,10 @@ pub struct OptimizedGraphTraversalScorer {
     /// One entry per constraint field name, None if fast field not available
     /// Text fields use StrColumn with dictionary encoding for fast field access
     pub(crate) constraint_fast_fields: Vec<Option<StrColumn>>,
+    /// Scratch buffer for source driver positions (reused across documents to avoid allocation)
+    pub(crate) src_positions_buf: Vec<u32>,
+    /// Scratch buffer for destination driver positions (reused across documents to avoid allocation)
+    pub(crate) dst_positions_buf: Vec<u32>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -214,6 +223,8 @@ impl OptimizedGraphTraversalScorer {
             dst_collapse,
             constraints_covered_by_postings,
             constraint_fast_fields,
+            src_positions_buf: Vec::with_capacity(16),
+            dst_positions_buf: Vec::with_capacity(16),
         }
     }
 }
@@ -247,21 +258,12 @@ fn extract_constraint_tokens_from_fast_field(
         let mut encoded_buffer = String::new();
         let ord_to_str_result = str_col.ord_to_str(term_ord, &mut encoded_buffer);
         if ord_to_str_result.as_ref().map(|b| *b).unwrap_or(false) && !encoded_buffer.is_empty() {
-            let encoded = encoded_buffer;
-            // Decode pipe-separated format (same as extract_field_values)
-            // Token fields are stored as "token1|token2|token3"
+            // Single-pass decode: split directly without pre-counting pipe chars
             let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
             if token_fields.contains(&field_name) {
-                // Decode pipe-separated tokens
-                let token_count = encoded.matches('|').count() + 1;
-                let mut tokens = Vec::with_capacity(token_count);
-                for s in encoded.split('|') {
-                    tokens.push(s.to_string());
-                }
-                return tokens;
+                return encoded_buffer.split('|').map(|s| s.to_string()).collect();
             } else {
-                // Single value, not pipe-separated
-                return vec![encoded];
+                return vec![encoded_buffer];
             }
         }
     }
@@ -401,21 +403,12 @@ impl<'a> LazyConstraintTokens<'a> {
             // ord_to_str() requires a mutable String buffer
             let mut encoded_buffer = String::new();
             if str_col.ord_to_str(term_ord, &mut encoded_buffer).is_ok() && !encoded_buffer.is_empty() {
-                let encoded = encoded_buffer;
-                // Decode pipe-separated format (same as extract_field_values)
-                // Token fields are stored as "token1|token2|token3"
+                // Single-pass decode: split directly without pre-counting pipe chars
                 let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
                 if token_fields.contains(&field_name) {
-                    // Decode pipe-separated tokens
-                    let token_count = encoded.matches('|').count() + 1;
-                    let mut tokens = Vec::with_capacity(token_count);
-                    for s in encoded.split('|') {
-                        tokens.push(s.to_string());
-                    }
-                    return tokens;
+                    return encoded_buffer.split('|').map(|s| s.to_string()).collect();
                 } else {
-                    // Single value, not pipe-separated
-                    return vec![encoded];
+                    return vec![encoded_buffer];
                 }
             }
         }
@@ -447,15 +440,19 @@ fn build_dst_inverted_index(
         .rev()
         .find(|step| matches!(step, FlatPatternStep::Constraint(_)));
     
-    let capture_name = if let Some(FlatPatternStep::Constraint(ref pat)) = dst_constraint_step {
-        // Extract capture name from pattern
+    // Count total constraints to derive the destination constraint index
+    let total_constraints = flat_steps.iter()
+        .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
+        .count();
+    let dst_constraint_idx = total_constraints.saturating_sub(1);
+
+    let cap_name = if let Some(FlatPatternStep::Constraint(ref pat)) = dst_constraint_step {
         match pat {
             Pattern::NamedCapture { name, .. } => name.clone(),
-            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            _ => capture_name(dst_constraint_idx),
         }
     } else {
-        // Fallback if no constraint found (shouldn't happen in valid patterns)
-        format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed))
+        capture_name(dst_constraint_idx)
     };
     
     // Pre-compute SpanWithCaptures for each destination position
@@ -464,7 +461,7 @@ fn build_dst_inverted_index(
             start: dst_pos as usize,
             end: dst_pos as usize + 1,
         };
-        let capture = crate::types::NamedCapture::new(capture_name.clone(), span.clone());
+        let capture = crate::types::NamedCapture::new(cap_name.clone(), span.clone());
         let span_with_captures = crate::types::SpanWithCaptures::with_captures(span, vec![capture]);
         
         index.entry(dst_pos).or_default().push(span_with_captures);
@@ -575,7 +572,7 @@ fn process_single_start_position_with_index<T: TokenAccessor>(
                             let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
                             let name = match pat {
                                 Pattern::NamedCapture { name, .. } => name.clone(),
-                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                _ => capture_name(c_idx),
                             };
                             captures.push(crate::types::NamedCapture::new(name, span));
                         }
@@ -617,7 +614,7 @@ fn process_single_start_position_with_index<T: TokenAccessor>(
                             let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
                             let name = match pat {
                                 Pattern::NamedCapture { name, .. } => name.clone(),
-                                _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                _ => capture_name(c_idx),
                             };
                             captures.push(crate::types::NamedCapture::new(name, span));
                         }
@@ -701,7 +698,7 @@ impl OptimizedGraphTraversalScorer {
                                 let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
                                 let name = match pat {
                                     Pattern::NamedCapture { name, .. } => name.clone(),
-                                    _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                    _ => capture_name(c_idx),
                                 };
                                 captures.push(crate::types::NamedCapture::new(name, span));
                             }
@@ -772,8 +769,8 @@ impl OptimizedGraphTraversalScorer {
         // Logging disabled for performance
     }
 
-    /// Build allowed positions combining src_driver, dst_driver, and prefilter positions
-    /// Converts all to HashSet<u32> for O(1) lookup
+    /// Build allowed positions combining src_driver, dst_driver, and prefilter positions.
+    /// Converts to HashSet<u32> with pre-allocated capacity to avoid rehashing.
     pub(crate) fn build_allowed_positions(
         &self,
         src_driver_positions: Option<&[u32]>,
@@ -785,14 +782,18 @@ impl OptimizedGraphTraversalScorer {
 
         if let Some(src_positions) = src_driver_positions {
             if num_constraints > 0 {
-                result[0] = Some(src_positions.iter().copied().collect());
+                let mut set = HashSet::with_capacity(src_positions.len());
+                set.extend(src_positions.iter().copied());
+                result[0] = Some(set);
             }
         }
 
         if let Some(dst_positions) = dst_driver_positions {
             let last_idx = num_constraints.saturating_sub(1);
             if last_idx > 0 && last_idx < num_constraints {
-                result[last_idx] = Some(dst_positions.iter().copied().collect());
+                let mut set = HashSet::with_capacity(dst_positions.len());
+                set.extend(dst_positions.iter().copied());
+                result[last_idx] = Some(set);
             }
         }
 
@@ -800,7 +801,9 @@ impl OptimizedGraphTraversalScorer {
             if idx < num_constraints {
                 if result[idx].is_none() {
                     if let Some(positions) = prefilter {
-                        result[idx] = Some(positions.iter().copied().collect());
+                        let mut set = HashSet::with_capacity(positions.len());
+                        set.extend(positions.iter().copied());
+                        result[idx] = Some(set);
                     }
                 }
             }
@@ -1047,71 +1050,91 @@ impl OptimizedGraphTraversalScorer {
         Some(allowed)
     }
 
+    /// Copy driver positions into reusable scratch buffers (avoids per-document heap allocation).
+    /// Must be called before check_graph_traversal to populate src_positions_buf / dst_positions_buf.
+    fn snapshot_driver_positions(&mut self) {
+        self.src_positions_buf.clear();
+        if let Some(positions) = self.intersection.src_driver().matching_positions() {
+            self.src_positions_buf.extend_from_slice(positions);
+        }
+        self.dst_positions_buf.clear();
+        if let Some(positions) = self.intersection.dst_driver().matching_positions() {
+            self.dst_positions_buf.extend_from_slice(positions);
+        }
+    }
+
     /// Check if a document has valid graph traversal from source to destination
     pub(crate) fn check_graph_traversal(&mut self, doc_id: DocId) -> bool {
-        let call_num = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        let call_num = prof_inc!(CALL_COUNT);
         self.current_doc_matches.clear();
 
         let num_constraints = self.prefilter_plan.num_constraints;
 
-        // Optimization: Check if all constraints are collapsed first (avoids cloning in fast path)
-        // We need to check driver positions availability before deciding the path
-        // Access drivers via TwoPhaseIntersection
-        let src_has_positions = self.intersection.src_driver().matching_positions().is_some();
-        let dst_has_positions = self.intersection.dst_driver().matching_positions().is_some();
+        // Use scratch buffers (populated by snapshot_driver_positions before this call)
+        let src_has_positions = !self.src_positions_buf.is_empty();
+        let dst_has_positions = !self.dst_positions_buf.is_empty();
         let all_collapsed = num_constraints == 2
             && self.src_collapse.is_some()
             && self.dst_collapse.is_some()
             && src_has_positions
             && dst_has_positions;
 
-        PREFILTER_DOCS.fetch_add(1, Ordering::Relaxed);
+        prof_inc!(PREFILTER_DOCS);
 
-        // Clone positions once - needed for both branches due to mutable borrow in compute_allowed_positions
-        // In the all_collapsed branch, this is the only clone needed
-        // In the non-collapsed branch, compute_allowed_positions needs &mut self, so we must clone first
-        // Access drivers via TwoPhaseIntersection
-        let src_driver_positions: Option<Vec<u32>> = self.intersection.src_driver().matching_positions().map(|p| p.to_vec());
-        let dst_driver_positions: Option<Vec<u32>> = self.intersection.dst_driver().matching_positions().map(|p| p.to_vec());
+        // Phase A: compute allowed_positions.
+        // compute_allowed_positions needs &mut self (for postings seek), so we must
+        // take ownership of scratch buffer contents before the call to avoid borrow conflicts.
+        // We use std::mem::take to move the data out of self without allocation,
+        // then put it back afterward so the buffers are reused on the next call.
+        let src_buf_owned = std::mem::take(&mut self.src_positions_buf);
+        let dst_buf_owned = std::mem::take(&mut self.dst_positions_buf);
 
         let allowed_positions = if all_collapsed {
-            PREFILTER_SKIPPED_ALL_COLLAPSED.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(PREFILTER_SKIPPED_ALL_COLLAPSED);
 
             let mut allowed: Vec<Option<Vec<u32>>> = vec![None; num_constraints];
-            // Move positions directly instead of cloning again
-            if let Some(positions) = src_driver_positions.clone() {
-                allowed[0] = Some(positions);
+            if src_has_positions {
+                allowed[0] = Some(src_buf_owned.clone());
             }
-            if let Some(positions) = dst_driver_positions.clone() {
-                allowed[num_constraints - 1] = Some(positions);
+            if dst_has_positions {
+                allowed[num_constraints - 1] = Some(dst_buf_owned.clone());
             }
             allowed
         } else {
+            let src_slice = if src_has_positions { Some(src_buf_owned.as_slice()) } else { None };
+            let dst_slice = if dst_has_positions { Some(dst_buf_owned.as_slice()) } else { None };
             match self.compute_allowed_positions(
                 doc_id,
-                src_driver_positions.as_deref(),
-                dst_driver_positions.as_deref(),
+                src_slice,
+                dst_slice,
             ) {
                 Some(ap) => ap,
                 None => {
-                    PREFILTER_KILLED.fetch_add(1, Ordering::Relaxed);
-                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    // Put buffers back before returning
+                    self.src_positions_buf = src_buf_owned;
+                    self.dst_positions_buf = dst_buf_owned;
+                    prof_inc!(PREFILTER_KILLED);
+                    prof_inc!(GRAPH_DESER_SKIPPED);
                     return false;
                 }
             }
         };
 
+        // Put scratch buffers back into self (preserves allocation for next call)
+        self.src_positions_buf = src_buf_owned;
+        self.dst_positions_buf = dst_buf_owned;
+
         for ap in &allowed_positions {
             if let Some(ref positions) = ap {
-                PREFILTER_ALLOWED_POS_SUM.fetch_add(positions.len(), Ordering::Relaxed);
-                PREFILTER_ALLOWED_POS_COUNT.fetch_add(1, Ordering::Relaxed);
+                prof_inc!(PREFILTER_ALLOWED_POS_SUM, positions.len());
+                prof_inc!(PREFILTER_ALLOWED_POS_COUNT);
             }
         }
 
         for ap in &allowed_positions {
             if let Some(ref positions) = ap {
                 if positions.is_empty() {
-                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    prof_inc!(GRAPH_DESER_SKIPPED);
                     return false;
                 }
             }
@@ -1119,7 +1142,7 @@ impl OptimizedGraphTraversalScorer {
 
         let flat_steps = &self.flat_steps;
         if flat_steps.is_empty() {
-            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(GRAPH_DESER_SKIPPED);
             return false;
         }
 
@@ -1127,9 +1150,13 @@ impl OptimizedGraphTraversalScorer {
             .filter(|s| matches!(s, FlatPatternStep::Constraint(_)))
             .count();
 
+        // Phase B: After the &mut self call is done, we can borrow scratch buffers immutably.
+        let src_driver_positions: Option<&[u32]> = if src_has_positions { Some(&self.src_positions_buf) } else { None };
+        let dst_driver_positions: Option<&[u32]> = if dst_has_positions { Some(&self.dst_positions_buf) } else { None };
+
         let allowed_positions_hashset = self.build_allowed_positions(
-            src_driver_positions.as_deref(),
-            dst_driver_positions.as_deref(),
+            src_driver_positions,
+            dst_driver_positions,
             &allowed_positions,
             num_constraints,
         );
@@ -1164,7 +1191,7 @@ impl OptimizedGraphTraversalScorer {
 
         // No need to load document - we use fast fields only for both constraint tokens and graph bytes
         if all_constraints_covered {
-            TOKEN_EXTRACTION_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(TOKEN_EXTRACTION_SKIPPED);
         }
 
         let mut constraint_count = 0;
@@ -1173,7 +1200,7 @@ impl OptimizedGraphTraversalScorer {
         for step in flat_steps.iter() {
             if let FlatPatternStep::Constraint(constraint_pat) = step {
                 if constraint_count >= self.constraint_field_names.len() {
-                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    prof_inc!(GRAPH_DESER_SKIPPED);
                     return false;
                 }
 
@@ -1269,7 +1296,7 @@ impl OptimizedGraphTraversalScorer {
                 };
 
                 if positions.is_empty() {
-                    GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    prof_inc!(GRAPH_DESER_SKIPPED);
                     return false;
                 }
                 cached_positions.push(positions);
@@ -1290,21 +1317,21 @@ impl OptimizedGraphTraversalScorer {
                         &graph_bytes_buffer
                     }
                     _ => {
-                        GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                        prof_inc!(GRAPH_DESER_SKIPPED);
                         return false;
                     }
                 }
             } else {
-                GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                prof_inc!(GRAPH_DESER_SKIPPED);
                 return false;
             }
         } else {
             // Fast field not available - cannot proceed without fallback
-            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(GRAPH_DESER_SKIPPED);
             return false;
         };
 
-        GRAPH_DESER_COUNT.fetch_add(1, Ordering::Relaxed);
+        prof_inc!(GRAPH_DESER_COUNT);
 
         let src_positions_slice: &[usize] = cached_positions.get(0).map(|v| v.as_slice()).unwrap_or(&[]);
         if constraint_count > 0 && src_positions_slice.is_empty() {
@@ -1321,7 +1348,7 @@ impl OptimizedGraphTraversalScorer {
         let constraint_field_names = &self.constraint_field_names;
 
         if !ZeroCopyGraph::is_valid_format(binary_data) {
-            GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(GRAPH_DESER_SKIPPED);
             return false;
         }
 
@@ -1333,22 +1360,18 @@ impl OptimizedGraphTraversalScorer {
                     // OPTIMIZATION: Build destination set once, share across all parallel threads
                     // Odinson-style: O(1) destination validation at traversal endpoints
                     let dst_set: HashSet<u32> = dst_driver_positions
-                        .as_ref()
                         .map(|positions| positions.iter().copied().collect())
                         .unwrap_or_default();
 
                     // OPTIMIZATION: Pre-build destination inverted index once, share across threads
-                    // This enables O(1) destination span lookup in each thread
-                    // Use Arc for thread-safe sharing in parallel iterator
                     let dst_index: Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>> =
-                        Arc::new(if let Some(ref positions) = dst_driver_positions {
+                        Arc::new(if let Some(positions) = dst_driver_positions {
                             build_dst_inverted_index(positions, flat_steps)
                         } else {
                             HashMap::new()
                         });
 
                     // OPTIMIZATION: Use EmptyTokenAccessor when all constraints are covered by postings
-                    // This eliminates token parsing overhead in the parallel traversal
                     let all_matches: Vec<crate::types::SpanWithCaptures> = if all_constraints_covered {
                         let empty_accessor = EmptyTokenAccessor::new(total_constraints);
                         src_positions
@@ -1439,14 +1462,12 @@ impl OptimizedGraphTraversalScorer {
                     // Build destination set for O(1) membership check during traversal
                     // If dst_driver has positions, use them; otherwise use empty set (no filtering)
                     let dst_set: HashSet<u32> = dst_driver_positions
-                        .as_ref()
                         .map(|positions| positions.iter().copied().collect())
                         .unwrap_or_default();
 
                     // OPTIMIZATION: Pre-build destination inverted index for O(1) span lookup
-                    // This matches Odinson's mkInvIndex(getAllSpansWithCaptures(dstSpans)) approach
                     let dst_index: HashMap<u32, Vec<crate::types::SpanWithCaptures>> = 
-                        if let Some(ref positions) = dst_driver_positions {
+                        if let Some(positions) = dst_driver_positions {
                             build_dst_inverted_index(positions, flat_steps)
                         } else {
                             HashMap::new()
@@ -1506,7 +1527,7 @@ impl OptimizedGraphTraversalScorer {
                                         let span = crate::types::Span { start: node_idx, end: node_idx + 1 };
                                         let name = match pat {
                                             Pattern::NamedCapture { name, .. } => name.clone(),
-                                            _ => format!("c{}", CAPTURE_COUNTER.fetch_add(1, Ordering::Relaxed)),
+                                            _ => capture_name(c_idx),
                                         };
                                         captures.push(crate::types::NamedCapture::new(name, span));
                                     }
@@ -1534,7 +1555,7 @@ impl OptimizedGraphTraversalScorer {
                 false
             }
             Err(_e) => {
-                GRAPH_DESER_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                prof_inc!(GRAPH_DESER_SKIPPED);
                 false
             }
         };
@@ -1680,16 +1701,19 @@ impl DocSet for OptimizedGraphTraversalScorer {
             }
 
             // Statistics tracking
-            DRIVER_ALIGNMENT_DOCS.fetch_add(1, Ordering::Relaxed);
+            prof_inc!(DRIVER_ALIGNMENT_DOCS);
 
             if let Some(src_pos) = self.intersection.src_driver().matching_positions() {
-                DRIVER_INTERSECTION_SUM.fetch_add(src_pos.len(), Ordering::Relaxed);
-                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                prof_inc!(DRIVER_INTERSECTION_SUM, src_pos.len());
+                prof_inc!(DRIVER_INTERSECTION_COUNT);
             }
             if let Some(dst_pos) = self.intersection.dst_driver().matching_positions() {
-                DRIVER_INTERSECTION_SUM.fetch_add(dst_pos.len(), Ordering::Relaxed);
-                DRIVER_INTERSECTION_COUNT.fetch_add(1, Ordering::Relaxed);
+                prof_inc!(DRIVER_INTERSECTION_SUM, dst_pos.len());
+                prof_inc!(DRIVER_INTERSECTION_COUNT);
             }
+
+            // Snapshot driver positions into scratch buffers before mutable check_graph_traversal
+            self.snapshot_driver_positions();
 
             // Phase 2: Expensive verification - check if graph traversal succeeds
             if self.check_graph_traversal(candidate) {
@@ -1722,6 +1746,9 @@ impl DocSet for OptimizedGraphTraversalScorer {
                 self.current_doc = None;
                 return tantivy::TERMINATED;
             }
+
+            // Snapshot driver positions into scratch buffers
+            self.snapshot_driver_positions();
 
             // Phase 2: Expensive verification - check if graph traversal succeeds
             if self.check_graph_traversal(candidate) {

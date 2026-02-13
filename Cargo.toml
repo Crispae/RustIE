@@ -62,5 +62,8 @@ path = "src/bin/profile_query.rs"
 name = "test_greedy_lazy"
 path = "src/bin/test_greedy_lazy.rs"
 
+[features]
+profiling = []
+
 [profile.release]
 debug = true

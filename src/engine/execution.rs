@@ -2,7 +2,6 @@
 
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
-use crate::query::parser::QueryParser;
 use crate::results::rustie_results::{RustIeResult, SentenceResult};
 use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
@@ -27,11 +26,8 @@ impl ExtractorEngine {
 
     /// Execute a query string with a limit on results
     pub fn query_with_limit(&self, query: &str, limit: usize) -> Result<RustIeResult> {
-        let parser = QueryParser::new(FIELD_WORD.to_string());
-        let pattern = parser.parse_query(query)?;
-
+        let pattern = self.parser().parse_query(query)?;
         let tantivy_query = self.compiler().compile(query)?;
-
         self.execute_query(tantivy_query.as_ref(), limit, &pattern)
     }
 
@@ -281,7 +277,8 @@ impl ExtractorEngine {
         Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
-    /// Execute named capture pattern matching queries using custom scorer
+    /// Execute named capture pattern matching queries using custom scorer.
+    /// Creates weight ONCE and caches scorers per segment (avoids O(N) weight+scorer creation).
     fn execute_named_capture_matching(
         &self,
         named_query: &RustieNamedCaptureQuery,
@@ -293,21 +290,30 @@ impl ExtractorEngine {
             .search(named_query, &TopDocs::with_limit(limit))
             .map_err(anyhow::Error::from)?;
 
+        // Create weight ONCE (previously created per-document)
+        let weight = named_query.weight(tantivy::query::EnableScoring::Enabled {
+            searcher: &searcher,
+            statistics_provider: &searcher,
+        })?;
+
+        // Cache scorers per segment to avoid re-creation
+        let mut scorer_cache: HashMap<u32, Box<dyn tantivy::query::Scorer>> = HashMap::new();
+
         let mut sentence_results = Vec::new();
 
         for (score, doc_address) in top_docs {
             if let Ok(doc) = self.doc(doc_address) {
                 let mut sentence_result = self.extract_sentence_result(&doc, score)?;
 
-                let (segment_ord, _) = (doc_address.segment_ord, doc_address.doc_id);
-                let segment_reader = searcher.segment_reader(segment_ord);
+                let segment_ord = doc_address.segment_ord;
 
-                let weight = named_query.weight(tantivy::query::EnableScoring::Enabled {
-                    searcher: &searcher,
-                    statistics_provider: &searcher,
-                })?;
-
-                let scorer = weight.scorer(segment_reader, 1.0)?;
+                // Get or create scorer for this segment
+                let scorer = scorer_cache.entry(segment_ord).or_insert_with(|| {
+                    let segment_reader = searcher.segment_reader(segment_ord);
+                    weight.scorer(segment_reader, 1.0).unwrap_or_else(|_| {
+                        Box::new(tantivy::query::EmptyScorer)
+                    })
+                });
 
                 if let Some(named_scorer) = scorer
                     .as_any()
@@ -399,15 +405,16 @@ impl ExtractorEngine {
         }
     }
 
-    /// Deduplicate results based on (document_id, sentence_id), keeping highest score
+    /// Deduplicate results based on (document_id, sentence_id), keeping highest score.
+    /// Uses tuple keys instead of format! to avoid heap allocation per result.
     fn deduplicate_results(
         results: Vec<(SentenceResult, Score)>,
         limit: usize,
     ) -> Vec<SentenceResult> {
-        let mut seen: HashMap<String, SentenceResult> = HashMap::new();
+        let mut seen: HashMap<(String, String), SentenceResult> = HashMap::new();
 
         for (result, score) in results {
-            let key = format!("{}:{}", result.document_id, result.sentence_id);
+            let key = (result.document_id.clone(), result.sentence_id.clone());
             match seen.get(&key) {
                 Some(existing) => {
                     if score > existing.score {
