@@ -66,4 +66,6 @@ path = "src/bin/test_greedy_lazy.rs"
 profiling = []
 
 [profile.release]
+opt-level = 3
+lto = "thin"
 debug = true
