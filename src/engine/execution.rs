@@ -7,14 +7,16 @@ use crate::tantivy_integration::concat_query::RustieConcatQuery;
 use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
 use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalScorer,
+    OptimizedGraphTraversalWeight,
 };
 use anyhow::Result;
 use log;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
-    query::Query,
+    query::{Query, Weight},
     DocAddress, Score,
 };
 
@@ -77,22 +79,18 @@ impl ExtractorEngine {
             }
         };
 
+        // Create weight once and share across segments (avoids per-segment schema/prefilter/regex work).
+        let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
+            graph_query
+                .concrete_weight(&searcher)
+                .map_err(anyhow::Error::from)?,
+        );
+
         // PARALLEL: Process all segments concurrently using Rayon
         let segment_results: Vec<(Vec<(SentenceResult, Score)>, u32)> = (0..num_segments)
             .into_par_iter()
             .filter_map(|segment_ord| {
                 let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-                let weight = match graph_query.weight(tantivy::query::EnableScoring::Enabled {
-                    searcher: &searcher,
-                    statistics_provider: &searcher,
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::warn!("graph traversal: segment {segment_ord} weight creation failed: {e}");
-                        return None;
-                    }
-                };
 
                 let mut scorer = match weight.scorer(segment_reader, 1.0) {
                     Ok(s) => s,

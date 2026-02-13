@@ -330,3 +330,13 @@ impl Weight for OptimizedGraphTraversalWeight {
         Ok(tantivy::query::Explanation::new("OptimizedGraphTraversalQuery", Score::default()))
     }
 }
+
+// Compile-time assertion: OptimizedGraphTraversalWeight must be Send + Sync to be shared across
+// segments via Arc in execute_graph_traversal. If this fails, fix the offending field rather
+// than adding unsafe impl.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    fn check() {
+        assert_send_sync::<OptimizedGraphTraversalWeight>();
+    }
+};
