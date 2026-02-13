@@ -39,3 +39,4 @@ test_index
 PROFILING.md
 profile.json.gz
 optimization.txt
+*.txt

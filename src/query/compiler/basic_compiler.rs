@@ -2,7 +2,7 @@ use tantivy::{
     query::{Query, BooleanQuery, Occur, TermQuery, RegexQuery},
     schema::{Term, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
+use crate::query::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, ConcatPlan, ConcatStep};
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
 use crate::tantivy_integration::assertion_query::LookaheadQuery;
@@ -129,7 +129,6 @@ impl BasicCompiler {
                 let term = Term::from_field_text(field, s);
                 
                 // Debug: Print the term to verify it's created correctly
-                log::debug!("Created TermQuery for field '{}' with term text '{}', term={:?}", field_name, s, term);
                 
                 // Use WithFreqsAndPositions to match the indexing option
                 // This ensures we can match terms that were indexed with positions
@@ -146,7 +145,6 @@ impl BasicCompiler {
                     // Extract the literal string (remove leading/trailing /)
                     let literal = clean_pattern;
                     let term = Term::from_field_text(field, literal);
-                    log::debug!("Optimizing regex pattern '{}' to TermQuery for literal '{}'", pattern, literal);
                     Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions)))
                 } else {
                     let regex_query = RegexQuery::from_pattern(clean_pattern, field)

@@ -1,4 +1,19 @@
 use tantivy::schema::{Schema, TantivyDocument, Value};
+use crate::engine::constants::TOKEN_FIELDS;
+
+/// Extract a single field value from a Tantivy document
+pub fn extract_field_value(schema: &Schema, doc: &TantivyDocument, field_name: &str) -> Option<String> {
+    let field = schema.get_field(field_name).ok()?;
+    doc.get_first(field).and_then(|value| {
+        if let Some(text) = value.as_str() {
+            Some(text.to_string())
+        } else if let Some(u64_val) = value.as_u64() {
+            Some(u64_val.to_string())
+        } else {
+            None
+        }
+    })
+}
 
 /// Extract multiple field values from a Tantivy document
 /// For token fields (word, lemma, pos, etc.), decodes the position-aware format
@@ -16,18 +31,8 @@ pub fn extract_field_values(schema: &Schema, doc: &TantivyDocument, field_name: 
 
         // For token fields stored in position-aware format (e.g., "John|eats|pizza"),
         // decode by splitting on | to get individual tokens
-        // These fields use the position-aware encoding
-        let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
-        if token_fields.contains(&field_name) && raw_values.len() == 1 {
-            // Single encoded string - decode it
-            // Pre-calculate capacity to avoid reallocations during iteration
-            let encoded = &raw_values[0];
-            let token_count = encoded.matches('|').count() + 1;
-            let mut tokens = Vec::with_capacity(token_count);
-            for s in encoded.split('|') {
-                tokens.push(s.to_string());
-            }
-            tokens
+        if TOKEN_FIELDS.contains(&field_name) && raw_values.len() == 1 {
+            raw_values[0].split('|').map(|s| s.to_string()).collect()
         } else {
             raw_values
         }

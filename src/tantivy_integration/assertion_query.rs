@@ -1,7 +1,7 @@
 use tantivy::query::{Query, Weight, Scorer, EnableScoring};
 use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet};
 use tantivy::schema::{Field, Value};
-use crate::compiler::ast::Pattern;
+use crate::query::ast::Pattern;
 
 /// Lookahead assertion type
 #[derive(Debug, Clone)]
@@ -196,7 +196,7 @@ impl LookaheadScorer {
     }
     
     fn find_positions_matching_pattern(&self, field_cache: &std::collections::HashMap<String, Vec<String>>, pattern: &Pattern) -> Vec<usize> {
-        use crate::compiler::ast::{Constraint, Matcher};
+        use crate::query::ast::{Constraint, Matcher};
         
         let mut positions = Vec::new();
         
@@ -229,11 +229,11 @@ impl LookaheadScorer {
 }
 
 fn matches_constraint_at_position(
-    constraint: &crate::compiler::ast::Constraint,
+    constraint: &crate::query::ast::Constraint,
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize
 ) -> bool {
-    use crate::compiler::ast::Constraint;
+    use crate::query::ast::Constraint;
     
     match constraint {
         Constraint::Wildcard => true,

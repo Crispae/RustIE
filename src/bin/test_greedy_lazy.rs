@@ -8,7 +8,7 @@
 /// - Lazy: Should match "a b c" twice (positions 0-3 and 3-6)
 /// - Greedy: Should match "a b c a b c" once (position 0-6)
 
-use rustie::compiler::ast::{Pattern, Constraint, Matcher, QuantifierKind};
+use rustie::query::ast::{Pattern, Constraint, Matcher, QuantifierKind};
 use rustie::tantivy_integration::concat_query::find_constraint_spans_in_sequence;
 use std::collections::HashMap;
 

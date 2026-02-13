@@ -2,8 +2,9 @@ use tantivy::{
     query::Query,
     schema::{Field, Schema},
 };
-use crate::compiler::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
+use crate::query::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
+use crate::engine::constants::get_required_field;
 use crate::tantivy_integration::graph_traversal::{OptimizedGraphTraversalQuery, flatten_graph_traversal_pattern, CollapsedSpec, CollapsedMatcher};
 
 /// Compiler for graph traversal patterns
@@ -71,25 +72,17 @@ impl GraphCompiler {
             (c_idx, t_idx, total_constraints - 1)
         };
         
-        // Helper to extract CollapsedMatcher from a Matcher
-        fn matcher_to_collapsed(matcher: &Matcher) -> Option<CollapsedMatcher> {
-            match matcher {
-                Matcher::String(term) => Some(CollapsedMatcher::Exact(term.clone())),
-                Matcher::Regex { pattern, .. } => Some(CollapsedMatcher::RegexPattern(pattern.clone())),
-            }
-        }
-        
         // Get the constraint pattern - supports exact string and regex matchers
         let constraint_step = flat_steps.get(constraint_step_idx)?;
         let (constraint_field_name, constraint_matcher) = match constraint_step {
             FlatPatternStep::Constraint(Pattern::Constraint(
                 Constraint::Field { name, matcher }
-            )) => (name.clone(), matcher_to_collapsed(matcher)?),
+            )) => (name.clone(), CollapsedMatcher::from(matcher)),
             FlatPatternStep::Constraint(Pattern::NamedCapture { pattern, .. }) => {
                 // Unwrap named capture to get underlying constraint
                 match pattern.as_ref() {
                     Pattern::Constraint(Constraint::Field { name, matcher }) => {
-                        (name.clone(), matcher_to_collapsed(matcher)?)
+                        (name.clone(), CollapsedMatcher::from(matcher))
                     }
                     _ => return None, // Can't collapse wildcard
                 }
@@ -112,17 +105,17 @@ impl GraphCompiler {
         let (edge_field, edge_matcher) = match traversal_step {
             FlatPatternStep::Traversal(Traversal::Incoming(matcher)) => {
                 // Incoming edge: constraint node must have incoming edge (works for both first and last)
-                (incoming_edges_field, matcher_to_collapsed(matcher)?)
+                (incoming_edges_field, CollapsedMatcher::from(matcher))
             }
             FlatPatternStep::Traversal(Traversal::Outgoing(matcher)) => {
                 if is_first {
                     // First constraint with outgoing: constraint node needs outgoing edge
-                    (outgoing_edges_field, matcher_to_collapsed(matcher)?)
+                    (outgoing_edges_field, CollapsedMatcher::from(matcher))
                 } else {
                     // Last constraint with outgoing (going TO it): constraint node needs incoming edge
                     // Example: [word=thirsty] >xcomp [word=pretzels]
                     //          The "pretzels" node is the TARGET of >xcomp, so it has an incoming edge
-                    (incoming_edges_field, matcher_to_collapsed(matcher)?)
+                    (incoming_edges_field, CollapsedMatcher::from(matcher))
                 }
             }
             FlatPatternStep::Traversal(Traversal::Concatenated(traversals)) => {
@@ -134,13 +127,13 @@ impl GraphCompiler {
                 };
                 match relevant_trav {
                     Some(Traversal::Incoming(matcher)) => {
-                        (incoming_edges_field, matcher_to_collapsed(matcher)?)
+                        (incoming_edges_field, CollapsedMatcher::from(matcher))
                     }
                     Some(Traversal::Outgoing(matcher)) => {
                         if is_first {
-                            (outgoing_edges_field, matcher_to_collapsed(matcher)?)
+                            (outgoing_edges_field, CollapsedMatcher::from(matcher))
                         } else {
-                            (incoming_edges_field, matcher_to_collapsed(matcher)?)
+                            (incoming_edges_field, CollapsedMatcher::from(matcher))
                         }
                     }
                     _ => return None, // Can't collapse
@@ -152,11 +145,6 @@ impl GraphCompiler {
             }
             FlatPatternStep::Traversal(Traversal::Disjunctive(traversals)) => {
                 // Disjunctive traversal: convert labels to regex pattern
-                log::info!(
-                    "Processing DISJUNCTIVE traversal with {} alternatives for {} constraint",
-                    traversals.len(),
-                    if is_first { "first" } else { "last" }
-                );
                 
                 // Extract labels and verify all are same direction
                 let mut labels = Vec::new();
@@ -169,11 +157,9 @@ impl GraphCompiler {
                             all_incoming = false;
                             match matcher {
                                 Matcher::String(s) => {
-                                    log::info!("  - Outgoing edge label (exact): '{}'", s);
                                     labels.push(regex::escape(s));
                                 }
                                 Matcher::Regex { pattern, .. } => {
-                                    log::info!("  - Outgoing edge label (regex): '{}'", pattern);
                                     labels.push(pattern.clone());
                                 }
                             }
@@ -182,28 +168,20 @@ impl GraphCompiler {
                             all_outgoing = false;
                             match matcher {
                                 Matcher::String(s) => {
-                                    log::info!("  - Incoming edge label (exact): '{}'", s);
                                     labels.push(regex::escape(s));
                                 }
                                 Matcher::Regex { pattern, .. } => {
-                                    log::info!("  - Incoming edge label (regex): '{}'", pattern);
                                     labels.push(pattern.clone());
                                 }
                             }
                         }
                         _ => {
-                            log::warn!("  - Nested complex traversal not supported, falling back");
                             return None;
                         }
                     }
                 }
                 
                 if labels.is_empty() || (!all_outgoing && !all_incoming) {
-                    log::warn!(
-                        "Disjunctive traversal cannot be collapsed: empty={} mixed_directions={}",
-                        labels.is_empty(),
-                        !all_outgoing && !all_incoming
-                    );
                     return None; // Mixed directions or empty
                 }
                 
@@ -211,11 +189,6 @@ impl GraphCompiler {
                 // Note: FST regex doesn't support anchors (^ and $), but since we match
                 // against complete terms in the dictionary, anchors aren't needed
                 let regex_pattern = format!("({})", labels.join("|"));
-                log::info!(
-                    "Disjunctive traversal collapsed to regex: '{}' (direction: {})",
-                    regex_pattern,
-                    if all_outgoing { "outgoing" } else { "incoming" }
-                );
                 let edge_matcher = CollapsedMatcher::RegexPattern(regex_pattern);
                 
                 // Determine edge field based on direction and position
@@ -236,14 +209,6 @@ impl GraphCompiler {
         
         // Get constraint field
         let constraint_field = self.schema.get_field(&constraint_field_name).ok()?;
-        
-        log::info!(
-            "Built CollapsedSpec for {} constraint: field='{}' constraint={} edge={}",
-            if is_first { "first" } else { "last" },
-            constraint_field_name,
-            constraint_matcher.display(),
-            edge_matcher.display()
-        );
         
         Some(CollapsedSpec {
             constraint_field,
@@ -275,10 +240,8 @@ impl GraphCompiler {
         flatten_graph_traversal_pattern(&full_pattern, &mut flat_steps);
 
         // Get edge label fields from schema (needed for collapse specs)
-        let incoming_edges_field = self.schema.get_field("incoming_edges")
-            .map_err(|_| anyhow!("Incoming edges field not found in schema"))?;
-        let outgoing_edges_field = self.schema.get_field("outgoing_edges")
-            .map_err(|_| anyhow!("Outgoing edges field not found in schema"))?;
+        let incoming_edges_field = get_required_field(&self.schema, "incoming_edges")?;
+        let outgoing_edges_field = get_required_field(&self.schema, "outgoing_edges")?;
 
         // Build collapse specs for first and last constraints
         // These enable CombinedPositionDriver for index-level position intersection
@@ -296,25 +259,13 @@ impl GraphCompiler {
         );
 
         // Log collapse spec status
-        log::info!(
-            "Odinson-style collapsed query (no BooleanQuery): src_collapse={}, dst_collapse={}",
-            src_collapse.is_some(),
-            dst_collapse.is_some()
-        );
 
         if src_collapse.is_none() && dst_collapse.is_none() {
-            log::warn!(
-                "Neither src nor dst could be collapsed. Query will use EmptyDriver \
-                and may return no results. Consider using exact string constraints \
-                with simple edge traversals for optimal performance."
-            );
         }
 
         // Get remaining schema fields
-        let dependencies_binary_field = self.schema.get_field("dependencies_binary")
-            .map_err(|_| anyhow!("Dependencies binary field not found in schema"))?;
-        let default_field = self.schema.get_field("word")
-            .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
+        let dependencies_binary_field = get_required_field(&self.schema, "dependencies_binary")?;
+        let default_field = get_required_field(&self.schema, "word")?;
 
         // Create the query with collapse specs only - no BooleanQuery
         Ok(Box::new(OptimizedGraphTraversalQuery::collapsed_only(

@@ -3,7 +3,6 @@
 //! This module provides `ZeroCopyGraphWriter` which converts a `DirectedGraph`
 //! into the zero-copy binary format that can be efficiently read at query time.
 
-use std::collections::HashMap;
 use crate::digraph::graph::DirectedGraph;
 use crate::digraph::graph_trait::GraphError;
 use crate::digraph::zero_copy::{MAGIC, VERSION, HEADER_SIZE};
