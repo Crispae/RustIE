@@ -165,7 +165,10 @@ impl OptimizedGraphTraversalWeight {
 
                                         if let Some(mut stream) = term_dict.search(automaton.as_ref()).into_stream().ok() {
                                             let mut count = 0;
-                                            while stream.advance() && count < DEFAULT_MAX_TERM_EXPANSIONS {
+                                            // Odinson-style: expand ALL matching terms without cap.
+                                            // FST automaton search is exact -- every matching term
+                                            // in the index is enumerated with zero false positives.
+                                            while stream.advance() {
                                                 let term_bytes = stream.key();
                                                 let term_str = String::from_utf8_lossy(term_bytes);
 

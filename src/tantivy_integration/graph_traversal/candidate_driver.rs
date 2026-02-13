@@ -275,7 +275,7 @@ pub(crate) fn expand_with_automaton(
     automaton: &Regex,
     field: Field,
     inverted_index: &tantivy::InvertedIndexReader,
-    max_expansions: usize,
+    _max_expansions: usize,
 ) -> Option<Vec<SegmentPostings>> {
     let mut stream = match term_dict.search(automaton).into_stream() {
         Ok(s) => s,
@@ -285,13 +285,12 @@ pub(crate) fn expand_with_automaton(
     };
 
     let mut postings_list = Vec::new();
-    let mut count = 0;
 
+    // Odinson-style: expand ALL matching terms from the FST without any cap.
+    // The FST automaton search is exact -- it enumerates every term in the index
+    // that matches the regex, with zero false positives. Capping the expansion
+    // would cause missing results, not just degraded performance.
     while stream.advance() {
-        if count >= max_expansions {
-            return None;
-        }
-
         let term_bytes = stream.key();
         let term = Term::from_field_bytes(field, term_bytes);
         if let Ok(Some(postings)) = inverted_index
@@ -299,7 +298,6 @@ pub(crate) fn expand_with_automaton(
         {
             postings_list.push(postings);
         }
-        count += 1;
     }
 
     if postings_list.is_empty() {
