@@ -3,8 +3,8 @@
 //! This module provides the core abstraction for document iteration with optional
 //! position access, enabling efficient position-based query optimization.
 
-use std::collections::{BinaryHeap, HashMap};
-use std::sync::{Arc, RwLock};
+use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use tantivy::{
     DocId, DocSet,
@@ -17,6 +17,7 @@ use tantivy_fst::Regex;
 
 use super::types::CollapsedMatcher;
 use super::intersection::{PositionIterator, intersect_sorted_into};
+use super::weight::RegexCache;
 
 // =============================================================================
 // CandidateDriver Trait and Implementations (Odinson-style collapsed queries)
@@ -309,14 +310,14 @@ pub(crate) fn expand_with_automaton(
 
 /// Get or compile a regex automaton from the cache (thread-safe).
 pub(crate) fn get_or_compile_regex(
-    cache: &Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    cache: &RegexCache,
     pattern: &str,
 ) -> Option<Arc<Regex>> {
     // Fast path: read lock
     {
         let read_guard = cache.read().ok()?;
         if let Some(regex) = read_guard.get(pattern) {
-            return Some(Arc::clone(regex));
+            return Some(Arc::clone(&regex));
         }
     } // Read lock released here
 
@@ -325,16 +326,14 @@ pub(crate) fn get_or_compile_regex(
 
     // Double-check after acquiring write lock (another thread might have compiled it)
     if let Some(regex) = write_guard.get(pattern) {
-        return Some(Arc::clone(regex));
+        return Some(Arc::clone(&regex));
     }
 
     // Compile and cache
-        let regex = match Regex::new(pattern) {
-            Ok(r) => Arc::new(r),
-            Err(_e) => {
-                return None;
-            }
-        };
+    let regex = match Regex::new(pattern) {
+        Ok(r) => Arc::new(r),
+        Err(_e) => return None,
+    };
     write_guard.insert(pattern.to_string(), Arc::clone(&regex));
     Some(regex)
 }
@@ -349,7 +348,7 @@ pub(crate) fn expand_matcher(
     field: Field,
     matcher: &CollapsedMatcher,
     max_expansions: usize,
-    regex_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    regex_cache: RegexCache,
 ) -> Option<Vec<SegmentPostings>> {
     let inverted_index = reader.inverted_index(field).ok()?;
 

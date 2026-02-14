@@ -83,7 +83,7 @@ impl ExtractorEngine {
         // Create weight once and share across segments (avoids per-segment schema/prefilter/regex work).
         let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
             graph_query
-                .concrete_weight(&searcher)
+                .concrete_weight_with_cache(self.regex_cache.clone())
                 .map_err(anyhow::Error::from)?,
         );
 

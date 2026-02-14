@@ -4,8 +4,10 @@ use crate::engine::constants::*;
 use crate::engine::schema::create_schema_from_yaml;
 use crate::query::QueryCompiler;
 use crate::query::parser::QueryParser;
+use crate::tantivy_integration::graph_traversal::{RegexCache, RegexCacheInner};
 use anyhow::Result;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use tantivy::{
     Index, IndexReader, IndexWriter,
     schema::{Field, Schema},
@@ -29,6 +31,8 @@ pub struct ExtractorEngine {
     pub(crate) query_compiler: QueryCompiler,
     /// Cached query parser (avoids re-creating pest parser on every query)
     pub(crate) query_parser: QueryParser,
+    /// Bounded regex cache for graph traversal (FST compilation shared across queries)
+    pub(crate) regex_cache: RegexCache,
 }
 
 impl ExtractorEngine {
@@ -45,6 +49,7 @@ impl ExtractorEngine {
 
         let query_compiler = QueryCompiler::new(schema.clone());
         let query_parser = QueryParser::new(FIELD_WORD.to_string());
+        let regex_cache: RegexCache = Arc::new(RwLock::new(RegexCacheInner::new(512)));
 
         Ok(Self {
             index,
@@ -60,6 +65,7 @@ impl ExtractorEngine {
             output_fields,
             query_compiler,
             query_parser,
+            regex_cache,
         })
     }
 

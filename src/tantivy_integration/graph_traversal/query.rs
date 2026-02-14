@@ -8,9 +8,11 @@ use tantivy::{
     Result as TantivyResult,
 };
 
+use std::sync::{Arc, RwLock};
+
 use crate::query::ast::Pattern;
 use super::types::CollapsedSpec;
-use super::weight::OptimizedGraphTraversalWeight;
+use super::weight::{OptimizedGraphTraversalWeight, RegexCache, RegexCacheInner};
 use super::pattern_utils::{flatten_graph_traversal_pattern, build_position_prefilter_plan};
 
 /// Optimized graph traversal query using Odinson-style collapsed query optimization.
@@ -60,12 +62,10 @@ impl OptimizedGraphTraversalQuery {
         }
     }
 
-    /// Returns the concrete weight without boxing. Used by execution to share one weight across segments.
-    /// `_searcher` is accepted for API symmetry with `Query::weight()` but is currently
-    /// unused because graph traversal scoring does not depend on corpus statistics.
-    pub(crate) fn concrete_weight(
+    /// Build weight with a provided (shared) regex cache. Single source of truth for weight construction.
+    pub(crate) fn concrete_weight_with_cache(
         &self,
-        _searcher: &tantivy::Searcher,
+        regex_cache: RegexCache,
     ) -> TantivyResult<OptimizedGraphTraversalWeight> {
         let full_pattern = Pattern::GraphTraversal {
             src: Box::new(self.src_pattern.clone()),
@@ -85,36 +85,27 @@ impl OptimizedGraphTraversalQuery {
             prefilter_plan,
             self.src_collapse.clone(),
             self.dst_collapse.clone(),
+            regex_cache,
         ))
+    }
+
+    /// Build weight with a fresh (empty) regex cache. Used when the query runs outside the engine.
+    pub(crate) fn concrete_weight(
+        &self,
+        _searcher: &tantivy::Searcher,
+    ) -> TantivyResult<OptimizedGraphTraversalWeight> {
+        let fresh_cache = Arc::new(RwLock::new(RegexCacheInner::new(256)));
+        self.concrete_weight_with_cache(fresh_cache)
     }
 }
 
 impl Query for OptimizedGraphTraversalQuery {
     fn weight(&self, scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
-        // Single source of truth: delegate to concrete_weight when searcher is available.
         if let EnableScoring::Enabled { searcher, .. } = scoring {
             return Ok(Box::new(self.concrete_weight(searcher)?));
         }
-        // Disabled scoring: no searcher; build weight inline (same logic as concrete_weight).
-        let full_pattern = Pattern::GraphTraversal {
-            src: Box::new(self.src_pattern.clone()),
-            traversal: self.traversal.clone(),
-            dst: Box::new(self.dst_pattern.clone()),
-        };
-        let mut flat_steps = Vec::new();
-        flatten_graph_traversal_pattern(&full_pattern, &mut flat_steps);
-        let prefilter_plan = build_position_prefilter_plan(
-            &flat_steps,
-            self.incoming_edges_field,
-            self.outgoing_edges_field,
-        );
-        Ok(Box::new(OptimizedGraphTraversalWeight::new(
-            self.dependencies_binary_field,
-            flat_steps,
-            prefilter_plan,
-            self.src_collapse.clone(),
-            self.dst_collapse.clone(),
-        )))
+        let fresh_cache = Arc::new(RwLock::new(RegexCacheInner::new(256)));
+        Ok(Box::new(self.concrete_weight_with_cache(fresh_cache)?))
     }
 }
 

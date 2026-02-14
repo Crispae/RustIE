@@ -30,6 +30,35 @@ use super::candidate_driver::{
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
 use super::scorer::OptimizedGraphTraversalScorer;
 
+/// Bounded container for compiled regex automata. Evicts all entries when full to cap memory.
+pub(crate) struct RegexCacheInner {
+    map: HashMap<String, Arc<Regex>>,
+    max_entries: usize,
+}
+
+impl RegexCacheInner {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            map: HashMap::with_capacity(max_entries.min(256)),
+            max_entries,
+        }
+    }
+
+    pub fn get(&self, pattern: &str) -> Option<Arc<Regex>> {
+        self.map.get(pattern).cloned()
+    }
+
+    pub fn insert(&mut self, pattern: String, regex: Arc<Regex>) {
+        if self.map.len() >= self.max_entries && !self.map.contains_key(&pattern) {
+            self.map.clear();
+        }
+        self.map.insert(pattern, regex);
+    }
+}
+
+/// Thread-safe shared regex cache (bounded size).
+pub(crate) type RegexCache = Arc<RwLock<RegexCacheInner>>;
+
 /// Optimized weight for graph traversal queries using Odinson-style collapsed optimization.
 /// No BooleanQuery weights - candidate generation driven exclusively by CombinedPositionDriver.
 pub(crate) struct OptimizedGraphTraversalWeight {
@@ -43,7 +72,7 @@ pub(crate) struct OptimizedGraphTraversalWeight {
     /// Collapse spec for dst constraint - required for CombinedPositionDriver
     dst_collapse: Option<CollapsedSpec>,
     /// Cached compiled regex automata (shared across segments, thread-safe)
-    regex_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    regex_cache: RegexCache,
 }
 
 impl OptimizedGraphTraversalWeight {
@@ -53,6 +82,7 @@ impl OptimizedGraphTraversalWeight {
         prefilter_plan: PositionPrefilterPlan,
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
+        regex_cache: RegexCache,
     ) -> Self {
         Self {
             dependencies_binary_field,
@@ -60,7 +90,7 @@ impl OptimizedGraphTraversalWeight {
             prefilter_plan,
             src_collapse,
             dst_collapse,
-            regex_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            regex_cache,
         }
     }
 

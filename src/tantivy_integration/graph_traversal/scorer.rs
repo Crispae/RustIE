@@ -35,6 +35,53 @@ use super::candidate_driver::CandidateDriver;
 use super::intersection::TwoPhaseIntersection;
 use super::pattern_utils::unwrap_constraint_pattern_static;
 
+/// View over a pipe-delimited token string. Stores the source string and byte offsets
+/// so tokens are accessed as slices without per-token allocations.
+/// Single-value fields use the same type: from_encoded("value") gives len() == 1, get(0) == "value".
+#[derive(Clone)]
+pub(crate) struct TokenView {
+    source: String,
+    /// offsets[i] = start byte of token i; offsets[len] = source.len() sentinel
+    offsets: Vec<u32>,
+}
+
+impl TokenView {
+    /// Build from a pipe-delimited string in one pass. No per-token allocations.
+    /// Empty string yields len() == 0.
+    pub fn from_encoded(source: String) -> Self {
+        let mut offsets = Vec::with_capacity(16);
+        offsets.push(0);
+        if !source.is_empty() {
+            for (i, b) in source.bytes().enumerate() {
+                if b == b'|' {
+                    offsets.push((i + 1) as u32);
+                }
+            }
+            offsets.push(source.len() as u32);
+        }
+        Self { source, offsets }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&str> {
+        if i >= self.len() {
+            return None;
+        }
+        let start = self.offsets[i] as usize;
+        let end = self.offsets[i + 1] as usize;
+        Some(&self.source[start..end])
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
+        (0..self.len()).map(move |i| self.get(i).unwrap())
+    }
+}
+
 /// Optimized scorer for graph traversal queries
 /// Uses CandidateDriver abstraction for Odinson-style collapsed query optimization
 /// and TwoPhaseIntersection for efficient document-level alignment (Lucene TwoPhaseIterator pattern)
@@ -244,36 +291,25 @@ impl OptimizedGraphTraversalScorer {
 }
 
 
-/// Extract tokens from a constraint field using fast fields (O(1) columnar access)
-/// Returns empty vector if fast field not available
-/// Uses StrColumn for text fields with dictionary encoding
+/// Extract tokens from a constraint field using fast fields (O(1) columnar access).
+/// Returns a TokenView (empty len() if fast field not available).
+/// Uses StrColumn for text fields with dictionary encoding.
 fn extract_constraint_tokens_from_fast_field(
     constraint_idx: usize,
     field_name: &str,
     fast_field_columns: &[Option<StrColumn>],
     doc_id: DocId,
-) -> Vec<String> {
+) -> TokenView {
     if let Some(Some(str_col)) = fast_field_columns.get(constraint_idx) {
-        // StrColumn uses dictionary encoding - get term ordinal for this document
-        // ords() returns a Column<u64> with term ordinals for each document
         let ords_col = str_col.ords();
         let term_ord = ords_col.values.get_val(doc_id);
-        
-        // Get the string value from the dictionary using the term ordinal
-        // ord_to_str() requires a mutable String buffer
         let mut encoded_buffer = String::new();
         let ord_to_str_result = str_col.ord_to_str(term_ord, &mut encoded_buffer);
-        if ord_to_str_result.as_ref().map(|b| *b).unwrap_or(false) && !encoded_buffer.is_empty() {
-            // Single-pass decode: split directly without pre-counting pipe chars
-            let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
-            if token_fields.contains(&field_name) {
-                return encoded_buffer.split('|').map(|s| s.to_string()).collect();
-            } else {
-                return vec![encoded_buffer];
-            }
+        if ord_to_str_result.as_ref().map(|b| *b).unwrap_or(false) {
+            return TokenView::from_encoded(encoded_buffer);
         }
     }
-    Vec::new()
+    TokenView::from_encoded(String::new())
 }
 
 /// Lazy constraint token loader - parses constraint fields only when first accessed
@@ -286,9 +322,8 @@ fn extract_constraint_tokens_from_fast_field(
 pub(crate) struct LazyConstraintTokens<'a> {
     constraint_field_names: &'a [String],
     schema: &'a tantivy::schema::Schema,
-    /// Per-constraint cache (indexes into field_cache values).
-    /// Each entry is Some(tokens) once loaded, shared across constraints with the same field.
-    cache: Vec<Option<Vec<String>>>,
+    /// Per-constraint cache. Each entry is Some(TokenView) once loaded.
+    cache: Vec<Option<TokenView>>,
     /// Fast field columns for O(1) columnar access to constraint tokens
     /// One entry per constraint field name, None if fast field not available
     /// Text fields use StrColumn with dictionary encoding
@@ -312,28 +347,28 @@ pub(crate) trait TokenAccessor: Sync {
 /// Immutable token accessor for thread-safe parallel processing
 /// Provides read-only access to pre-loaded tokens from LazyConstraintTokens
 pub(crate) struct ImmutableTokenAccessor<'a> {
-    tokens: Vec<Option<&'a [String]>>,
+    tokens: Vec<Option<&'a TokenView>>,
 }
 
 impl<'a> ImmutableTokenAccessor<'a> {
     /// Create a new immutable token accessor from a LazyConstraintTokens instance
     /// All tokens must be pre-loaded before calling this
     pub fn new(lazy_tokens: &'a LazyConstraintTokens) -> Self {
-        let tokens: Vec<Option<&'a [String]>> = lazy_tokens
+        let tokens: Vec<Option<&'a TokenView>> = lazy_tokens
             .cache
             .iter()
-            .map(|opt_tokens| opt_tokens.as_ref().map(|tokens| tokens.as_slice()))
+            .map(|opt_tokens| opt_tokens.as_ref())
             .collect();
         Self { tokens }
     }
 }
 
 impl<'a> TokenAccessor for ImmutableTokenAccessor<'a> {
+    /// Returns owned String per call. Follow-up: return &str to avoid this allocation when possible.
     fn get(&self, constraint_idx: usize, position: usize) -> Option<String> {
         self.tokens
             .get(constraint_idx)?
-            .and_then(|tokens| tokens.get(position))
-            .cloned()
+            .and_then(|view| view.get(position).map(String::from))
     }
 }
 
@@ -384,7 +419,7 @@ impl<'a> LazyConstraintTokens<'a> {
         schema: &'a tantivy::schema::Schema,
         fast_field_columns: &'a [Option<StrColumn>],
         doc_id: DocId,
-        preloaded: Vec<Option<Vec<String>>>,
+        preloaded: Vec<Option<TokenView>>,
     ) -> Self {
         let mut field_loaded_at = std::collections::HashMap::new();
         // Record which fields are already loaded so ensure_loaded can dedup
@@ -415,7 +450,7 @@ impl<'a> LazyConstraintTokens<'a> {
         if self.cache[constraint_idx].is_none() {
             let field_name = &self.constraint_field_names[constraint_idx];
 
-            // Check if another constraint already loaded this field
+            // Check if another constraint already loaded this field (clone = 2 allocations)
             if let Some(&existing_idx) = self.field_loaded_at.get(field_name.as_str()) {
                 if let Some(ref existing_tokens) = self.cache[existing_idx] {
                     self.cache[constraint_idx] = Some(existing_tokens.clone());
@@ -432,48 +467,31 @@ impl<'a> LazyConstraintTokens<'a> {
     }
 
     /// Get token at a specific position for a constraint (returns owned String)
-    /// Parses the constraint field on first access
+    /// Parses the constraint field on first access. Follow-up: return &str to avoid allocation.
     pub fn get(&mut self, constraint_idx: usize, position: usize) -> Option<String> {
         self.ensure_loaded(constraint_idx);
         self.cache[constraint_idx]
             .as_ref()
-            .and_then(|tokens| tokens.get(position))
-            .cloned()
+            .and_then(|view| view.get(position).map(String::from))
     }
 
     /// Get all tokens for a constraint (returns reference after ensuring loaded)
-    /// Used for position calculation that needs full token list
-    pub fn get_all_tokens(&mut self, constraint_idx: usize) -> Option<&[String]> {
+    pub fn get_all_tokens(&mut self, constraint_idx: usize) -> Option<&TokenView> {
         self.ensure_loaded(constraint_idx);
-        self.cache[constraint_idx].as_ref().map(|tokens| tokens.as_slice())
+        self.cache[constraint_idx].as_ref()
     }
 
     /// Extract tokens from a field using fast fields (O(1) columnar access)
-    /// Uses StrColumn for text fields with dictionary encoding
-    fn extract_tokens_from_field(&self, constraint_idx: usize, field_name: &str) -> Vec<String> {
-        // Use fast field access (O(1) columnar access) with StrColumn
+    fn extract_tokens_from_field(&self, constraint_idx: usize, _field_name: &str) -> TokenView {
         if let Some(Some(str_col)) = self.fast_field_columns.get(constraint_idx) {
-            // StrColumn uses dictionary encoding - get term ordinal for this document
-            // ords() returns a Column<u64> with term ordinals for each document
             let ords_col = str_col.ords();
             let term_ord = ords_col.values.get_val(self.doc_id);
-            
-            // Get the string value from the dictionary using the term ordinal
-            // ord_to_str() requires a mutable String buffer
             let mut encoded_buffer = String::new();
-            if str_col.ord_to_str(term_ord, &mut encoded_buffer).is_ok() && !encoded_buffer.is_empty() {
-                // Single-pass decode: split directly without pre-counting pipe chars
-                let token_fields = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"];
-                if token_fields.contains(&field_name) {
-                    return encoded_buffer.split('|').map(|s| s.to_string()).collect();
-                } else {
-                    return vec![encoded_buffer];
-                }
+            if str_col.ord_to_str(term_ord, &mut encoded_buffer).is_ok() {
+                return TokenView::from_encoded(encoded_buffer);
             }
         }
-
-        // Fast field not available - return empty vector (fast fields must be available after reindexing)
-        Vec::new()
+        TokenView::from_encoded(String::new())
     }
 }
 
@@ -1156,8 +1174,8 @@ impl OptimizedGraphTraversalScorer {
         // the fast field is read and split only once. Subsequent constraints reuse the result.
         // Also collects tokens into `phase_b_token_cache` so Phase C (traversal) can reuse them
         // without re-extracting from fast fields.
-        let mut field_token_cache: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        let mut phase_b_token_cache: Vec<Option<Vec<String>>> = vec![None; total_constraints];
+        let mut field_token_cache: std::collections::HashMap<String, TokenView> = std::collections::HashMap::new();
+        let mut phase_b_token_cache: Vec<Option<TokenView>> = vec![None; total_constraints];
 
         for step in flat_steps.iter() {
             if let FlatPatternStep::Constraint(constraint_pat) = step {
@@ -1193,8 +1211,7 @@ impl OptimizedGraphTraversalScorer {
                     && !(is_wildcard && allowed_positions.get(constraint_count).map(|p| p.is_some()).unwrap_or(false));
 
                 // OPTIMIZATION: Extract tokens once per unique field name, cache for reuse across constraints.
-                // When 3 constraints all use "tag", the fast field is read only once.
-                let tokens_for_constraint: Option<Vec<String>> = if needs_tokens {
+                let tokens_for_constraint: Option<TokenView> = if needs_tokens {
                     let field_name = &self.constraint_field_names[constraint_count];
                     if let Some(cached) = field_token_cache.get(field_name) {
                         Some(cached.clone())
@@ -1545,7 +1562,7 @@ impl OptimizedGraphTraversalScorer {
     }
 
     /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
-    pub(crate) fn find_positions_in_tokens(&self, tokens: &[String], pattern: &Pattern) -> Vec<usize> {
+    pub(crate) fn find_positions_in_tokens(&self, tokens: &TokenView, pattern: &Pattern) -> Vec<usize> {
         let pattern = unwrap_constraint_pattern_static(pattern);
 
         let mut positions = Vec::new();
@@ -1553,15 +1570,15 @@ impl OptimizedGraphTraversalScorer {
             Pattern::Constraint(Constraint::Field { name: _, matcher }) => {
                 match matcher {
                     Matcher::String(s) => {
-                        for (i, token) in tokens.iter().enumerate() {
-                            if token == s {
+                        for i in 0..tokens.len() {
+                            if tokens.get(i).map(|t| t == s.as_str()).unwrap_or(false) {
                                 positions.push(i);
                             }
                         }
                     }
                     Matcher::Regex { regex, .. } => {
-                        for (i, token) in tokens.iter().enumerate() {
-                            if regex.is_match(token) {
+                        for i in 0..tokens.len() {
+                            if tokens.get(i).map(|t| regex.is_match(t)).unwrap_or(false) {
                                 positions.push(i);
                             }
                         }
@@ -1579,7 +1596,7 @@ impl OptimizedGraphTraversalScorer {
     /// Find positions in tokens that match a pattern, restricted to allowed positions
     pub(crate) fn find_positions_in_tokens_limited(
         &self,
-        tokens: &[String],
+        tokens: &TokenView,
         pattern: &Pattern,
         allowed: &[u32],
     ) -> Vec<usize> {
@@ -1593,7 +1610,7 @@ impl OptimizedGraphTraversalScorer {
                     Matcher::String(s) => {
                         for &pos in allowed {
                             let pos_usize = pos as usize;
-                            if pos_usize < tokens.len() && tokens[pos_usize] == *s {
+                            if pos_usize < tokens.len() && tokens.get(pos_usize).map(|t| t == s.as_str()).unwrap_or(false) {
                                 positions.push(pos_usize);
                             }
                         }
@@ -1601,8 +1618,12 @@ impl OptimizedGraphTraversalScorer {
                     Matcher::Regex { regex, .. } => {
                         for &pos in allowed {
                             let pos_usize = pos as usize;
-                            if pos_usize < tokens.len() && regex.is_match(&tokens[pos_usize]) {
-                                positions.push(pos_usize);
+                            if pos_usize < tokens.len() {
+                                if let Some(t) = tokens.get(pos_usize) {
+                                    if regex.is_match(t) {
+                                        positions.push(pos_usize);
+                                    }
+                                }
                             }
                         }
                     }
