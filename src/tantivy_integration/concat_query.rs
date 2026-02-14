@@ -82,6 +82,28 @@ impl RustieConcatQuery {
             concat_plan: None,
         }
     }
+
+    /// Returns the concrete weight without boxing. Used by execution to call concrete_scorer per segment.
+    pub(crate) fn concrete_weight(
+        &self,
+        searcher: &tantivy::Searcher,
+    ) -> TantivyResult<RustieConcatWeight> {
+        let scoring = EnableScoring::Enabled {
+            searcher,
+            statistics_provider: searcher,
+        };
+        let sub_weights: Vec<Box<dyn Weight>> = self.sub_queries
+            .iter()
+            .map(|q| q.weight(scoring.clone()))
+            .collect::<TantivyResult<Vec<_>>>()?;
+        Ok(RustieConcatWeight {
+            sub_weights,
+            pattern: self.pattern.clone(),
+            default_field: self.default_field,
+            concat_plan: self.concat_plan.clone(),
+            regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+        })
+    }
 }
 
 impl Query for RustieConcatQuery {
@@ -101,7 +123,7 @@ impl Query for RustieConcatQuery {
     }
 }
 
-struct RustieConcatWeight {
+pub(crate) struct RustieConcatWeight {
     sub_weights: Vec<Box<dyn Weight>>,
     pattern: Pattern,
     default_field: Field,
@@ -423,23 +445,17 @@ fn compute_execution_plan(
     Some(ExecutionPlan { anchor_idx })
 }
 
-impl Weight for RustieConcatWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
-        let num_sub_weights = self.sub_weights.len();
+impl RustieConcatWeight {
+    /// Build the concrete scorer for this segment. Used by execution to avoid boxing and enable take_current_doc_matches.
+    pub(crate) fn concrete_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> TantivyResult<RustieConcatScorer> {
         let sub_scorers: Vec<Box<dyn Scorer>> = self.sub_weights
             .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                let scorer = w.scorer(reader, boost)?;
-                // Check if scorer has any documents immediately (before advance)
-                let initial_doc = scorer.doc();
-                Ok(scorer)
-            })
+            .map(|w| w.scorer(reader, boost))
             .collect::<TantivyResult<Vec<_>>>()?;
-
-        let is_simple = sub_scorers.len() == 2;
-        if is_simple {
-        }
 
         // Compile constraint sources for postings-based Phase 2
         let constraint_sources = match compile_constraint_sources(&self.pattern, reader, &self.default_field, self.regex_automaton_cache.clone()) {
@@ -452,10 +468,9 @@ impl Weight for RustieConcatWeight {
         // Compute execution plan (anchor-based verification)
         let execution_plan = compute_execution_plan(&constraint_sources, reader);
         
-        // Get concat plan from query
         let concat_plan = self.concat_plan.clone();
 
-        let scorer = RustieConcatScorer {
+        Ok(RustieConcatScorer {
             sub_scorers,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
@@ -465,14 +480,19 @@ impl Weight for RustieConcatWeight {
             match_index: 0,
             current_doc_matches: Vec::new(),
             boost,
-            started: false, // Explicitly track initialization state
+            started: false,
             constraint_sources,
             execution_plan,
             concat_plan,
             position_buffers: Vec::new(),
             regex_tmp: Vec::with_capacity(16),
-        };
-        Ok(Box::new(scorer))
+        })
+    }
+}
+
+impl Weight for RustieConcatWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+        Ok(Box::new(self.concrete_scorer(reader, boost)?))
     }
 
     fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> TantivyResult<tantivy::query::Explanation> {
@@ -822,6 +842,11 @@ impl RustieConcatScorer {
 
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
         &self.current_doc_matches
+    }
+
+    /// Take the current document's matches, leaving an empty vec. Avoids clone in hot path.
+    pub fn take_current_doc_matches(&mut self) -> Vec<crate::types::SpanWithCaptures> {
+        std::mem::take(&mut self.current_doc_matches)
     }
 }
 

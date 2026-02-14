@@ -177,10 +177,13 @@ impl OptimizedGraphTraversalWeight {
 
         expanded_reqs
     }
-}
 
-impl Weight for OptimizedGraphTraversalWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+    /// Build the concrete scorer for this segment. Used by execution to avoid boxing and enable take_current_doc_matches.
+    pub(crate) fn concrete_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> TantivyResult<OptimizedGraphTraversalScorer> {
         // Odinson-style: Build drivers exclusively from collapse specs
         // No GenericDriver fallback - use EmptyDriver when postings unavailable
 
@@ -323,7 +326,13 @@ impl Weight for OptimizedGraphTraversalWeight {
         // Advance to the first document
         let _ = scorer.advance();
 
-        Ok(Box::new(scorer))
+        Ok(scorer)
+    }
+}
+
+impl Weight for OptimizedGraphTraversalWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+        Ok(Box::new(self.concrete_scorer(reader, boost)?))
     }
 
     fn explain(&self, _reader: &SegmentReader, _doc: DocId) -> TantivyResult<tantivy::query::Explanation> {

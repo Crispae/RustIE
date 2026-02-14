@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tantivy::DocAddress;
 use tantivy::Score;
 use crate::types::SpanWithCaptures;
@@ -7,9 +8,9 @@ use crate::types::SpanWithCaptures;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SentenceResult {
     /// Document ID from the original document
-    pub document_id: String,
+    pub document_id: Arc<str>,
     /// Sentence ID within the document
-    pub sentence_id: String,
+    pub sentence_id: Arc<str>,
     /// Document score
     
     pub score: Score,
@@ -22,8 +23,8 @@ pub struct SentenceResult {
 
 impl SentenceResult {
     pub fn new(
-        document_id: String,
-        sentence_id: String,
+        document_id: Arc<str>,
+        sentence_id: Arc<str>,
         score: Score,
         matches: Vec<SpanWithCaptures>,
         fields: std::collections::HashMap<String, Vec<String>>,

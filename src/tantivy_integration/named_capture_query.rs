@@ -37,6 +37,24 @@ impl RustieNamedCaptureQuery {
             default_field,
         }
     }
+
+    /// Returns the concrete weight without boxing. Used by execution to call concrete_scorer per segment.
+    pub(crate) fn concrete_weight(
+        &self,
+        searcher: &tantivy::Searcher,
+    ) -> TantivyResult<RustieNamedCaptureWeight> {
+        let scoring = EnableScoring::Enabled {
+            searcher,
+            statistics_provider: searcher,
+        };
+        let inner_weight = self.inner_query.weight(scoring)?;
+        Ok(RustieNamedCaptureWeight {
+            inner_weight,
+            capture_name: self.capture_name.clone(),
+            pattern: self.pattern.clone(),
+            default_field: self.default_field,
+        })
+    }
 }
 
 impl Query for RustieNamedCaptureQuery {
@@ -54,18 +72,22 @@ impl Query for RustieNamedCaptureQuery {
 
 // QueryClone is automatically implemented by Tantivy for Clone types
 
-struct RustieNamedCaptureWeight {
+pub(crate) struct RustieNamedCaptureWeight {
     inner_weight: Box<dyn Weight>,
     capture_name: String,
     pattern: Pattern,
     default_field: Field,
 }
 
-impl Weight for RustieNamedCaptureWeight {
-    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+impl RustieNamedCaptureWeight {
+    /// Build the concrete scorer for this segment. Used by execution to avoid boxing and enable take_current_doc_matches.
+    pub(crate) fn concrete_scorer(
+        &self,
+        reader: &SegmentReader,
+        boost: Score,
+    ) -> TantivyResult<RustieNamedCaptureScorer> {
         let inner_scorer = self.inner_weight.scorer(reader, boost)?;
-        
-        let mut scorer = RustieNamedCaptureScorer {
+        Ok(RustieNamedCaptureScorer {
             inner_scorer,
             capture_name: self.capture_name.clone(),
             pattern: self.pattern.clone(),
@@ -73,18 +95,13 @@ impl Weight for RustieNamedCaptureWeight {
             reader: reader.clone(),
             current_doc_matches: Vec::new(),
             current_doc: None,
-        };
-        
-        // Initialize by advancing inner scorer to first document
-        if scorer.inner_scorer.doc() == tantivy::TERMINATED {
-             // It might have already started or be empty, try advance if at 0?
-             // Actually, usually we let the caller drive the advance, but our wrapper logic
-             // needs to be in sync. 
-             // IMPORTANT: inner_scorer starts at DOC_ID_Start (uninitialized), so we 
-             // don't advance it immediately, we let our advance() call do it.
-        }
-        
-        Ok(Box::new(scorer))
+        })
+    }
+}
+
+impl Weight for RustieNamedCaptureWeight {
+    fn scorer(&self, reader: &SegmentReader, boost: Score) -> TantivyResult<Box<dyn Scorer>> {
+        Ok(Box::new(self.concrete_scorer(reader, boost)?))
     }
 
     fn explain(&self, reader: &SegmentReader, doc: DocId) -> TantivyResult<tantivy::query::Explanation> {
@@ -189,5 +206,10 @@ impl RustieNamedCaptureScorer {
 
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
         &self.current_doc_matches
+    }
+
+    /// Take the current document's matches, leaving an empty vec. Avoids clone in hot path.
+    pub fn take_current_doc_matches(&mut self) -> Vec<crate::types::SpanWithCaptures> {
+        std::mem::take(&mut self.current_doc_matches)
     }
 }

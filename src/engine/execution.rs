@@ -3,11 +3,12 @@
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
 use crate::results::rustie_results::{RustIeResult, SentenceResult};
-use crate::tantivy_integration::concat_query::RustieConcatQuery;
-use crate::tantivy_integration::named_capture_query::RustieNamedCaptureQuery;
+use crate::tantivy_integration::concat_query::{RustieConcatQuery, RustieConcatWeight};
+use crate::tantivy_integration::named_capture_query::{
+    RustieNamedCaptureQuery, RustieNamedCaptureScorer, RustieNamedCaptureWeight,
+};
 use crate::tantivy_integration::graph_traversal::{
-    OptimizedGraphTraversalQuery, OptimizedGraphTraversalScorer,
-    OptimizedGraphTraversalWeight,
+    OptimizedGraphTraversalQuery, OptimizedGraphTraversalWeight,
 };
 use anyhow::Result;
 use log;
@@ -16,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
-    query::{Query, Weight},
-    DocAddress, Score,
+    query::{Query, Scorer, Weight},
+    DocAddress, DocSet, Score,
 };
 
 impl ExtractorEngine {
@@ -92,7 +93,7 @@ impl ExtractorEngine {
             .filter_map(|segment_ord| {
                 let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
                     Ok(s) => s,
                     Err(e) => {
                         log::warn!("graph traversal: segment {segment_ord} scorer creation failed: {e}");
@@ -111,13 +112,7 @@ impl ExtractorEngine {
                     let score = scorer.score();
                     let doc_address = DocAddress::new(segment_ord as u32, doc_id);
 
-                    let matches = if let Some(graph_scorer) =
-                        scorer.as_any().downcast_ref::<OptimizedGraphTraversalScorer>()
-                    {
-                        graph_scorer.get_current_doc_matches().to_vec()
-                    } else {
-                        Vec::new()
-                    };
+                    let matches = scorer.take_current_doc_matches();
 
                     if let Ok(doc) = searcher.doc(doc_address) {
                         if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
@@ -141,8 +136,6 @@ impl ExtractorEngine {
             .into_iter()
             .flat_map(|(results, _)| results)
             .collect();
-
-        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
@@ -215,23 +208,16 @@ impl ExtractorEngine {
         let searcher = self.reader.searcher();
         let num_segments = searcher.segment_readers().len();
 
+        let weight: Arc<RustieConcatWeight> = Arc::new(
+            pattern_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?,
+        );
+
         let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
             .into_par_iter()
             .filter_map(|segment_ord| {
                 let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-                let weight = match pattern_query.weight(tantivy::query::EnableScoring::Enabled {
-                    searcher: &searcher,
-                    statistics_provider: &searcher,
-                }) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::warn!("pattern matching: segment {segment_ord} weight creation failed: {e}");
-                        return None;
-                    }
-                };
-
-                let mut scorer = match weight.scorer(segment_reader, 1.0) {
+                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
                     Ok(s) => s,
                     Err(e) => {
                         log::warn!("pattern matching: segment {segment_ord} scorer creation failed: {e}");
@@ -250,15 +236,7 @@ impl ExtractorEngine {
                     let score = scorer.score();
                     let doc_address = DocAddress::new(segment_ord as u32, doc_id);
 
-                    let matches = if let Some(pattern_scorer) = scorer
-                        .as_any()
-                        .downcast_ref::<crate::tantivy_integration::concat_query::RustieConcatScorer>(
-                        )
-                    {
-                        pattern_scorer.get_current_doc_matches().to_vec()
-                    } else {
-                        Vec::new()
-                    };
+                    let matches = scorer.take_current_doc_matches();
 
                     if let Ok(doc) = searcher.doc(doc_address) {
                         if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
@@ -274,8 +252,6 @@ impl ExtractorEngine {
 
         let mut all_results: Vec<(SentenceResult, Score)> =
             segment_results.into_iter().flatten().collect();
-
-        all_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
@@ -293,14 +269,9 @@ impl ExtractorEngine {
             .search(named_query, &TopDocs::with_limit(limit))
             .map_err(anyhow::Error::from)?;
 
-        // Create weight ONCE (previously created per-document)
-        let weight = named_query.weight(tantivy::query::EnableScoring::Enabled {
-            searcher: &searcher,
-            statistics_provider: &searcher,
-        })?;
-
-        // Cache scorers per segment to avoid re-creation
-        let mut scorer_cache: HashMap<u32, Box<dyn tantivy::query::Scorer>> = HashMap::new();
+        // Create concrete weight ONCE and cache scorers per segment
+        let weight = named_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?;
+        let mut scorer_cache: HashMap<u32, RustieNamedCaptureScorer> = HashMap::new();
 
         let mut sentence_results = Vec::new();
 
@@ -310,23 +281,13 @@ impl ExtractorEngine {
 
                 let segment_ord = doc_address.segment_ord;
 
-                // Get or create scorer for this segment
+                // Get or create concrete scorer for this segment
                 let scorer = scorer_cache.entry(segment_ord).or_insert_with(|| {
                     let segment_reader = searcher.segment_reader(segment_ord);
-                    weight.scorer(segment_reader, 1.0).unwrap_or_else(|_| {
-                        Box::new(tantivy::query::EmptyScorer)
-                    })
+                    weight.concrete_scorer(segment_reader, 1.0).expect("named capture scorer creation")
                 });
 
-                if let Some(named_scorer) = scorer
-                    .as_any()
-                    .downcast_ref::<crate::tantivy_integration::named_capture_query::RustieNamedCaptureScorer>()
-                {
-                    let matches = named_scorer.get_current_doc_matches();
-                    sentence_result.matches = matches.to_vec();
-                } else {
-                    sentence_result.matches = Vec::new();
-                }
+                sentence_result.matches = scorer.take_current_doc_matches();
 
                 sentence_results.push(sentence_result);
             }
@@ -414,7 +375,7 @@ impl ExtractorEngine {
         results: Vec<(SentenceResult, Score)>,
         limit: usize,
     ) -> Vec<SentenceResult> {
-        let mut seen: HashMap<(String, String), SentenceResult> = HashMap::new();
+        let mut seen: HashMap<(Arc<str>, Arc<str>), SentenceResult> = HashMap::new();
 
         for (result, score) in results {
             let key = (result.document_id.clone(), result.sentence_id.clone());

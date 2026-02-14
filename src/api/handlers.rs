@@ -165,18 +165,18 @@ fn convert_to_detailed_results(engine: &ExtractorEngine, odin_results: crate::re
     let mut detailed_results = Vec::new();
 
     if !odin_results.sentence_results.is_empty() {
-        for sentence in odin_results.sentence_results {
+        for mut sentence in odin_results.sentence_results {
             let matches: Vec<MatchResult> = sentence.matches
-                .iter()
-                .map(|m| m.clone().into())
+                .into_iter()
+                .map(MatchResult::from)
                 .collect();
 
-            let words = sentence.fields.get("word").cloned().unwrap_or_default();
+            let words = sentence.fields.remove("word").unwrap_or_default();
 
             let detailed_result = DocumentResult {
                 odinson_doc: 0,
                 score: sentence.score,
-                document_id: sentence.document_id,
+                document_id: sentence.document_id.to_string(),
                 sentence_index: sentence.sentence_id.parse().unwrap_or(0),
                 words,
                 matches,

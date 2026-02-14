@@ -1545,6 +1545,11 @@ impl OptimizedGraphTraversalScorer {
         &self.current_doc_matches
     }
 
+    /// Take the current document's matches, leaving an empty vec. Avoids clone in hot path.
+    pub fn take_current_doc_matches(&mut self) -> Vec<crate::types::SpanWithCaptures> {
+        std::mem::take(&mut self.current_doc_matches)
+    }
+
     /// Find positions in tokens that match a given pattern (string, regex, or wildcard for any field)
     pub(crate) fn find_positions_in_tokens(&self, tokens: &[String], pattern: &Pattern) -> Vec<usize> {
         let pattern = unwrap_constraint_pattern_static(pattern);

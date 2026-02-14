@@ -8,6 +8,7 @@ use crate::results::rustie_results::SentenceResult;
 use crate::tantivy_integration::utils;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tantivy::{
     schema::TantivyDocument,
     DocAddress, Score,
@@ -43,8 +44,8 @@ impl ExtractorEngine {
         }
 
         Ok(SentenceResult::new(
-            document_id,
-            sentence_id,
+            Arc::from(document_id),
+            Arc::from(sentence_id),
             score,
             Vec::new(), // Matches will be populated separately if needed
             field_values,
