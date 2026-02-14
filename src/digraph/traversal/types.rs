@@ -30,3 +30,37 @@ impl TraversalResult {
         }
     }
 }
+
+/// Set of allowed positions for a constraint (e.g. prefilter or driver positions).
+/// Stored as a sorted vec for cache-friendly O(log n) lookup; avoids HashSet
+/// allocation and hashing for sentence-sized position sets.
+#[derive(Debug, Clone)]
+pub struct AllowedPositions {
+    sorted: Vec<u32>,
+}
+
+impl AllowedPositions {
+    /// Build from a slice of positions. Sorts and deduplicates.
+    /// Use for sentence-sized sets; debug_assert validates expected size.
+    pub fn from_positions(positions: &[u32]) -> Self {
+        debug_assert!(
+            positions.len() < 1000,
+            "Unexpectedly large position set ({}); consider HashSet variant if this fires",
+            positions.len()
+        );
+        let mut sorted = positions.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        Self { sorted }
+    }
+
+    #[inline]
+    pub fn contains(&self, v: u32) -> bool {
+        self.sorted.binary_search(&v).is_ok()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+}

@@ -39,5 +39,5 @@ mod automaton;
 mod tests;
 
 // Re-export public API
-pub use types::{TraversalResult, PARALLEL_START_POSITIONS_THRESHOLD};
+pub use types::{AllowedPositions, TraversalResult, PARALLEL_START_POSITIONS_THRESHOLD};
 pub use basic::GraphTraversal;

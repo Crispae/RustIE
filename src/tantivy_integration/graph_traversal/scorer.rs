@@ -17,7 +17,7 @@ use tantivy::{
 
 use crate::query::ast::{FlatPatternStep, Pattern, Constraint, Matcher};
 use crate::digraph::zero_copy::ZeroCopyGraph;
-use crate::digraph::traversal::PARALLEL_START_POSITIONS_THRESHOLD;
+use crate::digraph::traversal::{AllowedPositions, PARALLEL_START_POSITIONS_THRESHOLD};
 
 use super::types::{
     prof_inc, capture_name,
@@ -537,7 +537,7 @@ pub(crate) fn process_single_start_position<T: TokenAccessor>(
     start_pos: usize,
     constraint_field_names: &[String],
     token_accessor: &T,
-    allowed_positions: &[Option<HashSet<u32>>],
+    allowed_positions: &[Option<AllowedPositions>],
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
     total_constraints: usize,
@@ -563,7 +563,7 @@ fn process_single_start_position_with_index<T: TokenAccessor>(
     start_pos: usize,
     constraint_field_names: &[String],
     token_accessor: &T,
-    allowed_positions: &[Option<HashSet<u32>>],
+    allowed_positions: &[Option<AllowedPositions>],
     constraint_exact_flags: &[bool],
     dst_set: &HashSet<u32>,
     dst_index_opt: Option<&Arc<HashMap<u32, Vec<crate::types::SpanWithCaptures>>>>,
@@ -748,30 +748,26 @@ impl OptimizedGraphTraversalScorer {
     }
 
     /// Build allowed positions combining src_driver, dst_driver, and prefilter positions.
-    /// Converts to HashSet<u32> with pre-allocated capacity to avoid rehashing.
+    /// Uses sorted vec (AllowedPositions) for cache-friendly lookup; avoids HashSet allocation.
     pub(crate) fn build_allowed_positions(
         &self,
         src_driver_positions: Option<&[u32]>,
         dst_driver_positions: Option<&[u32]>,
         prefilter_positions: &[Option<Vec<u32>>],
         num_constraints: usize,
-    ) -> Vec<Option<HashSet<u32>>> {
-        let mut result: Vec<Option<HashSet<u32>>> = vec![None; num_constraints];
+    ) -> Vec<Option<AllowedPositions>> {
+        let mut result: Vec<Option<AllowedPositions>> = vec![None; num_constraints];
 
         if let Some(src_positions) = src_driver_positions {
             if num_constraints > 0 {
-                let mut set = HashSet::with_capacity(src_positions.len());
-                set.extend(src_positions.iter().copied());
-                result[0] = Some(set);
+                result[0] = Some(AllowedPositions::from_positions(src_positions));
             }
         }
 
         if let Some(dst_positions) = dst_driver_positions {
             let last_idx = num_constraints.saturating_sub(1);
             if last_idx > 0 && last_idx < num_constraints {
-                let mut set = HashSet::with_capacity(dst_positions.len());
-                set.extend(dst_positions.iter().copied());
-                result[last_idx] = Some(set);
+                result[last_idx] = Some(AllowedPositions::from_positions(dst_positions));
             }
         }
 
@@ -779,9 +775,7 @@ impl OptimizedGraphTraversalScorer {
             if idx < num_constraints {
                 if result[idx].is_none() {
                     if let Some(positions) = prefilter {
-                        let mut set = HashSet::with_capacity(positions.len());
-                        set.extend(positions.iter().copied());
-                        result[idx] = Some(set);
+                        result[idx] = Some(AllowedPositions::from_positions(positions));
                     }
                 }
             }

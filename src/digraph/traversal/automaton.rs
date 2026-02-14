@@ -11,6 +11,7 @@ use std::collections::HashSet;
 
 use crate::query::ast::{Traversal, FlatPatternStep};
 use crate::digraph::graph_trait::GraphAccess;
+use super::AllowedPositions;
 use super::GraphTraversal;
 use super::matcher::ResolvedTraversalMatcher;
 
@@ -84,7 +85,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         generation: u32,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
         resolved_matchers: &[Option<ResolvedTraversalMatcher>],
         path: &mut Vec<usize>,
@@ -143,7 +144,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         generation: u32,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
         resolved_matchers: &[Option<ResolvedTraversalMatcher>],
         path: &mut Vec<usize>,
@@ -171,7 +172,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
             let is_exact = constraint_exact_flags.get(constraint_idx).copied().unwrap_or(false);
             let prefilter_confirmed = allowed_positions.get(constraint_idx)
                 .and_then(|opt| opt.as_ref())
-                .map(|set| set.contains(&(node as u32)))  // O(1) HashSet lookup
+                .map(|ap| ap.contains(node as u32))
                 .unwrap_or(false);
 
             if is_exact && prefilter_confirmed {
@@ -219,7 +220,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         generation: u32,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
         resolved_matchers: &[Option<ResolvedTraversalMatcher>],
         path: &mut Vec<usize>,
@@ -328,7 +329,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         generation: u32,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
         resolved_matchers: &[Option<ResolvedTraversalMatcher>],
         path: &mut Vec<usize>,
@@ -372,7 +373,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         generation: u32,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
         resolved_matchers: &[Option<ResolvedTraversalMatcher>],
         path: &mut Vec<usize>,
@@ -419,7 +420,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         candidate_nodes: &[usize],
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
     ) -> Vec<Vec<usize>>
     where
@@ -468,7 +469,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         candidate_nodes: &[usize],
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
     ) -> bool
     where
@@ -527,7 +528,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         dst_set: &HashSet<u32>,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
     ) -> Vec<Vec<usize>>
     where
@@ -581,7 +582,7 @@ impl<G: GraphAccess> GraphTraversal<G> {
         dst_set: &HashSet<u32>,
         constraint_field_names: &[String],
         get_token: &mut F,
-        allowed_positions: &[Option<HashSet<u32>>],
+        allowed_positions: &[Option<AllowedPositions>],
         constraint_exact_flags: &[bool],
     ) -> Vec<(usize, usize, Vec<usize>)>
     where

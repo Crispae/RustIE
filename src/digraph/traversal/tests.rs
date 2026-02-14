@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::digraph::traversal::{GraphTraversal, TraversalResult};
+    use crate::digraph::traversal::{AllowedPositions, GraphTraversal, TraversalResult};
     use crate::query::ast::{Traversal, Matcher, FlatPatternStep};
     use crate::digraph::DirectedGraph;
 
@@ -383,7 +383,7 @@ mod tests {
 
         let traversal = GraphTraversal::new(graph);
         let mut get_token = |_constraint_idx: usize, _position: usize| -> Option<String> { None };
-        let allowed_positions: Vec<Option<std::collections::HashSet<u32>>> = vec![];
+        let allowed_positions: Vec<Option<AllowedPositions>> = vec![];
         let constraint_exact_flags: Vec<bool> = vec![];
         let result = traversal.automaton_query(&[], &[0], &[], &mut get_token, &allowed_positions, &constraint_exact_flags);
 
@@ -405,7 +405,7 @@ mod tests {
         let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
             tokens.get(constraint_idx)?.get(position).cloned()
         };
-        let allowed_positions: Vec<Option<std::collections::HashSet<u32>>> = vec![None];
+        let allowed_positions: Vec<Option<AllowedPositions>> = vec![None];
         let constraint_exact_flags: Vec<bool> = vec![false];
         let result = traversal.automaton_query(&pattern, &[0], &field_names, &mut get_token, &allowed_positions, &constraint_exact_flags);
 
@@ -429,7 +429,7 @@ mod tests {
         let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
             tokens.get(constraint_idx)?.get(position).cloned()
         };
-        let allowed_positions: Vec<Option<std::collections::HashSet<u32>>> = vec![None];
+        let allowed_positions: Vec<Option<AllowedPositions>> = vec![None];
         let constraint_exact_flags: Vec<bool> = vec![false];
         let result = traversal.automaton_query(&pattern, &[100], &field_names, &mut get_token, &allowed_positions, &constraint_exact_flags);
 
@@ -443,7 +443,7 @@ mod tests {
 
         let traversal = GraphTraversal::new(graph);
         let mut get_token = |_constraint_idx: usize, _position: usize| -> Option<String> { None };
-        let allowed_positions: Vec<Option<std::collections::HashSet<u32>>> = vec![];
+        let allowed_positions: Vec<Option<AllowedPositions>> = vec![];
         let constraint_exact_flags: Vec<bool> = vec![];
         let paths = traversal.automaton_query_paths(&[], &[0], &[], &mut get_token, &allowed_positions, &constraint_exact_flags);
 
@@ -465,7 +465,7 @@ mod tests {
         let mut get_token = |constraint_idx: usize, position: usize| -> Option<String> {
             tokens.get(constraint_idx)?.get(position).cloned()
         };
-        let allowed_positions: Vec<Option<std::collections::HashSet<u32>>> = vec![None];
+        let allowed_positions: Vec<Option<AllowedPositions>> = vec![None];
         let constraint_exact_flags: Vec<bool> = vec![false];
         let paths = traversal.automaton_query_paths(&pattern, &[0], &field_names, &mut get_token, &allowed_positions, &constraint_exact_flags);
 
