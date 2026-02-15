@@ -596,4 +596,65 @@ mod tests {
             _ => panic!("Expected Conjunctive constraint, got {:?}", pattern),
         }
     }
+
+    // ==================== Property-Based Tests ====================
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Parser should never panic, even on arbitrary Unicode strings.
+        proptest! {
+            #[test]
+            fn parser_never_panics(s in "\\PC{1,200}") {
+                let p = parser();
+                // Ok or Err is fine — just don't panic
+                let _ = p.parse_query(&s);
+            }
+        }
+
+        /// Strategy: generate field names from the schema-valid set
+        fn field_name() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("word".to_string()),
+                Just("lemma".to_string()),
+                Just("tag".to_string()),
+                Just("pos".to_string()),
+                Just("entity".to_string()),
+            ]
+        }
+
+        /// Strategy: generate simple alphanumeric values
+        fn field_value() -> impl Strategy<Value = String> {
+            "[a-zA-Z][a-zA-Z0-9]{0,15}".prop_map(|s| s)
+        }
+
+        /// Strategy: generate a single valid constraint like [word=Hello]
+        fn valid_constraint() -> impl Strategy<Value = String> {
+            (field_name(), field_value())
+                .prop_map(|(name, value)| format!("[{}={}]", name, value))
+        }
+
+        /// Strategy: generate a sequence of 1-3 valid constraints
+        fn valid_sequence() -> impl Strategy<Value = String> {
+            prop::collection::vec(valid_constraint(), 1..=3)
+                .prop_map(|constraints| constraints.join(" "))
+        }
+
+        proptest! {
+            #[test]
+            fn valid_single_constraint_always_parses(q in valid_constraint()) {
+                let p = parser();
+                let result = p.parse_query(&q);
+                prop_assert!(result.is_ok(), "Failed to parse valid constraint '{}': {:?}", q, result.err());
+            }
+
+            #[test]
+            fn valid_sequence_always_parses(q in valid_sequence()) {
+                let p = parser();
+                let result = p.parse_query(&q);
+                prop_assert!(result.is_ok(), "Failed to parse valid sequence '{}': {:?}", q, result.err());
+            }
+        }
+    }
 } 
