@@ -42,4 +42,7 @@ impl QueryCompiler {
             }
         }
     }
-} 
+}
+
+#[cfg(test)]
+mod tests; 
