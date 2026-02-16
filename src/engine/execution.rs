@@ -266,10 +266,12 @@ impl ExtractorEngine {
             }
         };
 
-        // Create weight once and share across segments (avoids per-segment schema/prefilter/regex work).
+        // Create weight once and share across segments. Use BM25 when searcher + terms available.
+        let score_field = self.default_field();
         let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
             graph_query
-                .concrete_weight_with_cache(self.regex_cache.clone())
+                .concrete_weight_with_bm25(&searcher, self.regex_cache.clone(), score_field)
+                .or_else(|_| graph_query.concrete_weight_with_cache(self.regex_cache.clone()))
                 .map_err(anyhow::Error::from)?,
         );
 
@@ -351,9 +353,11 @@ impl ExtractorEngine {
             }
         };
 
+        let score_field = self.default_field();
         let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
             graph_query
-                .concrete_weight_with_cache(self.regex_cache.clone())
+                .concrete_weight_with_bm25(&searcher, self.regex_cache.clone(), score_field)
+                .or_else(|_| graph_query.concrete_weight_with_cache(self.regex_cache.clone()))
                 .map_err(anyhow::Error::from)?,
         );
 

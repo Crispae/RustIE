@@ -6,8 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use rayon::prelude::*;
+use tantivy::fieldnorm::FieldNormReader;
 use tantivy::{
-    query::Scorer,
+    query::{Scorer, Bm25Weight},
     DocId, Score,
     DocSet, SegmentReader,
     store::StoreReader,
@@ -137,6 +138,10 @@ pub struct OptimizedGraphTraversalScorer {
     /// True means the constraint is an exact string match that can skip token verification
     /// when the prefilter confirms the position.
     constraint_exact_flags: Vec<bool>,
+    /// BM25 weight for scoring (IDF + field norms). None when scoring uses Option B fallback.
+    pub(crate) bm25_weight: Option<Bm25Weight>,
+    /// Field norm reader for the score field. None when BM25 path is not used.
+    pub(crate) fieldnorm_reader: Option<FieldNormReader>,
 }
 
 impl OptimizedGraphTraversalScorer {
@@ -158,6 +163,8 @@ impl OptimizedGraphTraversalScorer {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
         constraint_fast_fields: Vec<Option<StrColumn>>,
+        bm25_weight: Option<Bm25Weight>,
+        fieldnorm_reader: Option<FieldNormReader>,
     ) -> Self {
         // Wrap drivers in TwoPhaseIntersection for Lucene-style document alignment
         let intersection = TwoPhaseIntersection::new(src_driver, dst_driver);
@@ -286,6 +293,8 @@ impl OptimizedGraphTraversalScorer {
             dst_positions_buf: Vec::with_capacity(16),
             total_constraints,
             constraint_exact_flags,
+            bm25_weight,
+            fieldnorm_reader,
         }
     }
 }
@@ -731,33 +740,71 @@ pub(crate) fn is_exact_skippable(constraint: &Constraint) -> bool {
 }
 
 impl OptimizedGraphTraversalScorer {
-    /// Compute sloppy frequency factor based on span width (Odinson-style)
-    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width
-    /// Shorter spans get higher scores
+    /// Compute sloppy frequency factor based on span width (Odinson-style).
+    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width.
+    /// Shorter spans get higher scores. Kept for backward compatibility (e.g. concat_query).
+    #[inline(always)]
     fn compute_slop_factor(span_width: usize) -> Score {
         1.0 / (1.0 + span_width as f32)
     }
 
-    /// Compute Odinson-style score for the current document
-    /// Accumulates sloppy frequency for all matches, similar to Lucene/Odinson
+    /// Accumulate sloppy frequency from matches (single pass, inlined slop).
+    /// Used by score_from_matches and by the formula-identity test.
+    #[inline(always)]
+    pub(crate) fn accumulate_sloppy_freq(matches: &[crate::types::SpanWithCaptures]) -> Score {
+        let mut acc: Score = 0.0;
+        for span_match in matches {
+            let w = span_match.span.end.saturating_sub(span_match.span.start);
+            acc += 1.0 / (1.0 + w as f32);
+        }
+        acc
+    }
+
+    /// Compute Odinson-style score from a list of span matches.
+    ///
+    /// **Formula**: `(Σ slop) / √n × boost`, floor 0.01.
+    /// Algebraically equivalent to `tf × avg_slop × boost` (where `tf = √n`, `avg_slop = Σslop / n`)
+    /// with one fewer division.
+    ///
+    /// **Score properties**: More matches → higher score; tighter matches (smaller span width) →
+    /// higher score; boost scales linearly. Range: [0.01, ∞). Single match with span_width=0 → 1.0.
+    ///
+    /// `pub(crate)` so unit tests can call this without constructing a full scorer.
+    #[inline]
+    pub(crate) fn score_from_matches(
+        matches: &[crate::types::SpanWithCaptures],
+        boost: Score,
+    ) -> Score {
+        let n = matches.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let acc_sloppy_freq = Self::accumulate_sloppy_freq(matches);
+        let score = acc_sloppy_freq * (1.0 / (n as f32).sqrt()) * boost;
+        score.max(0.01)
+    }
+
+    /// Compute Odinson-style score for the current document.
+    ///
+    /// When BM25 is available (Option A): score = bm25.score(fieldnorm_id, match_count) * avg_slop.
+    /// Otherwise (Option B): score_from_matches (tf × avg_slop × boost). Range [0.01, ∞).
+    #[inline]
     fn compute_odinson_score(&self) -> Score {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
+        let sloppy_freq = Self::accumulate_sloppy_freq(&self.current_doc_matches);
+        let match_count = self.current_doc_matches.len();
 
-        let mut acc_sloppy_freq: Score = 0.0;
-
-        for span_match in &self.current_doc_matches {
-            let span_width = span_match.span.end.saturating_sub(span_match.span.start);
-            acc_sloppy_freq += Self::compute_slop_factor(span_width);
+        if let (Some(ref bm25), Some(ref fnr)) = (&self.bm25_weight, &self.fieldnorm_reader) {
+            let doc = self.doc();
+            let fieldnorm_id: u8 = fnr.fieldnorm_id(doc);
+            let bm25_score: Score = bm25.score(fieldnorm_id, match_count as u32);
+            let avg_slop = sloppy_freq / match_count as f32;
+            (bm25_score * avg_slop).max(0.01)
+        } else {
+            Self::score_from_matches(&self.current_doc_matches, self.boost)
         }
-
-        let src_score = 1.0;
-        let dst_score = 1.0;
-        let base_score = (src_score + dst_score) / 2.0;
-
-        let final_score = base_score * acc_sloppy_freq * self.boost;
-        final_score.max(1.0)
     }
 
     /// Log final statistics when iteration completes
@@ -1735,5 +1782,191 @@ impl DocSet for OptimizedGraphTraversalScorer {
 
     fn size_hint(&self) -> u32 {
         0
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+    use crate::types::{Span, SpanWithCaptures};
+
+    fn span(start: usize, end: usize) -> SpanWithCaptures {
+        SpanWithCaptures::new(Span::new(start, end))
+    }
+
+    #[test]
+    fn empty_matches_score_zero() {
+        assert_eq!(
+            OptimizedGraphTraversalScorer::score_from_matches(&[], 1.0),
+            0.0,
+        );
+    }
+
+    #[test]
+    fn single_tight_match_scores_around_one() {
+        let score = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 5)], 1.0);
+        assert!(
+            (score - 1.0).abs() < 0.01,
+            "Expected ~1.0, got {}",
+            score,
+        );
+    }
+
+    #[test]
+    fn single_wide_match_scores_below_one() {
+        let score = OptimizedGraphTraversalScorer::score_from_matches(&[span(1, 5)], 1.0);
+        assert!(score < 1.0, "Wide match should score < 1.0, got {}", score);
+        assert!(score > 0.1, "Score should be > 0.1, got {}", score);
+    }
+
+    #[test]
+    fn shorter_span_scores_higher() {
+        let tight = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 6)], 1.0);
+        let wide = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 15)], 1.0);
+        assert!(
+            tight > wide,
+            "Tight span ({}) should score higher than wide span ({})",
+            tight,
+            wide,
+        );
+    }
+
+    #[test]
+    fn more_matches_score_higher() {
+        let one = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 5)], 1.0);
+        let three = OptimizedGraphTraversalScorer::score_from_matches(
+            &[span(5, 5), span(10, 10), span(15, 15)],
+            1.0,
+        );
+        assert!(
+            three > one,
+            "3 matches ({}) should score higher than 1 match ({})",
+            three,
+            one,
+        );
+    }
+
+    #[test]
+    fn score_never_below_floor() {
+        let score = OptimizedGraphTraversalScorer::score_from_matches(&[span(0, 1000)], 1.0);
+        assert!(
+            score >= 0.01,
+            "Score should be >= 0.01, got {}",
+            score,
+        );
+    }
+
+    #[test]
+    fn different_span_widths_produce_different_scores() {
+        let scores: Vec<f32> = (0..6)
+            .map(|w| {
+                OptimizedGraphTraversalScorer::score_from_matches(&[span(0, w)], 1.0)
+            })
+            .collect();
+        for i in 1..scores.len() {
+            assert!(
+                scores[i] < scores[i - 1],
+                "width {} ({}) should be < width {} ({})",
+                i,
+                scores[i],
+                i - 1,
+                scores[i - 1],
+            );
+        }
+        for i in 0..scores.len() {
+            for j in (i + 1)..scores.len() {
+                assert!(
+                    (scores[i] - scores[j]).abs() > 0.001,
+                    "Scores for width {} ({}) and width {} ({}) should differ",
+                    i,
+                    scores[i],
+                    j,
+                    scores[j],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boost_scales_score() {
+        let base = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 5)], 1.0);
+        let boosted = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 5)], 2.0);
+        assert!(
+            (boosted - base * 2.0).abs() < 0.01,
+            "Boosted ({}) should be ~2x base ({})",
+            boosted,
+            base,
+        );
+    }
+
+    #[test]
+    fn zero_boost_hits_floor() {
+        let score = OptimizedGraphTraversalScorer::score_from_matches(&[span(5, 5)], 0.0);
+        assert!(
+            (score - 0.01).abs() < 0.001,
+            "Zero boost should hit floor, got {}",
+            score,
+        );
+    }
+
+    #[test]
+    fn expected_score_values() {
+        let s1 = OptimizedGraphTraversalScorer::score_from_matches(&[span(0, 0)], 1.0);
+        assert!((s1 - 1.0).abs() < 0.01, "1 match w=0 → 1.0, got {}", s1);
+
+        let s2 = OptimizedGraphTraversalScorer::score_from_matches(&[span(0, 1)], 1.0);
+        assert!((s2 - 0.5).abs() < 0.01, "1 match w=1 → 0.5, got {}", s2);
+
+        let s3 = OptimizedGraphTraversalScorer::score_from_matches(&[span(0, 0), span(5, 5)], 1.0);
+        assert!(
+            (s3 - std::f32::consts::SQRT_2).abs() < 0.01,
+            "2 matches w=0,0 → sqrt(2), got {}",
+            s3,
+        );
+
+        let s4 = OptimizedGraphTraversalScorer::score_from_matches(
+            &[span(0, 0), span(5, 5), span(10, 10), span(15, 15)],
+            1.0,
+        );
+        assert!((s4 - 2.0).abs() < 0.01, "4 matches w=0 → 2.0, got {}", s4);
+    }
+
+    #[test]
+    fn formula_identity_acc_div_sqrt_n() {
+        let cases: Vec<Vec<SpanWithCaptures>> = vec![
+            vec![span(0, 0)],
+            vec![span(0, 1), span(5, 5)],
+            vec![span(0, 0), span(1, 3), span(5, 8)],
+            vec![span(0, 0), span(0, 0), span(0, 0), span(0, 0)],
+        ];
+
+        for matches in &cases {
+            let n = matches.len() as f32;
+            let acc =
+                OptimizedGraphTraversalScorer::accumulate_sloppy_freq(matches);
+
+            let tf = n.sqrt();
+            let avg_slop = acc / n;
+            let method1 = tf * avg_slop;
+
+            let method2 = acc / n.sqrt();
+
+            assert!(
+                (method1 - method2).abs() < 0.0001,
+                "Identity failed for n={}: {} vs {}",
+                n,
+                method1,
+                method2,
+            );
+
+            let actual = OptimizedGraphTraversalScorer::score_from_matches(matches, 1.0);
+            assert!(
+                (actual - method2).abs() < 0.0001,
+                "Function result {} != expected {} for n={}",
+                actual,
+                method2,
+                n,
+            );
+        }
     }
 }
