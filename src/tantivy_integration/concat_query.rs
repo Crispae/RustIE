@@ -1,11 +1,16 @@
-use tantivy::query::{Query, Weight, Scorer, EnableScoring};
+use tantivy::query::{Query, Weight, Scorer, EnableScoring, Bm25Weight};
 use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet, Term};
 use tantivy::schema::{Field, IndexRecordOption, Value};
+use tantivy::fieldnorm::FieldNormReader;
 use tantivy::postings::Postings;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tantivy_fst::Regex;
 use crate::query::ast::{Pattern, Constraint, Matcher};
+use crate::tantivy_integration::graph_traversal::query::{
+    extract_terms_from_pattern,
+    expand_regex_terms_from_pattern,
+};
 
 /// Execution plan for anchor-based verification
 #[derive(Debug, Clone)]
@@ -96,12 +101,26 @@ impl RustieConcatQuery {
             .iter()
             .map(|q| q.weight(scoring.clone()))
             .collect::<TantivyResult<Vec<_>>>()?;
+        let schema = searcher.schema();
+        let mut terms = Vec::new();
+        extract_terms_from_pattern(&self.pattern, schema, &mut terms);
+        expand_regex_terms_from_pattern(&self.pattern, schema, searcher, &mut terms);
+        // Deduplicate so exact terms that also match a regex don't double-count IDF.
+        terms.sort_unstable();
+        terms.dedup();
+        let bm25_weight = if terms.is_empty() {
+            None
+        } else {
+            Some(Bm25Weight::for_terms(searcher, &terms)?)
+        };
         Ok(RustieConcatWeight {
             sub_weights,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
             concat_plan: self.concat_plan.clone(),
             regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            bm25_weight,
+            score_field: self.default_field,
         })
     }
 }
@@ -119,6 +138,8 @@ impl Query for RustieConcatQuery {
             default_field: self.default_field,
             concat_plan: self.concat_plan.clone(),
             regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            bm25_weight: None,
+            score_field: self.default_field,
         }))
     }
 }
@@ -130,6 +151,10 @@ pub(crate) struct RustieConcatWeight {
     concat_plan: Option<ConcatPlan>,
     /// Cached compiled regex automata (shared across segments, thread-safe)
     regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    /// BM25 weight for scoring (IDF + field norms). None when no terms or scoring disabled.
+    bm25_weight: Option<Bm25Weight>,
+    /// Field used for field norms (typically the default/word field).
+    score_field: Field,
 }
 
 
@@ -444,6 +469,8 @@ impl RustieConcatWeight {
         let execution_plan = compute_execution_plan(&constraint_sources, reader);
         
         let concat_plan = self.concat_plan.clone();
+        let fieldnorm_reader = reader.get_fieldnorms_reader(self.score_field).ok();
+        let boosted_bm25 = self.bm25_weight.as_ref().map(|w| w.clone().boost_by(boost));
 
         Ok(RustieConcatScorer {
             sub_scorers,
@@ -461,6 +488,8 @@ impl RustieConcatWeight {
             concat_plan,
             position_buffers: Vec::new(),
             regex_tmp: Vec::with_capacity(16),
+            bm25_weight: boosted_bm25,
+            fieldnorm_reader,
         })
     }
 }
@@ -491,6 +520,10 @@ pub struct RustieConcatScorer {
     concat_plan: Option<ConcatPlan>,
     position_buffers: Vec<Vec<u32>>,  // Reusable buffers for position collection
     regex_tmp: Vec<u32>,  // Reusable buffer for regex position collection
+    /// BM25 weight for scoring (IDF + field norms, boost already applied).
+    bm25_weight: Option<Bm25Weight>,
+    /// Field norm reader for the score field.
+    fieldnorm_reader: Option<FieldNormReader>,
 }
 
 impl RustieConcatScorer {
@@ -502,14 +535,20 @@ impl RustieConcatScorer {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
+        let (bm25, fnr) = match (&self.bm25_weight, &self.fieldnorm_reader) {
+            (Some(b), Some(f)) => (b, f),
+            // No extractable terms (pure regex/wildcard pattern) – flat score.
+            _ => return 1.0,
+        };
         let mut acc_sloppy_freq: Score = 0.0;
         for span_match in &self.current_doc_matches {
             let span_width = span_match.span.end.saturating_sub(span_match.span.start);
             acc_sloppy_freq += Self::compute_slop_factor(span_width);
         }
-        let base_score = 1.0;
-        let final_score = base_score * acc_sloppy_freq * self.boost;
-        final_score.max(1.0)
+        let doc = self.current_doc.unwrap_or(0);
+        let fieldnorm_id = fnr.fieldnorm_id(doc);
+        let term_freq = acc_sloppy_freq.ceil().max(1.0) as u32;
+        bm25.score(fieldnorm_id, term_freq).max(0.01)
     }
 }
 

@@ -712,25 +712,25 @@ impl OptimizedGraphTraversalScorer {
 
     /// Compute Odinson-style score for the current document.
     ///
-    /// When BM25 is available (Option A): score = bm25.score(fieldnorm_id, match_count) * avg_slop.
-    /// Otherwise (Option B): score_from_matches (tf × avg_slop × boost). Range [0.01, ∞).
+    /// Mirrors Odinson: feeds `⌈Σ 1/(1+width)⌉` (accumulated sloppy frequency) directly as the
+    /// BM25 term frequency, so BM25's TF-saturation curve weights tighter matches higher.
+    ///
+    /// Returns `1.0` when no BM25 weight is available (pure regex/wildcard patterns with no
+    /// extractable terms – flat score, no ranking signal).
     #[inline]
     fn compute_odinson_score(&self) -> Score {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
+        let (bm25, fnr) = match (&self.bm25_weight, &self.fieldnorm_reader) {
+            (Some(b), Some(f)) => (b, f),
+            _ => return 1.0,
+        };
         let sloppy_freq = Self::accumulate_sloppy_freq(&self.current_doc_matches);
-        let match_count = self.current_doc_matches.len();
-
-        if let (Some(ref bm25), Some(ref fnr)) = (&self.bm25_weight, &self.fieldnorm_reader) {
-            let doc = self.doc();
-            let fieldnorm_id: u8 = fnr.fieldnorm_id(doc);
-            let bm25_score: Score = bm25.score(fieldnorm_id, match_count as u32);
-            let avg_slop = sloppy_freq / match_count as f32;
-            (bm25_score * avg_slop).max(0.01)
-        } else {
-            Self::score_from_matches(&self.current_doc_matches, self.boost)
-        }
+        let doc = self.doc();
+        let fieldnorm_id: u8 = fnr.fieldnorm_id(doc);
+        let term_freq = sloppy_freq.ceil().max(1.0) as u32;
+        bm25.score(fieldnorm_id, term_freq).max(0.01)
     }
 
     /// Log final statistics when iteration completes
