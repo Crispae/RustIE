@@ -34,6 +34,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 proptest = "1"
 rstest = "0.23"
 pretty_assertions = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bin]]
 name = "api_server"
@@ -58,6 +59,10 @@ path = "src/bin/create_test_index.rs"
 [[bin]]
 name = "profile_query"
 path = "src/bin/profile_query.rs"
+
+[[bench]]
+name = "search_bench"
+harness = false
 
 [features]
 profiling = []
