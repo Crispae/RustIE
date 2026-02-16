@@ -3,6 +3,7 @@ use tantivy::{
     schema::{Term, Schema},
 };
 use crate::query::ast::{Pattern, Constraint, Matcher, Assertion, QuantifierKind};
+use crate::query::compiler::CompiledQuery;
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, ConcatPlan, ConcatStep};
 use crate::tantivy_integration::boolean_query::RustieOrQuery;
 use crate::tantivy_integration::assertion_query::LookaheadQuery;
@@ -19,25 +20,38 @@ impl BasicCompiler {
         Self { schema }
     }
 
-    pub fn compile_pattern(&self, pattern: &Pattern) -> Result<Box<dyn Query>> {
+    pub fn compile_pattern(&self, pattern: &Pattern) -> Result<CompiledQuery> {
         match pattern {
-            
-            Pattern::Assertion(assertion) => self.compile_assertion(assertion),
-            Pattern::Constraint(constraint) => self.compile_constraint(constraint),
-            Pattern::Disjunctive(patterns) => self.compile_disjunctive(patterns),
-            Pattern::Concatenated(patterns) => self.compile_concatenated(patterns),
+            Pattern::Concatenated(patterns) => {
+                let cq = self.compile_concatenated(patterns)?;
+                Ok(CompiledQuery::Concat(cq))
+            }
             Pattern::NamedCapture { name, pattern } => {
-                let inner_query = self.compile_pattern(pattern)?;
+                let inner_query = self.compile_pattern(pattern)?.into_boxed_query();
                 let default_field = self.schema.get_field("word")
                     .map_err(|_| anyhow!("Default field 'word' not found within schema"))?;
-                    
-                Ok(Box::new(RustieNamedCaptureQuery::new(
+                Ok(CompiledQuery::NamedCapture(RustieNamedCaptureQuery::new(
                     inner_query,
                     name.clone(),
                     *pattern.clone(),
                     default_field,
                 )))
             }
+            _ => {
+                let bq = self.compile_to_box(pattern)?;
+                Ok(CompiledQuery::Basic(bq))
+            }
+        }
+    }
+
+    /// Compile any pattern that does not produce a Concat or NamedCapture into a
+    /// `Box<dyn Query>`. Used internally by recursive compile methods that need
+    /// a boxed query as a sub-query (e.g., disjunctions, repetitions).
+    fn compile_to_box(&self, pattern: &Pattern) -> Result<Box<dyn Query>> {
+        match pattern {
+            Pattern::Assertion(assertion) => self.compile_assertion(assertion),
+            Pattern::Constraint(constraint) => self.compile_constraint(constraint),
+            Pattern::Disjunctive(patterns) => self.compile_disjunctive(patterns),
             Pattern::Mention { arg_name: _, label: _ } => {
                 Err(anyhow!("Mention queries not yet implemented"))
             }
@@ -46,6 +60,11 @@ impl BasicCompiler {
             }
             Pattern::Repetition { pattern, min, max, kind } => {
                 self.compile_repetition(pattern, *min, *max, *kind)
+            }
+            // These two variants produce typed CompiledQuery variants; callers that need
+            // a sub-query box should call compile_pattern().into_boxed_query() instead.
+            Pattern::Concatenated(_) | Pattern::NamedCapture { .. } => {
+                self.compile_pattern(pattern).map(CompiledQuery::into_boxed_query)
             }
         }
     }
@@ -176,8 +195,7 @@ impl BasicCompiler {
     fn compile_disjunctive(&self, patterns: &[Pattern]) -> Result<Box<dyn Query>> {
         let mut sub_queries = Vec::new();
         for pattern in patterns {
-            let query = self.compile_pattern(pattern)?;
-            sub_queries.push(query);
+            sub_queries.push(self.compile_pattern(pattern)?.into_boxed_query());
         }
         Ok(Box::new(RustieOrQuery { sub_queries }))
     }
@@ -205,11 +223,11 @@ impl BasicCompiler {
         }
     }
 
-    fn compile_concatenated(&self, patterns: &[Pattern]) -> Result<Box<dyn Query>> {
+    fn compile_concatenated(&self, patterns: &[Pattern]) -> Result<RustieConcatQuery> {
         // Build concat plan for postings-based execution
         let concat_plan = Self::build_concat_plan(patterns);
-        
-        let mut sub_queries = Vec::new();
+
+        let mut sub_queries: Vec<Box<dyn Query>> = Vec::new();
 
         if concat_plan.is_some() {
             // Phase 1 optimization for concat queries:
@@ -221,7 +239,7 @@ impl BasicCompiler {
                     // Reject wildcard as atom (shouldn't happen if build_concat_plan succeeded, but defensive)
                     if let Some(c) = Self::as_constraint(pattern) {
                         if !matches!(c, Constraint::Wildcard) {
-                            sub_queries.push(self.compile_pattern(pattern)?);
+                            sub_queries.push(self.compile_pattern(pattern)?.into_boxed_query());
                         }
                     }
                 }
@@ -231,11 +249,11 @@ impl BasicCompiler {
             // include mandatory patterns only (to avoid over-filtering).
             for pattern in patterns {
                 if self.is_mandatory_pattern(pattern) {
-                    sub_queries.push(self.compile_pattern(pattern)?);
+                    sub_queries.push(self.compile_pattern(pattern)?.into_boxed_query());
                 }
             }
         }
-        
+
         // If no mandatory patterns found, we must add a query that matches all documents
         // that could potentially be a match. A simple "word:* " regex query works as a fallback.
         if sub_queries.is_empty() {
@@ -245,27 +263,27 @@ impl BasicCompiler {
                 .map_err(|e| anyhow!("Invalid fallback regex: {}", e))?;
             sub_queries.push(Box::new(all_query));
         }
-        
+
         // Create the concatenated pattern
         let concatenated_pattern = Pattern::Concatenated(patterns.to_vec());
-        
+
         // Get the default field
         let default_field = self.schema.get_field("word")
             .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-        
+
         // Use RustieConcatQuery for concatenated patterns
         let mut pattern_query = RustieConcatQuery::new(
             default_field,
             concatenated_pattern,
             sub_queries,
         );
-        
+
         // Set concat plan if detected
         if let Some(plan) = concat_plan {
             pattern_query.concat_plan = Some(plan);
         }
-        
-        Ok(Box::new(pattern_query))
+
+        Ok(pattern_query)
     }
     
     /// Helper to extract constraint from pattern (supports NamedCapture wrapper)
@@ -394,12 +412,10 @@ impl BasicCompiler {
             
             if repeated.len() == 1 {
                 // Single pattern - just compile it directly
-                let query = self.compile_pattern(&repeated[0])?;
-                alternatives.push(query);
+                alternatives.push(self.compile_pattern(&repeated[0])?.into_boxed_query());
             } else {
                 // Multiple patterns - use concatenation
-                let concat_query = self.compile_concatenated(&repeated)?;
-                alternatives.push(concat_query);
+                alternatives.push(Box::new(self.compile_concatenated(&repeated)?));
             }
         }
         

@@ -3,15 +3,16 @@
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
 use crate::engine::pagination_driver::{PaginationDriver, Paginatable};
+use crate::query::ast::Pattern;
+use crate::query::compiler::CompiledQuery;
 use crate::results::rustie_results::{RustIeResult, SentenceResult};
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, RustieConcatWeight};
-use crate::tantivy_integration::named_capture_query::{
-    RustieNamedCaptureQuery, RustieNamedCaptureScorer,
-};
 use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalWeight,
 };
-use crate::query::ast::Pattern;
+use crate::tantivy_integration::named_capture_query::{
+    RustieNamedCaptureQuery, RustieNamedCaptureScorer,
+};
 use crate::tantivy_integration::paging_collector::{
     PaginatedSearchResult, PagingCollector, ScoredDoc, SimpleCollector,
 };
@@ -121,8 +122,8 @@ impl ExtractorEngine {
     /// Execute a query string with a limit on results
     pub fn query_with_limit(&self, query: &str, limit: usize) -> Result<RustIeResult> {
         let pattern = self.parser().parse_query(query)?;
-        let tantivy_query = self.compiler().compile(query)?;
-        self.execute_query(tantivy_query.as_ref(), limit, &pattern)
+        let compiled = self.compiler().compile_pattern(&pattern)?;
+        self.execute_query(&compiled, limit, &pattern)
     }
 
     /// Execute a query with Odinson-style cursor-based pagination.
@@ -135,29 +136,21 @@ impl ExtractorEngine {
         after: Option<SearchCursor>,
     ) -> Result<PaginatedResult> {
         let pattern = self.parser().parse_query(query)?;
-        let tantivy_query = self.compiler().compile(query)?;
+        let compiled = self.compiler().compile_pattern(&pattern)?;
 
-        match &pattern {
-            Pattern::GraphTraversal { .. } => {
-                self.execute_graph_traversal_paginated(
-                    tantivy_query.as_ref(),
-                    page_size,
-                    after,
-                    &pattern,
-                )
+        match &compiled {
+            CompiledQuery::Graph(gq) => {
+                self.execute_graph_traversal_paginated(gq, page_size, after)
             }
-            Pattern::Concatenated(..) => Err(anyhow!(
+            CompiledQuery::Concat(..) => Err(anyhow!(
                 "Paginated search does not support concatenated patterns; use POST /api/v1/query instead"
             )),
-            Pattern::NamedCapture { .. } => Err(anyhow!(
+            CompiledQuery::NamedCapture(..) => Err(anyhow!(
                 "Paginated search does not support named capture patterns; use POST /api/v1/query instead"
             )),
-            _ => self.execute_paginated(
-                tantivy_query.as_ref(),
-                page_size,
-                after,
-                &pattern,
-            ),
+            CompiledQuery::Basic(bq) => {
+                self.execute_paginated(bq.as_ref(), page_size, after, &pattern)
+            }
         }
     }
 
@@ -221,24 +214,19 @@ impl ExtractorEngine {
         })
     }
 
-    /// Execute a compiled query with the original pattern for match extraction
+    /// Execute a compiled query. Each variant is dispatched to its specialised executor
+    /// with full type information — no runtime downcasting required.
     pub fn execute_query(
         &self,
-        query: &dyn Query,
+        compiled: &CompiledQuery,
         limit: usize,
-        pattern: &crate::query::ast::Pattern,
+        pattern: &Pattern,
     ) -> Result<RustIeResult> {
-        match pattern {
-            crate::query::ast::Pattern::GraphTraversal { .. } => {
-                self.execute_graph_traversal(query, limit, pattern)
-            }
-            crate::query::ast::Pattern::Concatenated { .. }
-            | crate::query::ast::Pattern::Constraint { .. } => {
-                self.execute_pattern_matching(query, limit, pattern)
-            }
-            _ => {
-                self.execute_fallback(query, limit, pattern)
-            }
+        match compiled {
+            CompiledQuery::Graph(gq) => self.execute_graph_traversal(gq, limit),
+            CompiledQuery::Concat(cq) => self.execute_optimized_pattern_matching(cq, limit),
+            CompiledQuery::NamedCapture(nq) => self.execute_named_capture_matching(nq, limit),
+            CompiledQuery::Basic(bq) => self.execute_fallback(bq.as_ref(), limit, pattern),
         }
     }
 
@@ -246,25 +234,12 @@ impl ExtractorEngine {
     /// OPTIMIZED: Parallel segment processing + Single-pass collection
     fn execute_graph_traversal(
         &self,
-        query: &dyn Query,
+        graph_query: &OptimizedGraphTraversalQuery,
         limit: usize,
-        _pattern: &crate::query::ast::Pattern,
     ) -> Result<RustIeResult> {
 
         let searcher = self.reader.searcher();
         let num_segments = searcher.segment_readers().len();
-
-        let graph_query = match query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>() {
-            Some(gq) => gq,
-            None => {
-                return Ok(RustIeResult {
-                    total_hits: 0,
-                    score_docs: Vec::new(),
-                    sentence_results: Vec::new(),
-                    max_score: None,
-                });
-            }
-        };
 
         // Create weight once and share across segments. Use BM25 when searcher + terms available.
         let score_field = self.default_field();
@@ -334,24 +309,12 @@ impl ExtractorEngine {
     /// records total_hits, skips past cursor, takes page_size, and builds next_cursor.
     fn execute_graph_traversal_paginated(
         &self,
-        query: &dyn Query,
+        graph_query: &OptimizedGraphTraversalQuery,
         page_size: usize,
         after: Option<SearchCursor>,
-        _pattern: &Pattern,
     ) -> Result<PaginatedResult> {
         let searcher = self.reader.searcher();
         let num_segments = searcher.segment_readers().len();
-
-        let graph_query = match query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>() {
-            Some(gq) => gq,
-            None => {
-                return Ok(PaginatedResult {
-                    total_hits: 0,
-                    sentence_results: Vec::new(),
-                    next_cursor: None,
-                });
-            }
-        };
 
         let score_field = self.default_field();
         let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
@@ -430,63 +393,6 @@ impl ExtractorEngine {
             sentence_results,
             next_cursor: page.next_cursor,
         })
-    }
-
-    /// Execute pattern matching queries using token sequence matching
-    fn execute_pattern_matching(
-        &self,
-        query: &dyn Query,
-        limit: usize,
-        pattern: &crate::query::ast::Pattern,
-    ) -> Result<RustIeResult> {
-        if let Some(pattern_query) = query.as_any().downcast_ref::<RustieConcatQuery>() {
-            return self.execute_optimized_pattern_matching(pattern_query, limit);
-        }
-
-        if let Some(named_query) = query.as_any().downcast_ref::<RustieNamedCaptureQuery>() {
-            return self.execute_named_capture_matching(named_query, limit);
-        }
-
-        let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(query, &TopDocs::with_limit(limit))
-            .map_err(anyhow::Error::from)?;
-
-        let mut sentence_results = Vec::new();
-
-        for (score, doc_address) in top_docs {
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                let tokens = self.extract_field_values(&doc, FIELD_WORD);
-
-                let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
-
-                let mut pattern_matches = Vec::new();
-                for (i, &pos) in match_positions.iter().enumerate() {
-                    let span = crate::types::Span {
-                        start: pos,
-                        end: pos + 1,
-                    };
-                    let capture =
-                        crate::types::NamedCapture::new(format!("c{}", i), span.clone());
-                    pattern_matches
-                        .push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));
-                }
-
-                sentence_result.matches = pattern_matches;
-                sentence_results.push(sentence_result);
-            }
-        }
-
-        let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
-            .into_iter()
-            .map(|r| {
-                let score = r.score;
-                (r, score)
-            })
-            .collect();
-
-        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
     }
 
     /// Execute optimized pattern matching queries using custom scorer

@@ -10,9 +10,8 @@ pub struct QueryParser {
 }
 
 impl QueryParser {
-    pub fn new(_default_field: String) -> Self {
-        Self {
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 
     pub fn parse_query(&self, query: &str) -> Result<Pattern> {
@@ -51,7 +50,7 @@ mod tests {
     use crate::query::ast::{Constraint, Traversal};
 
     fn parser() -> QueryParser {
-        QueryParser::new("word".to_string())
+        QueryParser::new()
     }
 
     // ==================== Valid Query Tests ====================
@@ -369,8 +368,7 @@ mod tests {
 
     #[test]
     fn test_parser_new_creates_valid_instance() {
-        let parser = QueryParser::new("lemma".to_string());
-        // Parser should be created with any field name
+        let parser = QueryParser::new();
         let result = parser.parse_query("[]");
         assert!(result.is_ok());
     }
