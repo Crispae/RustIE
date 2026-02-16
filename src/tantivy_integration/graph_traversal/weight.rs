@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tantivy::{
-    query::{Weight, Scorer},
+    query::{Weight, Scorer, Bm25Weight},
     schema::{Field, Schema, IndexRecordOption},
     DocId, DocSet, Score, SegmentReader,
     Result as TantivyResult,
@@ -73,9 +73,14 @@ pub(crate) struct OptimizedGraphTraversalWeight {
     dst_collapse: Option<CollapsedSpec>,
     /// Cached compiled regex automata (shared across segments, thread-safe)
     regex_cache: RegexCache,
+    /// BM25 weight for scoring (IDF + field norms). None when no terms or scoring disabled.
+    bm25_weight: Option<Bm25Weight>,
+    /// Field used for field norms (e.g. word). Must have indexed field norms.
+    score_field: Field,
 }
 
 impl OptimizedGraphTraversalWeight {
+    /// Build weight without BM25 (e.g. when only cache is available). Scorer will use Option B.
     pub fn new(
         dependencies_binary_field: Field,
         flat_steps: Vec<FlatPatternStep>,
@@ -83,6 +88,8 @@ impl OptimizedGraphTraversalWeight {
         src_collapse: Option<CollapsedSpec>,
         dst_collapse: Option<CollapsedSpec>,
         regex_cache: RegexCache,
+        bm25_weight: Option<Bm25Weight>,
+        score_field: Field,
     ) -> Self {
         Self {
             dependencies_binary_field,
@@ -91,6 +98,8 @@ impl OptimizedGraphTraversalWeight {
             src_collapse,
             dst_collapse,
             regex_cache,
+            bm25_weight,
+            score_field,
         }
     }
 
@@ -335,6 +344,14 @@ impl OptimizedGraphTraversalWeight {
             }
         }
 
+        let fieldnorm_reader = reader
+            .get_fieldnorms_reader(self.score_field)
+            .ok();
+        let boosted_bm25 = self
+            .bm25_weight
+            .as_ref()
+            .map(|w| w.clone().boost_by(boost));
+
         let mut scorer = OptimizedGraphTraversalScorer::new(
             src_driver,
             dst_driver,
@@ -351,6 +368,8 @@ impl OptimizedGraphTraversalWeight {
             self.src_collapse.clone(),
             self.dst_collapse.clone(),
             constraint_fast_fields,
+            boosted_bm25,
+            fieldnorm_reader,
         );
 
         // Advance to the first document

@@ -13,10 +13,15 @@ pub mod constants;
 pub mod core;
 pub mod document;
 pub mod execution;
+pub mod pagination_driver;
 pub mod schema;
 
 // Re-export main types for convenience
 pub use config::{FieldConfig, SchemaConfig};
 pub use constants::*;
 pub use core::ExtractorEngine;
+pub use execution::PaginatedResult;
 pub use schema::create_schema_from_yaml;
+
+#[cfg(test)]
+mod tests;

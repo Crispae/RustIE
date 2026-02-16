@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use crate::results::RustIeResult;
-use crate::types::{Span, SpanWithCaptures, NamedCapture};
+use crate::types::{Span, SpanWithCaptures, NamedCapture, SearchCursor};
 
 /// Request model for querying documents
 #[derive(Debug, Deserialize, ToSchema)]
@@ -124,6 +124,46 @@ pub struct StatsResponse {
 
 fn default_limit() -> usize {
     10
+}
+
+/// Cursor for the next page of paginated search (alias for API; same shape as SearchCursor).
+pub type AfterCursor = SearchCursor;
+
+/// Request for Odinson-style paginated search.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PaginatedQueryRequest {
+    /// The Odinson query string to execute (must be a simple pattern: constraint, assertion, disjunctive, repetition).
+    #[schema(example = "[entity=/B-Gene/]")]
+    pub query: String,
+    /// Page size (default 15).
+    #[serde(default = "default_page_size")]
+    #[schema(example = 15, default = 15)]
+    pub page_size: usize,
+    /// Cursor from the previous page's response; omit for the first page.
+    pub after: Option<AfterCursor>,
+}
+
+fn default_page_size() -> usize {
+    15
+}
+
+/// Response for paginated search with total_hits and next_cursor.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PaginatedQueryResponse {
+    /// The original query string
+    pub query: String,
+    /// Query execution duration in seconds
+    pub duration: f32,
+    /// Total number of matching documents (all pages)
+    pub total_hits: usize,
+    /// Number of results in this page
+    pub result_count: usize,
+    /// Maximum score among results in this page
+    pub max_score: Option<f32>,
+    /// Results for the current page only
+    pub results: Vec<DocumentResult>,
+    /// Cursor for the next page; absent if this is the last page
+    pub next_cursor: Option<AfterCursor>,
 }
 
 impl From<RustIeResult> for QueryResponse {

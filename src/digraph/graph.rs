@@ -618,4 +618,100 @@ mod tests {
         
         assert!(!fail_matcher.matches(0, &vocab));
     }
+
+    // ==================== Property-Based Tests ====================
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Strategy: generate small valid dependency label names
+        fn label_name() -> impl Strategy<Value = String> {
+            "[a-z]{2,8}".prop_map(|s| s)
+        }
+
+        proptest! {
+            /// Vocabulary: to_bytes → from_bytes preserves all terms and IDs
+            #[test]
+            fn vocabulary_serialization_roundtrip(
+                terms in prop::collection::vec(label_name(), 1..20)
+            ) {
+                let mut vocab = Vocabulary::new();
+                for term in &terms {
+                    vocab.get_or_create_id(term);
+                }
+
+                let bytes = vocab.to_bytes().expect("serialization should not fail");
+                let restored = Vocabulary::from_bytes(&bytes).expect("deserialization should not fail");
+
+                prop_assert_eq!(vocab.len(), restored.len(),
+                    "Vocabulary length mismatch after roundtrip");
+
+                for term in &terms {
+                    prop_assert_eq!(
+                        vocab.get_id(term), restored.get_id(term),
+                        "ID mismatch for term '{}' after roundtrip", term
+                    );
+                }
+            }
+
+            /// edge_count matches the number of unique edges inserted
+            #[test]
+            fn edge_count_matches_insertions(
+                edges in prop::collection::vec(
+                    (0..10usize, 0..10usize, label_name()),
+                    0..30
+                )
+            ) {
+                let mut graph = DirectedGraph::new();
+
+                // Ensure nodes exist
+                for i in 0..10 {
+                    graph.add_node(i);
+                }
+
+                let mut unique_edges = std::collections::HashSet::new();
+                for (from, to, label) in &edges {
+                    // Deduplicate: DirectedGraph stores edges without checking duplicates,
+                    // so we insert each unique (from, to, label) only once.
+                    if unique_edges.insert((*from, *to, label.clone())) {
+                        graph.add_edge(*from, *to, label);
+                    }
+                }
+
+                prop_assert_eq!(
+                    graph.edge_count(), unique_edges.len(),
+                    "edge_count should equal number of unique edges"
+                );
+            }
+
+            /// All outgoing neighbor indices should be valid node indices
+            #[test]
+            fn outgoing_neighbors_are_valid_nodes(
+                edges in prop::collection::vec(
+                    (0..5usize, 0..5usize, label_name()),
+                    0..15
+                )
+            ) {
+                let mut graph = DirectedGraph::new();
+                for i in 0..5 {
+                    graph.add_node(i);
+                }
+                for (from, to, label) in &edges {
+                    graph.add_edge(*from, *to, label);
+                }
+
+                let node_count = graph.node_count();
+                for node_id in 0..node_count {
+                    if let Some(out_edges) = graph.outgoing(node_id) {
+                        for &neighbor in out_edges.chunks(2).map(|c| &c[0]) {
+                            prop_assert!(neighbor < node_count,
+                                "Outgoing neighbor {} from node {} exceeds node_count {}",
+                                neighbor, node_id, node_count);
+                        }
+                    }
+                }
+            }
+        }
+    }
 } 
