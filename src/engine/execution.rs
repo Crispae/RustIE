@@ -2,6 +2,7 @@
 
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
+use crate::engine::pagination_driver::{PaginationDriver, Paginatable};
 use crate::results::rustie_results::{RustIeResult, SentenceResult};
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, RustieConcatWeight};
 use crate::tantivy_integration::named_capture_query::{
@@ -19,7 +20,7 @@ use anyhow::{anyhow, Result};
 use log;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
@@ -90,6 +91,23 @@ impl Ord for ScoredSentence {
             .unwrap_or(Ordering::Equal)
             .then_with(|| self.address.segment_ord.cmp(&other.address.segment_ord))
             .then_with(|| self.address.doc_id.cmp(&other.address.doc_id))
+    }
+}
+
+impl Paginatable for ScoredSentence {
+    fn score(&self) -> f32 {
+        self.score
+    }
+
+    fn doc_address(&self) -> DocAddress {
+        self.address
+    }
+
+    fn dedup_key(&self) -> Option<(String, String)> {
+        Some((
+            self.sentence_result.document_id.to_string(),
+            self.sentence_result.sentence_id.to_string(),
+        ))
     }
 }
 
@@ -184,18 +202,17 @@ impl ExtractorEngine {
             sentence_results.push(result);
         }
 
-        let next_cursor = if !sentence_results.is_empty()
-            && sentence_results.len() == page_size
-            && search_result.total_hits > page_size
-        {
-            search_result.scored_docs.last().map(|last| SearchCursor {
-                segment_ord: last.address.segment_ord,
-                doc_id: last.address.doc_id,
-                score: last.score,
-            })
-        } else {
-            None
-        };
+        let next_cursor = search_result
+            .scored_docs
+            .last()
+            .and_then(|last| {
+                PaginationDriver::next_cursor_for_page(
+                    last,
+                    search_result.total_hits,
+                    page_size,
+                    search_result.scored_docs.len(),
+                )
+            });
 
         Ok(PaginatedResult {
             total_hits: search_result.total_hits,
@@ -395,47 +412,19 @@ impl ExtractorEngine {
 
         all_scored.sort();
 
-        let mut seen: HashSet<(Arc<str>, Arc<str>)> = HashSet::new();
-        all_scored.retain(|ss| seen.insert(ss.dedup_key()));
-
-        let total_hits = all_scored.len();
-
-        let after_index = match &after {
-            Some(cursor) => all_scored
-                .iter()
-                .position(|ss| !ss.as_scored_doc().should_skip(cursor))
-                .unwrap_or(all_scored.len()),
-            None => 0,
-        };
-
-        let page: Vec<ScoredSentence> = all_scored
-            .into_iter()
-            .skip(after_index)
-            .take(page_size)
-            .collect();
-
-        let next_cursor =
-            if page.len() == page_size && after_index + page_size < total_hits {
-                page.last().map(|last| {
-                    SearchCursor::new(
-                        last.address.segment_ord,
-                        last.address.doc_id,
-                        last.score,
-                    )
-                })
-            } else {
-                None
-            };
+        let driver = PaginationDriver::new(page_size, after);
+        let page = driver.paginate(all_scored);
 
         let sentence_results = page
+            .items
             .into_iter()
             .map(|ss| ss.sentence_result)
             .collect();
 
         Ok(PaginatedResult {
-            total_hits,
+            total_hits: page.total_hits,
             sentence_results,
-            next_cursor,
+            next_cursor: page.next_cursor,
         })
     }
 
@@ -700,7 +689,7 @@ impl ExtractorEngine {
 #[cfg(test)]
 mod graph_pagination_tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     fn make_sentence_result(
         document_id: &str,
@@ -835,5 +824,155 @@ mod graph_pagination_tests {
 
         let total_seen = page1.len() + page2.len() + page3.len();
         assert_eq!(total_seen, total_hits);
+    }
+}
+
+#[cfg(test)]
+mod unified_pagination_tests {
+    use super::*;
+    use crate::engine::pagination_driver::PaginationDriver;
+    use crate::tantivy_integration::paging_collector::ScoredDoc;
+    use std::collections::HashMap;
+    use tantivy::DocAddress;
+
+    fn make_sentence_result(
+        document_id: &str,
+        sentence_id: &str,
+        score: f32,
+    ) -> SentenceResult {
+        SentenceResult::new(
+            Arc::from(document_id),
+            Arc::from(sentence_id),
+            score,
+            vec![],
+            HashMap::new(),
+        )
+    }
+
+    fn make_pair(
+        score: f32,
+        seg: u32,
+        doc: u32,
+        doc_id: &str,
+        sent_id: &str,
+    ) -> (ScoredDoc, ScoredSentence) {
+        let scored_doc = ScoredDoc {
+            score,
+            address: DocAddress::new(seg, doc),
+        };
+        let scored_sentence = ScoredSentence::new(
+            score,
+            DocAddress::new(seg, doc),
+            make_sentence_result(doc_id, sent_id, score),
+        );
+        (scored_doc, scored_sentence)
+    }
+
+    #[test]
+    fn basic_and_graph_produce_same_cursor() {
+        let pairs: Vec<_> = vec![
+            make_pair(5.0, 0, 1, "d1", "s1"),
+            make_pair(4.5, 1, 1, "d2", "s1"),
+            make_pair(4.0, 0, 2, "d3", "s1"),
+            make_pair(3.0, 0, 3, "d4", "s1"),
+            make_pair(2.0, 1, 2, "d5", "s1"),
+        ];
+
+        let scored_docs: Vec<ScoredDoc> = pairs.iter().map(|(sd, _)| sd.clone()).collect();
+        let mut scored_sentences: Vec<ScoredSentence> =
+            pairs.iter().map(|(_, ss)| ss.clone()).collect();
+        scored_sentences.sort();
+
+        let driver = PaginationDriver::new(2, None);
+
+        let basic_page = driver.paginate(scored_docs);
+        let graph_page = driver.paginate(scored_sentences);
+
+        assert_eq!(basic_page.total_hits, graph_page.total_hits);
+        assert_eq!(basic_page.items.len(), graph_page.items.len());
+        assert_eq!(basic_page.next_cursor, graph_page.next_cursor);
+
+        for (basic_item, graph_item) in basic_page.items.iter().zip(graph_page.items.iter()) {
+            assert_eq!(basic_item.doc_address(), graph_item.doc_address());
+            assert!((basic_item.score() - graph_item.score()).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn cursor_from_basic_works_in_graph_and_vice_versa() {
+        let pairs: Vec<_> = vec![
+            make_pair(5.0, 0, 1, "d1", "s1"),
+            make_pair(4.5, 1, 1, "d2", "s1"),
+            make_pair(4.0, 0, 2, "d3", "s1"),
+            make_pair(3.0, 0, 3, "d4", "s1"),
+        ];
+
+        let scored_docs: Vec<ScoredDoc> = pairs.iter().map(|(sd, _)| sd.clone()).collect();
+        let mut scored_sentences: Vec<ScoredSentence> =
+            pairs.iter().map(|(_, ss)| ss.clone()).collect();
+        scored_sentences.sort();
+
+        let driver1 = PaginationDriver::new(2, None);
+        let basic_page1 = driver1.paginate(scored_docs);
+        let cursor = basic_page1.next_cursor.unwrap();
+
+        let driver2 = PaginationDriver::new(2, Some(cursor.clone()));
+        let graph_page2 = driver2.paginate(scored_sentences);
+
+        assert_eq!(graph_page2.items.len(), 2);
+        assert!((graph_page2.items[0].score() - 4.0).abs() < 1e-6);
+        assert!((graph_page2.items[1].score() - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_input_produces_no_cursor() {
+        let driver = PaginationDriver::new(10, None);
+
+        let basic_page: crate::engine::pagination_driver::PaginatedPage<ScoredDoc> =
+            driver.paginate(vec![]);
+        assert_eq!(basic_page.total_hits, 0);
+        assert!(basic_page.items.is_empty());
+        assert!(basic_page.next_cursor.is_none());
+
+        let graph_page: crate::engine::pagination_driver::PaginatedPage<ScoredSentence> =
+            driver.paginate(vec![]);
+        assert_eq!(graph_page.total_hits, 0);
+        assert!(graph_page.items.is_empty());
+        assert!(graph_page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn page_size_larger_than_results() {
+        let pairs: Vec<_> = vec![
+            make_pair(5.0, 0, 1, "d1", "s1"),
+            make_pair(4.0, 0, 2, "d2", "s1"),
+        ];
+
+        let scored_docs: Vec<ScoredDoc> = pairs.iter().map(|(sd, _)| sd.clone()).collect();
+
+        let driver = PaginationDriver::new(10, None);
+        let page = driver.paginate(scored_docs);
+
+        assert_eq!(page.total_hits, 2);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn cursor_past_all_items_returns_empty() {
+        let pairs: Vec<_> = vec![
+            make_pair(5.0, 0, 1, "d1", "s1"),
+            make_pair(4.0, 0, 2, "d2", "s1"),
+        ];
+
+        let scored_docs: Vec<ScoredDoc> = pairs.iter().map(|(sd, _)| sd.clone()).collect();
+
+        let cursor = SearchCursor::new(1, 999, 1.0);
+        let driver = PaginationDriver::new(10, Some(cursor));
+        let page = driver.paginate(scored_docs);
+
+        assert_eq!(page.total_hits, 2);
+        assert!(page.items.is_empty());
+        assert!(page.next_cursor.is_none());
     }
 }

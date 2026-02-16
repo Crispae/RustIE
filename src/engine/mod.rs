@@ -13,6 +13,7 @@ pub mod constants;
 pub mod core;
 pub mod document;
 pub mod execution;
+pub mod pagination_driver;
 pub mod schema;
 
 // Re-export main types for convenience
