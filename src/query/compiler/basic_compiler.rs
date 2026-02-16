@@ -71,25 +71,18 @@ impl BasicCompiler {
 
     fn compile_assertion(&self, assertion: &Assertion) -> Result<Box<dyn Query>> {
         // Get the default field for assertion queries
-        let default_field = self.schema.get_field("word")
-            .map_err(|_| anyhow!("Default field 'word' not found in schema"))?;
-
         match assertion {
             Assertion::PositiveLookahead(pattern) => {
-                // Positive lookahead - next token must match pattern
-                Ok(Box::new(LookaheadQuery::positive_lookahead(pattern.as_ref().clone(), default_field)))
+                Ok(Box::new(LookaheadQuery::positive_lookahead(pattern.as_ref().clone())))
             }
             Assertion::NegativeLookahead(pattern) => {
-                // Negative lookahead - next token must NOT match pattern
-                Ok(Box::new(LookaheadQuery::negative_lookahead(pattern.as_ref().clone(), default_field)))
+                Ok(Box::new(LookaheadQuery::negative_lookahead(pattern.as_ref().clone())))
             }
             Assertion::PositiveLookbehind(pattern) => {
-                // Positive lookbehind - previous token must match pattern
-                Ok(Box::new(LookaheadQuery::positive_lookbehind(pattern.as_ref().clone(), default_field)))
+                Ok(Box::new(LookaheadQuery::positive_lookbehind(pattern.as_ref().clone())))
             }
             Assertion::NegativeLookbehind(pattern) => {
-                // Negative lookbehind - previous token must NOT match pattern
-                Ok(Box::new(LookaheadQuery::negative_lookbehind(pattern.as_ref().clone(), default_field)))
+                Ok(Box::new(LookaheadQuery::negative_lookbehind(pattern.as_ref().clone())))
             }
         }
     }
@@ -153,7 +146,7 @@ impl BasicCompiler {
                 // This ensures we can match terms that were indexed with positions
                 Ok(Box::new(TermQuery::new(term, tantivy::schema::IndexRecordOption::WithFreqsAndPositions)))
             }
-            Matcher::Regex { pattern, regex } => {
+            Matcher::Regex { pattern, regex: _ } => {
                 // Strip /.../ delimiters before processing
                 let clean_pattern = pattern.trim_start_matches('/').trim_end_matches('/');
                 

@@ -48,11 +48,6 @@ impl DocumentParser {
         self.schema.get_field(field_name).is_ok()
     }
 
-    /// Get a field from schema with a descriptive error
-    fn get_field_checked(&self, field_name: &str) -> Result<tantivy::schema::Field> {
-        crate::engine::constants::get_required_field(&self.schema, field_name)
-    }
-
     /// Validate document structure before indexing
     /// Checks for valid edge indices and consistent token counts
     pub fn validate_document(&self, doc: &RustDoc) -> Result<()> {
@@ -70,7 +65,7 @@ impl DocumentParser {
                             );
                         }
                     }
-                    DocField::GraphField { name, edges, .. } => {
+                    DocField::GraphField { edges, .. } => {
                         // Validate edge indices are within bounds
                         for (from, to, rel) in edges {
                             let from_idx = *from as usize;

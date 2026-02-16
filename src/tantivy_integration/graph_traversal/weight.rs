@@ -256,9 +256,6 @@ impl OptimizedGraphTraversalWeight {
             .ok()
             .flatten();
 
-        // Cache the store reader (still needed for constraint token extraction)
-        let store_reader = reader.get_store_reader(1)?;
-
         // Pre-extract constraint field names from flat_steps (computed once, not per document)
         fn unwrap_pattern_for_field_name(pat: &crate::query::ast::Pattern) -> String {
             use crate::query::ast::Pattern;
@@ -355,9 +352,7 @@ impl OptimizedGraphTraversalWeight {
         let mut scorer = OptimizedGraphTraversalScorer::new(
             src_driver,
             dst_driver,
-            reader.clone(),
             dependencies_fast_field,
-            store_reader,
             boost,
             self.flat_steps.clone(),
             constraint_field_names,

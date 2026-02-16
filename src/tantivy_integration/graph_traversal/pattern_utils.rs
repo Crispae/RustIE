@@ -22,11 +22,11 @@ pub fn flatten_graph_traversal_pattern(pattern: &crate::query::ast::Pattern, ste
         Pattern::Constraint(_) => {
             steps.push(FlatPatternStep::Constraint(pattern.clone()));
         }
-        Pattern::NamedCapture { pattern: inner, .. } => {
+        Pattern::NamedCapture { pattern: _inner, .. } => {
             // Wrap the constraint step with the capture
             steps.push(FlatPatternStep::Constraint(pattern.clone()));
         }
-        Pattern::Repetition { pattern: inner, .. } => {
+        Pattern::Repetition { pattern: _inner, .. } => {
             // For repetitions, add the constraint step
             steps.push(FlatPatternStep::Constraint(pattern.clone()));
         }

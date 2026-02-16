@@ -8,7 +8,6 @@
 //! The module is organized into several submodules:
 //!
 //! - [`types`]: Core data structures and atomic counters for statistics
-//! - [`logging`]: Debug and performance logging helpers
 //! - [`intersection`]: Position intersection algorithms (galloping, linear)
 //! - [`candidate_driver`]: CandidateDriver trait and implementations
 //! - [`query`]: OptimizedGraphTraversalQuery implementation
@@ -18,7 +17,6 @@
 //! - [`stats`]: Performance statistics collection and reporting
 
 pub mod types;
-pub mod logging;
 pub mod intersection;
 pub mod candidate_driver;
 pub mod query;

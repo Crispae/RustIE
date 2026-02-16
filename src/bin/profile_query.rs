@@ -9,7 +9,6 @@
 
 use rustie::ExtractorEngine;
 use rustie::tantivy_integration::graph_traversal::GraphTraversalStats;
-use std::path::Path;
 use clap::Parser;
 use anyhow::Result;
 

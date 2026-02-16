@@ -295,7 +295,7 @@ impl ExtractorEngine {
 
         
             // MERGE: Combine results from all segments
-        let mut all_results: Vec<(SentenceResult, Score)> = segment_results
+        let all_results: Vec<(SentenceResult, Score)> = segment_results
             .into_iter()
             .flat_map(|(results, _)| results)
             .collect();
@@ -448,7 +448,7 @@ impl ExtractorEngine {
             })
             .collect();
 
-        let mut all_results: Vec<(SentenceResult, Score)> =
+        let all_results: Vec<(SentenceResult, Score)> =
             segment_results.into_iter().flatten().collect();
 
         Ok(Self::build_result_from_sentence_results(all_results, limit))

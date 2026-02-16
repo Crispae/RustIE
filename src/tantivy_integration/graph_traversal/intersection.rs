@@ -200,13 +200,6 @@ impl TwoPhaseIntersection {
         }
     }
 
-    /// Get the current aligned document ID.
-    /// Returns TERMINATED if exhausted or not yet started.
-    #[inline]
-    pub fn doc(&self) -> DocId {
-        self.current_doc
-    }
-
     /// Get the source driver (for position access after alignment).
     #[inline]
     pub fn src_driver(&self) -> &dyn CandidateDriver {
@@ -219,18 +212,6 @@ impl TwoPhaseIntersection {
         self.dst_driver.as_ref()
     }
 
-    /// Get mutable access to source driver.
-    #[inline]
-    pub fn src_driver_mut(&mut self) -> &mut Box<dyn CandidateDriver> {
-        &mut self.src_driver
-    }
-
-    /// Get mutable access to destination driver.
-    #[inline]
-    pub fn dst_driver_mut(&mut self) -> &mut Box<dyn CandidateDriver> {
-        &mut self.dst_driver
-    }
-
     /// Advance to the next candidate document where both drivers align.
     ///
     /// This is Phase 1 of the two-phase pattern. After this returns a valid
@@ -239,7 +220,7 @@ impl TwoPhaseIntersection {
     /// Returns `tantivy::TERMINATED` when exhausted.
     pub fn advance(&mut self) -> DocId {
         // Get next candidate from source
-        let mut candidate = if !self.started {
+        let candidate = if !self.started {
             self.started = true;
             self.src_driver.seek(0)
         } else {
@@ -339,101 +320,5 @@ impl TwoPhaseIntersection {
         }
     }
 
-    /// Iterate with verification callback, implementing the full two-phase pattern.
-    ///
-    /// This method combines Phase 1 (intersection) and Phase 2 (verification)
-    /// into a single iteration. The callback receives the aligned document ID
-    /// and returns `true` if the document passes verification.
-    ///
-    /// # Arguments
-    ///
-    /// * `verify` - Closure that performs expensive Phase 2 verification.
-    ///              Receives the aligned DocId, returns `true` if valid.
-    ///
-    /// # Returns
-    ///
-    /// The first document that passes both phases, or `TERMINATED` if exhausted.
-    pub fn advance_with_verify<F>(&mut self, mut verify: F) -> DocId
-    where
-        F: FnMut(DocId) -> bool,
-    {
-        loop {
-            let candidate = self.advance();
-            if candidate == tantivy::TERMINATED {
-                return tantivy::TERMINATED;
-            }
 
-            if verify(candidate) {
-                return candidate;
-            }
-            // Verification failed, continue to next candidate
-            // Note: advance() will be called again in next iteration
-        }
-    }
-
-    /// Seek with verification callback.
-    ///
-    /// Similar to `advance_with_verify` but starts from a target document.
-    pub fn seek_with_verify<F>(&mut self, target: DocId, mut verify: F) -> DocId
-    where
-        F: FnMut(DocId) -> bool,
-    {
-        let mut candidate = self.seek(target);
-
-        loop {
-            if candidate == tantivy::TERMINATED {
-                return tantivy::TERMINATED;
-            }
-
-            if verify(candidate) {
-                return candidate;
-            }
-
-            candidate = self.advance_past_current();
-        }
-    }
-
-    /// Iterate with pruning support for top-k queries.
-    ///
-    /// This implements a `for_each_pruning`-style pattern where:
-    /// 1. Documents are iterated in order
-    /// 2. A callback processes each verified match
-    /// 3. The callback can return a threshold to skip documents below a score
-    ///
-    /// # Arguments
-    ///
-    /// * `verify_and_score` - Returns `Some(score)` if document passes verification
-    /// * `callback` - Processes (doc, score), returns new threshold or `None` to stop
-    /// * `initial_threshold` - Starting score threshold for pruning
-    ///
-    /// # Note
-    ///
-    /// Block-level score pruning is not yet implemented but the interface
-    /// supports future optimization via block_max_score checks.
-    pub fn for_each_pruning<V, C>(
-        &mut self,
-        mut verify_and_score: V,
-        mut callback: C,
-        _initial_threshold: f32,
-    ) where
-        V: FnMut(DocId) -> Option<f32>,
-        C: FnMut(DocId, f32) -> Option<f32>,
-    {
-        loop {
-            let candidate = self.advance();
-            if candidate == tantivy::TERMINATED {
-                return;
-            }
-
-            // Phase 2: Verify and compute score
-            if let Some(score) = verify_and_score(candidate) {
-                // TODO: Block-level pruning - skip if block_max_score < threshold
-                // This requires access to block-max scores from the underlying postings
-
-                if callback(candidate, score).is_none() {
-                    return; // Callback requested early termination
-                }
-            }
-        }
-    }
 }
