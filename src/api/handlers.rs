@@ -1,12 +1,22 @@
 use actix_web::{web, HttpResponse, Result};
 use crate::engine::ExtractorEngine;
-use crate::api::models::{QueryRequest, QueryResponse, ErrorResponse, DocumentResult, MatchResult, HealthResponse, StatsResponse};
+use crate::api::models::{
+    DocumentResult, ErrorResponse, HealthResponse, MatchResult, PaginatedQueryRequest,
+    PaginatedQueryResponse, QueryRequest, QueryResponse, StatsResponse,
+};
+use crate::results::rustie_results::SentenceResult;
 use std::time::Instant;
 
 /// Send-safe result type returned from the blocking closure (HttpResponse is not Send in actix-web 4).
 enum QueryOutcome {
     Success(QueryResponse),
     Error(ErrorResponse),
+}
+
+/// Outcome of paginated search (Send-safe). Error carries (response, true) if 400 (unsupported pattern).
+enum PaginatedOutcome {
+    Success(PaginatedQueryResponse),
+    Error((ErrorResponse, bool)),
 }
 
 /// Validate that the query string is non-empty, returning a BadRequest response if invalid.
@@ -130,6 +140,70 @@ pub async fn simple_query(
     Ok(outcome_to_response(outcome))
 }
 
+/// Paginated search (Odinson-style): first page or next page via cursor.
+#[utoipa::path(
+    post,
+    path = "/api/v1/search",
+    tag = "Query",
+    request_body = PaginatedQueryRequest,
+    responses(
+        (status = 200, description = "Paginated search executed successfully", body = PaginatedQueryResponse),
+        (status = 400, description = "Invalid query or unsupported pattern", body = ErrorResponse),
+        (status = 500, description = "Query execution failed", body = ErrorResponse)
+    )
+)]
+pub async fn paginated_search(
+    engine: web::Data<ExtractorEngine>,
+    body: web::Json<PaginatedQueryRequest>,
+) -> Result<HttpResponse> {
+    if let Some(err_response) = validate_query(&body.query) {
+        return Ok(err_response);
+    }
+    let engine = engine.clone();
+    let query = body.query.clone();
+    let page_size = body.page_size;
+    let after = body.after.clone();
+    let query_for_response = body.query.clone();
+    let start = Instant::now();
+    let outcome = web::block(move || {
+        match engine.query_paginated(&query, page_size, after) {
+            Ok(paginated) => {
+                let duration = start.elapsed().as_secs_f32();
+                let results = sentence_results_to_document_results(paginated.sentence_results);
+                PaginatedOutcome::Success(PaginatedQueryResponse {
+                    query: query_for_response,
+                    duration,
+                    total_hits: paginated.total_hits,
+                    result_count: results.len(),
+                    max_score: results.first().map(|r| r.score),
+                    results,
+                    next_cursor: paginated.next_cursor,
+                })
+            }
+            Err(e) => {
+                log::error!("Paginated query failed: {}", e);
+                let msg = e.to_string();
+                let is_unsupported = msg.contains("Paginated search does not support");
+                PaginatedOutcome::Error((ErrorResponse {
+                    error: msg,
+                    error_type: "QueryError".to_string(),
+                }, is_unsupported))
+            }
+        }
+    })
+    .await?;
+    Ok(match outcome {
+        PaginatedOutcome::Success(resp) => HttpResponse::Ok().json(resp),
+        PaginatedOutcome::Error((err, unsupported)) => {
+            if unsupported {
+                HttpResponse::BadRequest().json(err)
+            } else {
+                HttpResponse::InternalServerError().json(err)
+            }
+        }
+    })
+}
+
 /// Get index statistics
 #[utoipa::path(
     get,
@@ -158,6 +232,33 @@ pub async fn index_stats(engine: web::Data<ExtractorEngine>) -> Result<HttpRespo
     .await?;
 
     Ok(HttpResponse::Ok().json(stats))
+}
+
+/// Convert a list of SentenceResult into DocumentResult for API response.
+/// Must match the sentence_results branch of convert_to_detailed_results so that
+/// paginated and non-paginated endpoints return identical DocumentResult shape.
+fn sentence_results_to_document_results(
+    sentence_results: Vec<SentenceResult>,
+) -> Vec<DocumentResult> {
+    sentence_results
+        .into_iter()
+        .map(|mut sentence| {
+            let matches: Vec<MatchResult> = sentence
+                .matches
+                .into_iter()
+                .map(MatchResult::from)
+                .collect();
+            let words = sentence.fields.remove("word").unwrap_or_default();
+            DocumentResult {
+                odinson_doc: 0,
+                score: sentence.score,
+                document_id: sentence.document_id.to_string(),
+                sentence_index: sentence.sentence_id.parse().unwrap_or(0),
+                words,
+                matches,
+            }
+        })
+        .collect()
 }
 
 /// Convert RustIeResult to detailed DocumentResult with tokens and matches

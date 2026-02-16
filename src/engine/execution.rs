@@ -5,21 +5,32 @@ use crate::engine::core::ExtractorEngine;
 use crate::results::rustie_results::{RustIeResult, SentenceResult};
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, RustieConcatWeight};
 use crate::tantivy_integration::named_capture_query::{
-    RustieNamedCaptureQuery, RustieNamedCaptureScorer, RustieNamedCaptureWeight,
+    RustieNamedCaptureQuery, RustieNamedCaptureScorer,
 };
 use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalWeight,
 };
-use anyhow::Result;
+use crate::tantivy_integration::paging_collector::{
+    PaginatedSearchResult, PagingCollector, SimpleCollector,
+};
+use crate::types::SearchCursor;
+use anyhow::{anyhow, Result};
 use log;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tantivy::{
     collector::TopDocs,
-    query::{Query, Scorer, Weight},
+    query::{Query, Scorer},
     DocAddress, DocSet, Score,
 };
+
+/// Result of a paginated search: total hits, one page of sentence results, optional next cursor.
+pub struct PaginatedResult {
+    pub total_hits: usize,
+    pub sentence_results: Vec<SentenceResult>,
+    pub next_cursor: Option<SearchCursor>,
+}
 
 impl ExtractorEngine {
     
@@ -33,6 +44,99 @@ impl ExtractorEngine {
         let pattern = self.parser().parse_query(query)?;
         let tantivy_query = self.compiler().compile(query)?;
         self.execute_query(tantivy_query.as_ref(), limit, &pattern)
+    }
+
+    /// Execute a query with Odinson-style cursor-based pagination.
+    /// Only supports pattern types that use the fallback path (Assertion, Constraint, Disjunctive, Repetition).
+    /// Returns an error for GraphTraversal, Concatenated, or NamedCapture patterns.
+    pub fn query_paginated(
+        &self,
+        query: &str,
+        page_size: usize,
+        after: Option<SearchCursor>,
+    ) -> Result<PaginatedResult> {
+        let pattern = self.parser().parse_query(query)?;
+        match &pattern {
+            crate::query::ast::Pattern::GraphTraversal { .. } => {
+                return Err(anyhow!(
+                    "Paginated search does not support graph traversal patterns; use POST /api/v1/query instead"
+                ));
+            }
+            crate::query::ast::Pattern::Concatenated(..) => {
+                return Err(anyhow!(
+                    "Paginated search does not support concatenated patterns; use POST /api/v1/query instead"
+                ));
+            }
+            crate::query::ast::Pattern::NamedCapture { .. } => {
+                return Err(anyhow!(
+                    "Paginated search does not support named capture patterns; use POST /api/v1/query instead"
+                ));
+            }
+            _ => {}
+        }
+        let tantivy_query = self.compiler().compile(query)?;
+        self.execute_paginated(tantivy_query.as_ref(), page_size, after, &pattern)
+    }
+
+    /// Execute a compiled query with pagination: use paging collector, load only one page of docs.
+    fn execute_paginated(
+        &self,
+        query: &dyn Query,
+        page_size: usize,
+        after: Option<SearchCursor>,
+        pattern: &crate::query::ast::Pattern,
+    ) -> Result<PaginatedResult> {
+        let searcher = self.reader.searcher();
+        let search_result: PaginatedSearchResult = match &after {
+            None => searcher
+                .search(query, &SimpleCollector::new(page_size))
+                .map_err(anyhow::Error::from)?,
+            Some(cursor) => searcher
+                .search(query, &PagingCollector::new(page_size, cursor.clone()))
+                .map_err(anyhow::Error::from)?,
+        };
+
+        let needs_word_positions = pattern.references_field(FIELD_WORD);
+        let mut sentence_results = Vec::with_capacity(search_result.scored_docs.len());
+
+        for scored_doc in &search_result.scored_docs {
+            let doc = self.doc(scored_doc.address)?;
+            let mut result = self.extract_sentence_result(&doc, scored_doc.score)?;
+            if needs_word_positions {
+                let tokens = self.extract_field_values(&doc, FIELD_WORD);
+                let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
+                let mut matches = Vec::new();
+                for (i, &start) in match_positions.iter().enumerate() {
+                    let span = crate::types::Span {
+                        start,
+                        end: start + 1,
+                    };
+                    let capture = crate::types::NamedCapture::new(format!("c{}", i), span.clone());
+                    matches.push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));
+                }
+                result.matches = matches;
+            }
+            sentence_results.push(result);
+        }
+
+        let next_cursor = if !sentence_results.is_empty()
+            && sentence_results.len() == page_size
+            && search_result.total_hits > page_size
+        {
+            search_result.scored_docs.last().map(|last| SearchCursor {
+                segment_ord: last.address.segment_ord,
+                doc_id: last.address.doc_id,
+                score: last.score,
+            })
+        } else {
+            None
+        };
+
+        Ok(PaginatedResult {
+            total_hits: search_result.total_hits,
+            sentence_results,
+            next_cursor,
+        })
     }
 
     /// Execute a compiled query with the original pattern for match extraction

@@ -3,11 +3,15 @@ use anyhow::Result;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use crate::engine::ExtractorEngine;
-use crate::api::handlers::{health_check, query_documents, simple_query, index_stats};
-use crate::api::models::{
-    QueryRequest, QueryResponse, ErrorResponse, DocumentResult,
-    MatchResult, SpanResult, NamedCaptureResult, HealthResponse, StatsResponse
+use crate::api::handlers::{
+    health_check, index_stats, paginated_search, query_documents, simple_query,
 };
+use crate::api::models::{
+    DocumentResult, ErrorResponse, HealthResponse, MatchResult, NamedCaptureResult,
+    PaginatedQueryRequest, PaginatedQueryResponse, QueryRequest, QueryResponse,
+    SpanResult, StatsResponse,
+};
+use crate::types::SearchCursor;
 
 /// OpenAPI documentation
 #[derive(OpenApi)]
@@ -50,11 +54,13 @@ use crate::api::models::{
         crate::api::handlers::health_check,
         crate::api::handlers::query_documents,
         crate::api::handlers::simple_query,
+        crate::api::handlers::paginated_search,
         crate::api::handlers::index_stats
     ),
     components(schemas(
         QueryRequest, QueryResponse, ErrorResponse, DocumentResult,
-        MatchResult, SpanResult, NamedCaptureResult, HealthResponse, StatsResponse
+        MatchResult, SpanResult, NamedCaptureResult, HealthResponse, StatsResponse,
+        PaginatedQueryRequest, PaginatedQueryResponse, SearchCursor
     )),
     tags(
         (name = "Health", description = "Health check endpoints"),
@@ -110,6 +116,7 @@ pub async fn start_server(config: ApiConfig) -> Result<()> {
                     .route("/health", web::get().to(health_check))
                     .route("/query", web::post().to(query_documents))
                     .route("/query/{query}", web::get().to(simple_query))
+                    .route("/search", web::post().to(paginated_search))
                     .route("/stats", web::get().to(index_stats))
             )
     })

@@ -19,6 +19,7 @@ pub mod schema;
 pub use config::{FieldConfig, SchemaConfig};
 pub use constants::*;
 pub use core::ExtractorEngine;
+pub use execution::PaginatedResult;
 pub use schema::create_schema_from_yaml;
 
 #[cfg(test)]

@@ -85,6 +85,26 @@ impl Constraint {
             }
         }
     }
+
+    /// Returns true if this constraint references the given field name.
+    ///
+    /// Used to determine whether token-level position extraction is needed
+    /// for a given field. For example, a constraint on "entity" does not
+    /// reference "word", so we can skip loading word tokens entirely.
+    pub fn references_field(&self, field_name: &str) -> bool {
+        match self {
+            Constraint::Wildcard => true,
+            Constraint::Field { name, .. } => name == field_name,
+            Constraint::Fuzzy { name, .. } => name == field_name,
+            Constraint::Negated(inner) => inner.references_field(field_name),
+            Constraint::Conjunctive(constraints) => {
+                constraints.iter().any(|c| c.references_field(field_name))
+            }
+            Constraint::Disjunctive(constraints) => {
+                constraints.iter().any(|c| c.references_field(field_name))
+            }
+        }
+    }
 }
 
 /// Assertions for position-based matching (lookahead and lookbehind only)
@@ -94,6 +114,18 @@ pub enum Assertion {
     NegativeLookahead(Box<Pattern>),
     PositiveLookbehind(Box<Pattern>),
     NegativeLookbehind(Box<Pattern>),
+}
+
+impl Assertion {
+    /// Returns true if this assertion's inner pattern references the given field.
+    pub fn references_field(&self, field_name: &str) -> bool {
+        match self {
+            Assertion::PositiveLookahead(pattern) => pattern.references_field(field_name),
+            Assertion::NegativeLookahead(pattern) => pattern.references_field(field_name),
+            Assertion::PositiveLookbehind(pattern) => pattern.references_field(field_name),
+            Assertion::NegativeLookbehind(pattern) => pattern.references_field(field_name),
+        }
+    }
 }
 
 /// Graph traversal patterns for dependency parsing
@@ -146,6 +178,9 @@ impl Pattern {
                 vec![]
             }
             Pattern::Constraint(constraint) => {
+                if !constraint.references_field(field_name) {
+                    return Vec::new();
+                }
                 tokens.iter().enumerate()
                     .filter_map(|(i, token)| {
                         if constraint.matches(field_name, token) {
@@ -196,6 +231,27 @@ impl Pattern {
                 // For non-graph patterns, treat as regular pattern
                 self.extract_matching_positions(field_name, tokens)
             }
+        }
+    }
+
+    /// Returns true if this pattern references the given field name in any
+    /// constraint that would require token-level matching against that field.
+    pub fn references_field(&self, field_name: &str) -> bool {
+        match self {
+            Pattern::Assertion(assertion) => assertion.references_field(field_name),
+            Pattern::Constraint(constraint) => constraint.references_field(field_name),
+            Pattern::Disjunctive(patterns) => {
+                patterns.iter().any(|p| p.references_field(field_name))
+            }
+            Pattern::Concatenated(patterns) => {
+                patterns.iter().any(|p| p.references_field(field_name))
+            }
+            Pattern::NamedCapture { pattern, .. } => pattern.references_field(field_name),
+            Pattern::Mention { .. } => false,
+            Pattern::GraphTraversal { src, dst, .. } => {
+                src.references_field(field_name) || dst.references_field(field_name)
+            }
+            Pattern::Repetition { pattern, .. } => pattern.references_field(field_name),
         }
     }
 }
@@ -721,5 +777,325 @@ mod tests {
         let cloned = pattern.clone();
         let tokens = vec!["a".to_string()];
         assert_eq!(cloned.extract_matching_positions("word", &tokens), vec![0]);
+    }
+
+    // ==================== references_field Tests ====================
+
+    #[test]
+    fn test_constraint_wildcard_references_any_field() {
+        let c = Constraint::Wildcard;
+        assert!(c.references_field("word"));
+        assert!(c.references_field("entity"));
+        assert!(c.references_field("pos"));
+        assert!(c.references_field("anything"));
+    }
+
+    #[test]
+    fn test_constraint_field_references_own_field_only() {
+        let c = Constraint::Field {
+            name: "entity".to_string(),
+            matcher: Matcher::string("B-Gene".to_string()),
+        };
+        assert!(c.references_field("entity"));
+        assert!(!c.references_field("word"));
+        assert!(!c.references_field("pos"));
+        assert!(!c.references_field("lemma"));
+    }
+
+    #[test]
+    fn test_constraint_fuzzy_references_own_field_only() {
+        let c = Constraint::Fuzzy {
+            name: "word".to_string(),
+            matcher: "cat".to_string(),
+        };
+        assert!(c.references_field("word"));
+        assert!(!c.references_field("entity"));
+    }
+
+    #[test]
+    fn test_constraint_negated_delegates() {
+        let inner = Constraint::Field {
+            name: "entity".to_string(),
+            matcher: Matcher::string("B-Gene".to_string()),
+        };
+        let c = Constraint::Negated(Box::new(inner));
+        assert!(c.references_field("entity"));
+        assert!(!c.references_field("word"));
+    }
+
+    #[test]
+    fn test_constraint_conjunctive_any_child() {
+        let c = Constraint::Conjunctive(vec![
+            Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("hello".to_string()),
+            },
+            Constraint::Field {
+                name: "entity".to_string(),
+                matcher: Matcher::string("B-Gene".to_string()),
+            },
+        ]);
+        assert!(c.references_field("word"));
+        assert!(c.references_field("entity"));
+        assert!(!c.references_field("pos"));
+    }
+
+    #[test]
+    fn test_constraint_disjunctive_any_child() {
+        let c = Constraint::Disjunctive(vec![
+            Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("NN".to_string()),
+            },
+            Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("NNS".to_string()),
+            },
+        ]);
+        assert!(c.references_field("pos"));
+        assert!(!c.references_field("word"));
+    }
+
+    #[test]
+    fn test_constraint_nested_negated_conjunctive() {
+        let c = Constraint::Negated(Box::new(Constraint::Conjunctive(vec![
+            Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("cat".to_string()),
+            },
+            Constraint::Field {
+                name: "entity".to_string(),
+                matcher: Matcher::string("B-Gene".to_string()),
+            },
+        ])));
+        assert!(c.references_field("word"));
+        assert!(c.references_field("entity"));
+        assert!(!c.references_field("pos"));
+    }
+
+    #[test]
+    fn test_pattern_constraint_references_field() {
+        let p = Pattern::Constraint(Constraint::Field {
+            name: "entity".to_string(),
+            matcher: Matcher::string("B-Gene".to_string()),
+        });
+        assert!(p.references_field("entity"));
+        assert!(!p.references_field("word"));
+    }
+
+    #[test]
+    fn test_pattern_wildcard_references_any_field() {
+        let p = Pattern::Constraint(Constraint::Wildcard);
+        assert!(p.references_field("word"));
+        assert!(p.references_field("entity"));
+        assert!(p.references_field("anything"));
+    }
+
+    #[test]
+    fn test_pattern_disjunctive_references_field() {
+        let p = Pattern::Disjunctive(vec![
+            Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("cat".to_string()),
+            }),
+            Pattern::Constraint(Constraint::Field {
+                name: "entity".to_string(),
+                matcher: Matcher::string("B-Gene".to_string()),
+            }),
+        ]);
+        assert!(p.references_field("word"));
+        assert!(p.references_field("entity"));
+        assert!(!p.references_field("pos"));
+    }
+
+    #[test]
+    fn test_pattern_concatenated_references_field() {
+        let p = Pattern::Concatenated(vec![
+            Pattern::Constraint(Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("DET".to_string()),
+            }),
+            Pattern::Constraint(Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("NN".to_string()),
+            }),
+        ]);
+        assert!(p.references_field("pos"));
+        assert!(!p.references_field("word"));
+    }
+
+    #[test]
+    fn test_pattern_named_capture_delegates() {
+        let p = Pattern::NamedCapture {
+            name: "subject".to_string(),
+            pattern: Box::new(Pattern::Constraint(Constraint::Field {
+                name: "entity".to_string(),
+                matcher: Matcher::string("B-Gene".to_string()),
+            })),
+        };
+        assert!(p.references_field("entity"));
+        assert!(!p.references_field("word"));
+    }
+
+    #[test]
+    fn test_pattern_mention_references_no_field() {
+        let p = Pattern::Mention {
+            arg_name: Some("arg".to_string()),
+            label: "Person".to_string(),
+        };
+        assert!(!p.references_field("word"));
+        assert!(!p.references_field("entity"));
+        assert!(!p.references_field("anything"));
+    }
+
+    #[test]
+    fn test_pattern_graph_traversal_checks_src_and_dst() {
+        let p = Pattern::GraphTraversal {
+            src: Box::new(Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("run".to_string()),
+            })),
+            traversal: Traversal::OutgoingWildcard,
+            dst: Box::new(Pattern::Constraint(Constraint::Field {
+                name: "entity".to_string(),
+                matcher: Matcher::string("B-Gene".to_string()),
+            })),
+        };
+        assert!(p.references_field("word"));
+        assert!(p.references_field("entity"));
+        assert!(!p.references_field("pos"));
+    }
+
+    #[test]
+    fn test_pattern_graph_traversal_src_only() {
+        let p = Pattern::GraphTraversal {
+            src: Box::new(Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("run".to_string()),
+            })),
+            traversal: Traversal::OutgoingWildcard,
+            dst: Box::new(Pattern::Constraint(Constraint::Wildcard)),
+        };
+        assert!(p.references_field("word"));
+        assert!(p.references_field("entity"));
+    }
+
+    #[test]
+    fn test_pattern_repetition_delegates() {
+        let p = Pattern::Repetition {
+            pattern: Box::new(Pattern::Constraint(Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("NN".to_string()),
+            })),
+            min: 1,
+            max: Some(3),
+            kind: QuantifierKind::Greedy,
+        };
+        assert!(p.references_field("pos"));
+        assert!(!p.references_field("word"));
+    }
+
+    #[test]
+    fn test_pattern_assertion_delegates_to_inner() {
+        let p = Pattern::Assertion(Assertion::PositiveLookahead(Box::new(
+            Pattern::Constraint(Constraint::Field {
+                name: "word".to_string(),
+                matcher: Matcher::string("test".to_string()),
+            }),
+        )));
+        assert!(p.references_field("word"));
+        assert!(!p.references_field("entity"));
+    }
+
+    #[test]
+    fn test_pattern_assertion_all_variants() {
+        let make_inner = || {
+            Box::new(Pattern::Constraint(Constraint::Field {
+                name: "pos".to_string(),
+                matcher: Matcher::string("VB".to_string()),
+            }))
+        };
+
+        let variants = vec![
+            Pattern::Assertion(Assertion::PositiveLookahead(make_inner())),
+            Pattern::Assertion(Assertion::NegativeLookahead(make_inner())),
+            Pattern::Assertion(Assertion::PositiveLookbehind(make_inner())),
+            Pattern::Assertion(Assertion::NegativeLookbehind(make_inner())),
+        ];
+
+        for (i, p) in variants.iter().enumerate() {
+            assert!(
+                p.references_field("pos"),
+                "Assertion variant {i} should reference 'pos'"
+            );
+            assert!(
+                !p.references_field("word"),
+                "Assertion variant {i} should not reference 'word'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_references_field_deeply_nested() {
+        let p = Pattern::NamedCapture {
+            name: "deep".to_string(),
+            pattern: Box::new(Pattern::Repetition {
+                pattern: Box::new(Pattern::Disjunctive(vec![
+                    Pattern::Constraint(Constraint::Field {
+                        name: "entity".to_string(),
+                        matcher: Matcher::string("B-Gene".to_string()),
+                    }),
+                    Pattern::Constraint(Constraint::Field {
+                        name: "word".to_string(),
+                        matcher: Matcher::string("test".to_string()),
+                    }),
+                ])),
+                min: 0,
+                max: None,
+                kind: QuantifierKind::Lazy,
+            }),
+        };
+        assert!(p.references_field("entity"));
+        assert!(p.references_field("word"));
+        assert!(!p.references_field("pos"));
+        assert!(!p.references_field("lemma"));
+    }
+
+    #[test]
+    fn test_extract_positions_short_circuits_on_wrong_field() {
+        let pattern = Pattern::Constraint(Constraint::Field {
+            name: "entity".to_string(),
+            matcher: Matcher::string("B-Gene".to_string()),
+        });
+        let tokens = vec![
+            "The".to_string(),
+            "B-Gene".to_string(),
+            "protein".to_string(),
+        ];
+        let positions = pattern.extract_matching_positions("word", &tokens);
+        assert!(
+            positions.is_empty(),
+            "Entity constraint should not match word tokens, got {:?}",
+            positions
+        );
+    }
+
+    #[test]
+    fn test_extract_positions_works_when_field_matches() {
+        let pattern = Pattern::Constraint(Constraint::Field {
+            name: "word".to_string(),
+            matcher: Matcher::string("cat".to_string()),
+        });
+        let tokens = vec!["the".to_string(), "cat".to_string(), "sat".to_string()];
+        let positions = pattern.extract_matching_positions("word", &tokens);
+        assert_eq!(positions, vec![1]);
+    }
+
+    #[test]
+    fn test_extract_positions_wildcard_not_short_circuited() {
+        let pattern = Pattern::Constraint(Constraint::Wildcard);
+        let tokens = vec!["a".to_string(), "b".to_string()];
+        let positions = pattern.extract_matching_positions("word", &tokens);
+        assert_eq!(positions, vec![0, 1]);
     }
 } 

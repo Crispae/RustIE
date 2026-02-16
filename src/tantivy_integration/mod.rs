@@ -1,5 +1,6 @@
 pub mod utils;
 pub mod collector;
+pub mod paging_collector;
 pub mod boolean_query;
 pub mod concat_query;
 pub mod graph_traversal;
