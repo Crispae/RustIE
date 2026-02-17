@@ -9,11 +9,21 @@
 
 use std::collections::HashSet;
 
-use crate::query::ast::{Traversal, FlatPatternStep};
+use crate::query::ast::{Pattern, Traversal, FlatPatternStep};
 use crate::digraph::graph_trait::GraphAccess;
 use super::AllowedPositions;
 use super::GraphTraversal;
 use super::matcher::ResolvedTraversalMatcher;
+
+/// Unwrap NamedCapture/Repetition wrappers to reach the underlying Pattern.
+/// Named captures are pure tagging wrappers (Odinson-style) that must not affect matching.
+fn unwrap_to_constraint(pat: &Pattern) -> &Pattern {
+    match pat {
+        Pattern::NamedCapture { pattern, .. } => unwrap_to_constraint(pattern),
+        Pattern::Repetition { pattern, .. } => unwrap_to_constraint(pattern),
+        _ => pat,
+    }
+}
 
 impl<G: GraphAccess> GraphTraversal<G> {
 
@@ -167,7 +177,12 @@ impl<G: GraphAccess> GraphTraversal<G> {
 
         let field_name = &constraint_field_names[constraint_idx];
 
-        if let crate::query::ast::Pattern::Constraint(constraint) = constraint_pat {
+        // Unwrap NamedCapture/Repetition to get the underlying constraint.
+        // Named captures are pure tagging wrappers (Odinson-style) and must not
+        // affect matching logic.
+        let unwrapped = unwrap_to_constraint(constraint_pat);
+
+        if let Pattern::Constraint(constraint) = unwrapped {
             // Optimization: Check if exact constraint + prefilter confirmed
             let is_exact = constraint_exact_flags.get(constraint_idx).copied().unwrap_or(false);
             let prefilter_confirmed = allowed_positions.get(constraint_idx)
