@@ -2,16 +2,10 @@ use actix_web::{web, HttpResponse, Result};
 use crate::engine::ExtractorEngine;
 use crate::api::models::{
     DocumentResult, ErrorResponse, HealthResponse, MatchResult, PaginatedQueryRequest,
-    PaginatedQueryResponse, QueryRequest, QueryResponse, StatsResponse,
+    PaginatedQueryResponse, StatsResponse,
 };
 use crate::results::rustie_results::SentenceResult;
 use std::time::Instant;
-
-/// Send-safe result type returned from the blocking closure (HttpResponse is not Send in actix-web 4).
-enum QueryOutcome {
-    Success(QueryResponse),
-    Error(ErrorResponse),
-}
 
 /// Outcome of paginated search (Send-safe). Error carries (response, true) if 400 (unsupported pattern).
 enum PaginatedOutcome {
@@ -31,40 +25,6 @@ fn validate_query(query: &str) -> Option<HttpResponse> {
     }
 }
 
-/// Execute a query on the blocking pool — returns Send-safe data, NOT HttpResponse.
-fn execute_query(engine: &ExtractorEngine, query: &str, limit: usize) -> QueryOutcome {
-    let start_time = Instant::now();
-    match engine.query_with_limit(query, limit) {
-        Ok(odin_results) => {
-            let duration = start_time.elapsed().as_secs_f32();
-            let results = convert_to_detailed_results(engine, odin_results);
-
-            QueryOutcome::Success(QueryResponse {
-                query: query.to_string(),
-                duration,
-                result_count: results.len(),
-                max_score: results.iter().map(|r| r.score).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)),
-                results,
-            })
-        }
-        Err(e) => {
-            log::error!("Query execution failed: {}", e);
-            QueryOutcome::Error(ErrorResponse {
-                error: format!("Query execution failed: {}", e),
-                error_type: "QueryError".to_string(),
-            })
-        }
-    }
-}
-
-/// Convert QueryOutcome → HttpResponse (runs on async worker, cheap).
-fn outcome_to_response(outcome: QueryOutcome) -> HttpResponse {
-    match outcome {
-        QueryOutcome::Success(resp) => HttpResponse::Ok().json(resp),
-        QueryOutcome::Error(err) => HttpResponse::InternalServerError().json(err),
-    }
-}
-
 /// Health check endpoint
 #[utoipa::path(
     get,
@@ -81,66 +41,8 @@ pub async fn health_check() -> Result<HttpResponse> {
     }))
 }
 
-/// Query documents with full options
-#[utoipa::path(
-    post,
-    path = "/api/v1/query",
-    tag = "Query",
-    request_body = QueryRequest,
-    responses(
-        (status = 200, description = "Query executed successfully", body = QueryResponse),
-        (status = 400, description = "Invalid query", body = ErrorResponse),
-        (status = 500, description = "Query execution failed", body = ErrorResponse)
-    )
-)]
-pub async fn query_documents(
-    engine: web::Data<ExtractorEngine>,
-    request: web::Json<QueryRequest>,
-) -> Result<HttpResponse> {
-    if let Some(err_response) = validate_query(&request.query) {
-        return Ok(err_response);
-    }
-
-    let engine = engine.clone();
-    let query = request.query.clone();
-    let limit = request.limit;
-
-    let outcome = web::block(move || execute_query(&engine, &query, limit)).await?;
-    Ok(outcome_to_response(outcome))
-}
-
-/// Simple query endpoint that accepts query as URL parameter
-#[utoipa::path(
-    get,
-    path = "/api/v1/query/{query}",
-    tag = "Query",
-    params(
-        ("query" = String, Path, description = "The Odinson query string (URL encoded)")
-    ),
-    responses(
-        (status = 200, description = "Query executed successfully", body = QueryResponse),
-        (status = 400, description = "Invalid query", body = ErrorResponse),
-        (status = 500, description = "Query execution failed", body = ErrorResponse)
-    )
-)]
-pub async fn simple_query(
-    engine: web::Data<ExtractorEngine>,
-    path: web::Path<String>,
-) -> Result<HttpResponse> {
-    let query = path.into_inner();
-
-    if let Some(err_response) = validate_query(&query) {
-        return Ok(err_response);
-    }
-
-    let engine = engine.clone();
-    let limit = 10usize;
-
-    let outcome = web::block(move || execute_query(&engine, &query, limit)).await?;
-    Ok(outcome_to_response(outcome))
-}
-
 /// Paginated search (Odinson-style): first page or next page via cursor.
+/// Supports all pattern types: basic constraints, graph traversal, concatenated, and named captures.
 #[utoipa::path(
     post,
     path = "/api/v1/search",
@@ -148,7 +50,7 @@ pub async fn simple_query(
     request_body = PaginatedQueryRequest,
     responses(
         (status = 200, description = "Paginated search executed successfully", body = PaginatedQueryResponse),
-        (status = 400, description = "Invalid query or unsupported pattern", body = ErrorResponse),
+        (status = 400, description = "Invalid query", body = ErrorResponse),
         (status = 500, description = "Query execution failed", body = ErrorResponse)
     )
 )]
@@ -257,8 +159,6 @@ fn sentence_result_to_document_result(
 }
 
 /// Convert a list of SentenceResult into DocumentResult for API response.
-/// Must match the sentence_results branch of convert_to_detailed_results so that
-/// paginated and non-paginated endpoints return identical DocumentResult shape.
 fn sentence_results_to_document_results(
     sentence_results: Vec<SentenceResult>,
 ) -> Vec<DocumentResult> {
@@ -266,74 +166,4 @@ fn sentence_results_to_document_results(
         .into_iter()
         .map(|sentence| sentence_result_to_document_result(sentence, 0))
         .collect()
-}
-
-/// Convert RustIeResult to detailed DocumentResult with tokens and matches
-fn convert_to_detailed_results(
-    engine: &ExtractorEngine,
-    odin_results: crate::results::RustIeResult,
-) -> Vec<DocumentResult> {
-    if !odin_results.sentence_results.is_empty() {
-        return odin_results
-            .sentence_results
-            .into_iter()
-            .map(|sentence| sentence_result_to_document_result(sentence, 0))
-            .collect();
-    }
-
-    let mut detailed_results = Vec::new();
-    for score_doc in odin_results.score_docs() {
-        let detailed_result = match engine.doc(score_doc.doc) {
-            Ok(doc) => {
-                match engine.extract_sentence_result(&doc, score_doc.score) {
-                    Ok(mut sentence_result) => {
-                        sentence_result.matches = score_doc.get_matches().to_vec();
-                        sentence_result_to_document_result(
-                            sentence_result,
-                            score_doc.doc.doc_id,
-                        )
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to extract sentence from doc {:?}: {}",
-                            score_doc.doc,
-                            e
-                        );
-                        fallback_document_result_from_score_doc(score_doc)
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to fetch doc {:?}: {}",
-                    score_doc.doc,
-                    e
-                );
-                fallback_document_result_from_score_doc(score_doc)
-            }
-        };
-        detailed_results.push(detailed_result);
-    }
-
-    detailed_results
-}
-
-/// Build a minimal DocumentResult when doc lookup or extraction fails.
-/// Uses only data available from RustieDoc (no stored fields).
-fn fallback_document_result_from_score_doc(
-    score_doc: &crate::results::RustieDoc,
-) -> DocumentResult {
-    let matches: Vec<MatchResult> = score_doc
-        .get_matches()
-        .iter()
-        .map(|span_with_captures| span_with_captures.clone().into())
-        .collect();
-    DocumentResult {
-        odinson_doc: score_doc.doc.doc_id,
-        score: score_doc.score,
-        document_id: format!("doc_{}", score_doc.doc.doc_id),
-        sentence_index: 0,
-        words: Vec::new(),
-        matches,
-    }
 }

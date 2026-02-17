@@ -1,38 +1,6 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use crate::results::RustIeResult;
 use crate::types::{Span, SpanWithCaptures, NamedCapture, SearchCursor};
-
-/// Request model for querying documents
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct QueryRequest {
-    /// The Odinson query string to execute
-    #[schema(example = "[word=John] >nsubj [pos=/VB.*/]")]
-    pub query: String,
-    /// Maximum number of results to return (optional)
-    #[serde(default = "default_limit")]
-    #[schema(example = 10, default = 10)]
-    pub limit: usize,
-}
-
-/// Response model for query results
-#[derive(Debug, Serialize, ToSchema)]
-pub struct QueryResponse {
-    /// The original query string
-    #[schema(example = "[word=John]")]
-    pub query: String,
-    /// Query execution duration in seconds
-    #[schema(example = 0.023)]
-    pub duration: f32,
-    /// Number of matching results
-    #[schema(example = 5)]
-    pub result_count: usize,
-    /// Maximum score among results
-    #[schema(example = 1.5)]
-    pub max_score: Option<f32>,
-    /// The query results
-    pub results: Vec<DocumentResult>,
-}
 
 /// Individual document result with detailed information
 #[derive(Debug, Serialize, ToSchema)]
@@ -122,17 +90,13 @@ pub struct StatsResponse {
     pub fields: Vec<String>,
 }
 
-fn default_limit() -> usize {
-    10
-}
-
 /// Cursor for the next page of paginated search (alias for API; same shape as SearchCursor).
 pub type AfterCursor = SearchCursor;
 
 /// Request for Odinson-style paginated search.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PaginatedQueryRequest {
-    /// The Odinson query string to execute (must be a simple pattern: constraint, assertion, disjunctive, repetition).
+    /// The Odinson query string to execute.
     #[schema(example = "[entity=/B-Gene/]")]
     pub query: String,
     /// Page size (default 15).
@@ -164,31 +128,6 @@ pub struct PaginatedQueryResponse {
     pub results: Vec<DocumentResult>,
     /// Cursor for the next page; absent if this is the last page
     pub next_cursor: Option<AfterCursor>,
-}
-
-impl From<RustIeResult> for QueryResponse {
-    fn from(odin_results: RustIeResult) -> Self {
-        let results: Vec<DocumentResult> = odin_results
-            .score_docs()
-            .iter()
-            .map(|score_doc| DocumentResult {
-                odinson_doc: score_doc.doc.doc_id,
-                score: score_doc.score,
-                document_id: format!("doc_{}", score_doc.doc.doc_id),
-                sentence_index: 0,
-                words: Vec::new(),
-                matches: Vec::new(),
-            })
-            .collect();
-
-        QueryResponse {
-            query: "".to_string(),
-            duration: 0.0,
-            result_count: results.len(),
-            max_score: odin_results.max_score,
-            results,
-        }
-    }
 }
 
 // Helper conversion functions

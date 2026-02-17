@@ -17,7 +17,7 @@ use crate::tantivy_integration::paging_collector::{
     PaginatedSearchResult, PagingCollector, ScoredDoc, SimpleCollector,
 };
 use crate::types::SearchCursor;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use log;
 use rayon::prelude::*;
 use std::cmp::Ordering;
@@ -127,8 +127,7 @@ impl ExtractorEngine {
     }
 
     /// Execute a query with Odinson-style cursor-based pagination.
-    /// Supports simple constraints (collector-based), graph traversal, and named captures.
-    /// Returns an error for Concatenated patterns.
+    /// Supports all pattern types: basic constraints, graph traversal, concatenated, and named captures.
     pub fn query_paginated(
         &self,
         query: &str,
@@ -142,9 +141,9 @@ impl ExtractorEngine {
             CompiledQuery::Graph(gq) => {
                 self.execute_graph_traversal_paginated(gq, page_size, after)
             }
-            CompiledQuery::Concat(..) => Err(anyhow!(
-                "Paginated search does not support concatenated patterns; use POST /api/v1/query instead"
-            )),
+            CompiledQuery::Concat(cq) => {
+                self.execute_concat_paginated(cq, page_size, after)
+            }
             CompiledQuery::NamedCapture(nq) => {
                 self.execute_named_capture_paginated(nq, page_size, after)
             }
@@ -452,6 +451,88 @@ impl ExtractorEngine {
             segment_results.into_iter().flatten().collect();
 
         Ok(Self::build_result_from_sentence_results(all_results, limit))
+    }
+
+    /// Paginated execution for concatenated pattern queries.
+    /// Same parallel-segment approach as the non-paginated variant, then sort + paginate.
+    fn execute_concat_paginated(
+        &self,
+        pattern_query: &RustieConcatQuery,
+        page_size: usize,
+        after: Option<SearchCursor>,
+    ) -> Result<PaginatedResult> {
+        let searcher = self.reader.searcher();
+        let num_segments = searcher.segment_readers().len();
+
+        let weight: Arc<RustieConcatWeight> = Arc::new(
+            pattern_query.concrete_weight(&searcher, self.regex_cache.clone()).map_err(anyhow::Error::from)?,
+        );
+
+        let segment_results: Vec<Vec<ScoredSentence>> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
+                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "concat paginated: segment {segment_ord} scorer creation failed: {e}"
+                        );
+                        return None;
+                    }
+                };
+
+                let mut segment_scored = Vec::new();
+
+                loop {
+                    let doc_id = scorer.advance();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+                    let matches = scorer.take_current_doc_matches();
+
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) =
+                            self.extract_sentence_result(&doc, score)
+                        {
+                            sentence_result.matches = matches;
+                            segment_scored.push(ScoredSentence::new(
+                                score,
+                                doc_address,
+                                sentence_result,
+                            ));
+                        }
+                    }
+                }
+
+                Some(segment_scored)
+            })
+            .collect();
+
+        let mut all_scored: Vec<ScoredSentence> = segment_results
+            .into_iter()
+            .flat_map(|v| v.into_iter())
+            .collect();
+
+        all_scored.sort();
+
+        let driver = PaginationDriver::new(page_size, after);
+        let page = driver.paginate(all_scored);
+
+        let sentence_results = page
+            .items
+            .into_iter()
+            .map(|ss| ss.sentence_result)
+            .collect();
+
+        Ok(PaginatedResult {
+            total_hits: page.total_hits,
+            sentence_results,
+            next_cursor: page.next_cursor,
+        })
     }
 
     /// Execute named capture pattern matching queries.

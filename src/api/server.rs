@@ -4,11 +4,11 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use crate::engine::ExtractorEngine;
 use crate::api::handlers::{
-    health_check, index_stats, paginated_search, query_documents, simple_query,
+    health_check, index_stats, paginated_search,
 };
 use crate::api::models::{
     DocumentResult, ErrorResponse, HealthResponse, MatchResult, NamedCaptureResult,
-    PaginatedQueryRequest, PaginatedQueryResponse, QueryRequest, QueryResponse,
+    PaginatedQueryRequest, PaginatedQueryResponse,
     SpanResult, StatsResponse,
 };
 use crate::types::SearchCursor;
@@ -52,13 +52,11 @@ use crate::types::SearchCursor;
     ),
     paths(
         crate::api::handlers::health_check,
-        crate::api::handlers::query_documents,
-        crate::api::handlers::simple_query,
         crate::api::handlers::paginated_search,
         crate::api::handlers::index_stats
     ),
     components(schemas(
-        QueryRequest, QueryResponse, ErrorResponse, DocumentResult,
+        ErrorResponse, DocumentResult,
         MatchResult, SpanResult, NamedCaptureResult, HealthResponse, StatsResponse,
         PaginatedQueryRequest, PaginatedQueryResponse, SearchCursor
     )),
@@ -114,8 +112,6 @@ pub async fn start_server(config: ApiConfig) -> Result<()> {
             .service(
                 web::scope("/api/v1")
                     .route("/health", web::get().to(health_check))
-                    .route("/query", web::post().to(query_documents))
-                    .route("/query/{query}", web::get().to(simple_query))
                     .route("/search", web::post().to(paginated_search))
                     .route("/stats", web::get().to(index_stats))
             )
