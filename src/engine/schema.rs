@@ -72,7 +72,7 @@ fn add_text_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldCon
 
 fn add_string_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldConfig) {
     let indexing = TextFieldIndexing::default()
-        .set_tokenizer("token_position_tokenizer")
+        .set_tokenizer(TOKENIZER_TOKEN_POSITION)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let mut options = TextOptions::default().set_indexing_options(indexing);
     if field.stored {
@@ -92,7 +92,7 @@ fn add_string_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldC
 
 fn add_edge_positions_field(builder: &mut tantivy::schema::SchemaBuilder, field: &FieldConfig) {
     let indexing = TextFieldIndexing::default()
-        .set_tokenizer("edge_position_tokenizer")
+        .set_tokenizer(TOKENIZER_EDGE_POSITION)
         .set_index_option(IndexRecordOption::WithFreqsAndPositions);
     let mut options = TextOptions::default().set_indexing_options(indexing);
     if field.stored {

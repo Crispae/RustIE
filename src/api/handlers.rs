@@ -234,6 +234,28 @@ pub async fn index_stats(engine: web::Data<ExtractorEngine>) -> Result<HttpRespo
     Ok(HttpResponse::Ok().json(stats))
 }
 
+/// Convert a single SentenceResult into DocumentResult. Shared by both
+/// sentence_results and score_docs conversion paths for consistent output.
+fn sentence_result_to_document_result(
+    mut sentence: SentenceResult,
+    odinson_doc: u32,
+) -> DocumentResult {
+    let matches: Vec<MatchResult> = sentence
+        .matches
+        .into_iter()
+        .map(MatchResult::from)
+        .collect();
+    let words = sentence.fields.remove("word").unwrap_or_default();
+    DocumentResult {
+        odinson_doc,
+        score: sentence.score,
+        document_id: sentence.document_id.to_string(),
+        sentence_index: sentence.sentence_id.parse().unwrap_or(0),
+        words,
+        matches,
+    }
+}
+
 /// Convert a list of SentenceResult into DocumentResult for API response.
 /// Must match the sentence_results branch of convert_to_detailed_results so that
 /// paginated and non-paginated endpoints return identical DocumentResult shape.
@@ -242,80 +264,76 @@ fn sentence_results_to_document_results(
 ) -> Vec<DocumentResult> {
     sentence_results
         .into_iter()
-        .map(|mut sentence| {
-            let matches: Vec<MatchResult> = sentence
-                .matches
-                .into_iter()
-                .map(MatchResult::from)
-                .collect();
-            let words = sentence.fields.remove("word").unwrap_or_default();
-            DocumentResult {
-                odinson_doc: 0,
-                score: sentence.score,
-                document_id: sentence.document_id.to_string(),
-                sentence_index: sentence.sentence_id.parse().unwrap_or(0),
-                words,
-                matches,
-            }
-        })
+        .map(|sentence| sentence_result_to_document_result(sentence, 0))
         .collect()
 }
 
 /// Convert RustIeResult to detailed DocumentResult with tokens and matches
-fn convert_to_detailed_results(engine: &ExtractorEngine, odin_results: crate::results::RustIeResult) -> Vec<DocumentResult> {
-    let mut detailed_results = Vec::new();
-
+fn convert_to_detailed_results(
+    engine: &ExtractorEngine,
+    odin_results: crate::results::RustIeResult,
+) -> Vec<DocumentResult> {
     if !odin_results.sentence_results.is_empty() {
-        for mut sentence in odin_results.sentence_results {
-            let matches: Vec<MatchResult> = sentence.matches
-                .into_iter()
-                .map(MatchResult::from)
-                .collect();
-
-            let words = sentence.fields.remove("word").unwrap_or_default();
-
-            let detailed_result = DocumentResult {
-                odinson_doc: 0,
-                score: sentence.score,
-                document_id: sentence.document_id.to_string(),
-                sentence_index: sentence.sentence_id.parse().unwrap_or(0),
-                words,
-                matches,
-            };
-            detailed_results.push(detailed_result);
-        }
-        return detailed_results;
+        return odin_results
+            .sentence_results
+            .into_iter()
+            .map(|sentence| sentence_result_to_document_result(sentence, 0))
+            .collect();
     }
 
+    let mut detailed_results = Vec::new();
     for score_doc in odin_results.score_docs() {
-        let (document_id, sentence_index, words) = match engine.doc(score_doc.doc) {
-            Ok(_doc) => {
-                let doc_id = format!("doc_{}", score_doc.doc.doc_id);
-                let sent_idx = 0u32;
-                let tokens = Vec::new();
-                (doc_id, sent_idx, tokens)
+        let detailed_result = match engine.doc(score_doc.doc) {
+            Ok(doc) => {
+                match engine.extract_sentence_result(&doc, score_doc.score) {
+                    Ok(mut sentence_result) => {
+                        sentence_result.matches = score_doc.get_matches().to_vec();
+                        sentence_result_to_document_result(
+                            sentence_result,
+                            score_doc.doc.doc_id,
+                        )
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to extract sentence from doc {:?}: {}",
+                            score_doc.doc,
+                            e
+                        );
+                        fallback_document_result_from_score_doc(score_doc)
+                    }
+                }
             }
-            Err(_) => {
-                (format!("doc_{}", score_doc.doc.doc_id), 0, Vec::new())
+            Err(e) => {
+                log::warn!(
+                    "Failed to fetch doc {:?}: {}",
+                    score_doc.doc,
+                    e
+                );
+                fallback_document_result_from_score_doc(score_doc)
             }
         };
-
-        let matches: Vec<MatchResult> = score_doc.get_matches()
-            .iter()
-            .map(|span_with_captures| span_with_captures.clone().into())
-            .collect();
-
-        let detailed_result = DocumentResult {
-            odinson_doc: score_doc.doc.doc_id,
-            score: score_doc.score,
-            document_id,
-            sentence_index,
-            words,
-            matches,
-        };
-
         detailed_results.push(detailed_result);
     }
 
     detailed_results
+}
+
+/// Build a minimal DocumentResult when doc lookup or extraction fails.
+/// Uses only data available from RustieDoc (no stored fields).
+fn fallback_document_result_from_score_doc(
+    score_doc: &crate::results::RustieDoc,
+) -> DocumentResult {
+    let matches: Vec<MatchResult> = score_doc
+        .get_matches()
+        .iter()
+        .map(|span_with_captures| span_with_captures.clone().into())
+        .collect();
+    DocumentResult {
+        odinson_doc: score_doc.doc.doc_id,
+        score: score_doc.score,
+        document_id: format!("doc_{}", score_doc.doc.doc_id),
+        sentence_index: 0,
+        words: Vec::new(),
+        matches,
+    }
 }

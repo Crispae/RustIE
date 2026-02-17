@@ -127,8 +127,8 @@ impl ExtractorEngine {
     }
 
     /// Execute a query with Odinson-style cursor-based pagination.
-    /// Supports simple constraints (collector-based) and graph traversal (best-effort merge-then-page).
-    /// Returns an error for Concatenated and NamedCapture patterns.
+    /// Supports simple constraints (collector-based), graph traversal, and named captures.
+    /// Returns an error for Concatenated patterns.
     pub fn query_paginated(
         &self,
         query: &str,
@@ -145,9 +145,9 @@ impl ExtractorEngine {
             CompiledQuery::Concat(..) => Err(anyhow!(
                 "Paginated search does not support concatenated patterns; use POST /api/v1/query instead"
             )),
-            CompiledQuery::NamedCapture(..) => Err(anyhow!(
-                "Paginated search does not support named capture patterns; use POST /api/v1/query instead"
-            )),
+            CompiledQuery::NamedCapture(nq) => {
+                self.execute_named_capture_paginated(nq, page_size, after)
+            }
             CompiledQuery::Basic(bq) => {
                 self.execute_paginated(bq.as_ref(), page_size, after, &pattern)
             }
@@ -528,6 +528,101 @@ impl ExtractorEngine {
             segment_results.into_iter().flatten().collect();
 
         Ok(Self::build_result_from_sentence_results(all_results, limit))
+    }
+
+    /// Paginated execution for named capture queries.
+    /// Same parallel-segment approach as the non-paginated variant, then sort + paginate.
+    fn execute_named_capture_paginated(
+        &self,
+        named_query: &RustieNamedCaptureQuery,
+        page_size: usize,
+        after: Option<SearchCursor>,
+    ) -> Result<PaginatedResult> {
+        let searcher = self.reader.searcher();
+        let num_segments = searcher.segment_readers().len();
+
+        let weight: Arc<RustieNamedCaptureWeight> = Arc::new(
+            named_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?,
+        );
+
+        let capture_name = named_query.capture_name.clone();
+        let pattern = named_query.pattern.clone();
+
+        let segment_results: Vec<Vec<ScoredSentence>> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
+                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!(
+                            "named capture paginated: segment {segment_ord} scorer creation failed: {e}"
+                        );
+                        return None;
+                    }
+                };
+
+                let field_name = searcher
+                    .schema()
+                    .get_field_name(weight.default_field())
+                    .to_string();
+
+                let mut segment_scored = Vec::new();
+
+                loop {
+                    let doc_id = scorer.advance();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
+
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) =
+                            self.extract_sentence_result(&doc, score)
+                        {
+                            let tokens = self.extract_field_values(&doc, &field_name);
+                            sentence_result.matches = RustieNamedCaptureQuery::compute_captures(
+                                &capture_name,
+                                &pattern,
+                                &field_name,
+                                &tokens,
+                            );
+                            segment_scored.push(ScoredSentence::new(
+                                score,
+                                doc_address,
+                                sentence_result,
+                            ));
+                        }
+                    }
+                }
+
+                Some(segment_scored)
+            })
+            .collect();
+
+        let mut all_scored: Vec<ScoredSentence> = segment_results
+            .into_iter()
+            .flat_map(|v| v.into_iter())
+            .collect();
+
+        all_scored.sort();
+
+        let driver = PaginationDriver::new(page_size, after);
+        let page = driver.paginate(all_scored);
+
+        let sentence_results = page
+            .items
+            .into_iter()
+            .map(|ss| ss.sentence_result)
+            .collect();
+
+        Ok(PaginatedResult {
+            total_hits: page.total_hits,
+            sentence_results,
+            next_cursor: page.next_cursor,
+        })
     }
 
     /// Execute fallback for other pattern types (Assertion, Disjunctive, Repetition)
