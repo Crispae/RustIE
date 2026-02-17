@@ -59,6 +59,7 @@ pub struct ExtractorEngine {
 }
 
 impl ExtractorEngine {
+    
     /// Create a new ExtractorEngine from an index directory with a required schema file
     pub fn new(index_dir: &Path, schema_path: &Path) -> Result<Self> {
         Self::with_config(index_dir, &EngineConfig {

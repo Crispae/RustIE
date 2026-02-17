@@ -17,7 +17,6 @@ use crate::tantivy_integration::paging_collector::{
 };
 use crate::types::SearchCursor;
 use anyhow::Result;
-use log;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::sync::Arc;

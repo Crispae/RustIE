@@ -165,7 +165,6 @@ fn expand_regex_terms_from_constraint(
 /// Candidate generation is driven exclusively by CombinedPositionDriver - no BooleanQuery pre-filtering.
 #[derive(Debug)]
 pub struct OptimizedGraphTraversalQuery {
-    #[allow(dead_code)]
     pub(crate) default_field: Field,
     pub(crate) dependencies_binary_field: Field,
     pub(crate) incoming_edges_field: Field,

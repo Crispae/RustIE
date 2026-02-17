@@ -1,5 +1,4 @@
 pub mod utils;
-pub mod collector;
 pub mod paging_collector;
 pub mod boolean_query;
 pub mod concat_query;
@@ -9,7 +8,6 @@ pub mod named_capture_query;
 pub mod position_tokenizer;
 pub mod match_selector;
 
-pub use collector::*;
 pub use concat_query::*;
 pub use graph_traversal::*;
 pub use boolean_query::*;

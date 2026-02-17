@@ -332,8 +332,9 @@ impl<'a> GraphAccess for ZeroCopyGraph<'a> {
         }
         let start = self.label_offsets[label_id].get() as usize;
         let end = self.label_offsets[label_id + 1].get() as usize;
-        // Safety: Labels are validated as UTF-8 at index time
-        std::str::from_utf8(&self.label_data[start..end]).ok()
+        let bytes = &self.label_data[start..end];
+        debug_assert!(std::str::from_utf8(bytes).is_ok(), "Corrupted label data: label_id={} contains invalid UTF-8", label_id);
+        std::str::from_utf8(bytes).ok()
     }
     
     fn get_label_id(&self, label: &str) -> Option<usize> {
