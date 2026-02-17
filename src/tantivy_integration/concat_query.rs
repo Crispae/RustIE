@@ -11,6 +11,7 @@ use crate::tantivy_integration::graph_traversal::query::{
     extract_terms_from_pattern,
     expand_regex_terms_from_pattern,
 };
+use crate::tantivy_integration::graph_traversal::weight::RegexCache;
 
 /// Execution plan for anchor-based verification
 #[derive(Debug, Clone)]
@@ -92,6 +93,7 @@ impl RustieConcatQuery {
     pub(crate) fn concrete_weight(
         &self,
         searcher: &tantivy::Searcher,
+        regex_cache: RegexCache,
     ) -> TantivyResult<RustieConcatWeight> {
         let scoring = EnableScoring::Enabled {
             searcher,
@@ -104,7 +106,7 @@ impl RustieConcatQuery {
         let schema = searcher.schema();
         let mut terms = Vec::new();
         extract_terms_from_pattern(&self.pattern, schema, &mut terms);
-        expand_regex_terms_from_pattern(&self.pattern, schema, searcher, &mut terms);
+        expand_regex_terms_from_pattern(&self.pattern, schema, searcher, &regex_cache, &mut terms);
         // Deduplicate so exact terms that also match a regex don't double-count IDF.
         terms.sort_unstable();
         terms.dedup();

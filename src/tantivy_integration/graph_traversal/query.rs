@@ -72,26 +72,28 @@ fn extract_terms_from_constraint(c: &Constraint, schema: &Schema, terms: &mut Ve
 /// regex terms at query time before computing BM25 weights.
 ///
 /// Iterates all segment readers, deduplicates across segments, and caps at
-/// `MAX_REGEX_TERMS_FOR_BM25` to bound the cost.
+/// `MAX_REGEX_TERMS_FOR_BM25` to bound the cost. **Caches results** per (pattern, field)
+/// to avoid redundant FST traversals across repeated queries.
 pub(crate) fn expand_regex_terms_from_pattern(
     pattern: &Pattern,
     schema: &Schema,
     searcher: &tantivy::Searcher,
+    regex_cache: &super::weight::RegexCache,
     terms: &mut Vec<Term>,
 ) {
     match pattern {
-        Pattern::Constraint(c) => expand_regex_terms_from_constraint(c, schema, searcher, terms),
+        Pattern::Constraint(c) => expand_regex_terms_from_constraint(c, schema, searcher, regex_cache, terms),
         Pattern::NamedCapture { pattern: inner, .. } =>
-            expand_regex_terms_from_pattern(inner, schema, searcher, terms),
+            expand_regex_terms_from_pattern(inner, schema, searcher, regex_cache, terms),
         Pattern::Repetition { pattern: inner, .. } =>
-            expand_regex_terms_from_pattern(inner, schema, searcher, terms),
+            expand_regex_terms_from_pattern(inner, schema, searcher, regex_cache, terms),
         Pattern::GraphTraversal { src, dst, .. } => {
-            expand_regex_terms_from_pattern(src, schema, searcher, terms);
-            expand_regex_terms_from_pattern(dst, schema, searcher, terms);
+            expand_regex_terms_from_pattern(src, schema, searcher, regex_cache, terms);
+            expand_regex_terms_from_pattern(dst, schema, searcher, regex_cache, terms);
         }
         Pattern::Disjunctive(patterns) | Pattern::Concatenated(patterns) => {
             for p in patterns {
-                expand_regex_terms_from_pattern(p, schema, searcher, terms);
+                expand_regex_terms_from_pattern(p, schema, searcher, regex_cache, terms);
             }
         }
         Pattern::Assertion(_) | Pattern::Mention { .. } => {}
@@ -102,13 +104,22 @@ fn expand_regex_terms_from_constraint(
     c: &Constraint,
     schema: &Schema,
     searcher: &tantivy::Searcher,
+    regex_cache: &super::weight::RegexCache,
     terms: &mut Vec<Term>,
 ) {
     match c {
         Constraint::Field { name, matcher: Matcher::Regex { pattern, .. } } => {
             if let Ok(field) = schema.get_field(name) {
+                // Fast path: check cache
+                if let Ok(cache_guard) = regex_cache.read() {
+                    if let Some(cached_terms) = cache_guard.get_expanded_terms(pattern, field) {
+                        terms.extend(cached_terms);
+                        return;
+                    }
+                }
+
+                // Slow path: FST traversal across all segments
                 if let Ok(fst_regex) = tantivy_fst::Regex::new(pattern) {
-                    // Collect unique term bytes across all segments.
                     let mut seen: HashSet<Vec<u8>> = HashSet::new();
                     for reader in searcher.segment_readers() {
                         if let Ok(inv_idx) = reader.inverted_index(field) {
@@ -123,21 +134,29 @@ fn expand_regex_terms_from_constraint(
                             }
                         }
                     }
-                    for bytes in seen {
-                        // Text field bytes are UTF-8 term text.
-                        let term_str = String::from_utf8_lossy(&bytes);
-                        terms.push(Term::from_field_text(field, &term_str));
+                    let expanded: Vec<Term> = seen.into_iter()
+                        .map(|bytes| {
+                            let term_str = String::from_utf8_lossy(&bytes);
+                            Term::from_field_text(field, &term_str)
+                        })
+                        .collect();
+
+                    // Cache the result
+                    if let Ok(mut cache_guard) = regex_cache.write() {
+                        cache_guard.insert_expanded_terms(pattern.to_string(), field, expanded.clone());
                     }
+
+                    terms.extend(expanded);
                 }
             }
         }
         Constraint::Conjunctive(cs) | Constraint::Disjunctive(cs) => {
             for c in cs {
-                expand_regex_terms_from_constraint(c, schema, searcher, terms);
+                expand_regex_terms_from_constraint(c, schema, searcher, regex_cache, terms);
             }
         }
         Constraint::Negated(inner) =>
-            expand_regex_terms_from_constraint(inner, schema, searcher, terms),
+            expand_regex_terms_from_constraint(inner, schema, searcher, regex_cache, terms),
         _ => {}
     }
 }
@@ -243,8 +262,8 @@ impl OptimizedGraphTraversalQuery {
         let mut terms = Vec::new();
         extract_terms_from_pattern(&self.src_pattern, schema, &mut terms);
         extract_terms_from_pattern(&self.dst_pattern, schema, &mut terms);
-        expand_regex_terms_from_pattern(&self.src_pattern, schema, searcher, &mut terms);
-        expand_regex_terms_from_pattern(&self.dst_pattern, schema, searcher, &mut terms);
+        expand_regex_terms_from_pattern(&self.src_pattern, schema, searcher, &regex_cache, &mut terms);
+        expand_regex_terms_from_pattern(&self.dst_pattern, schema, searcher, &regex_cache, &mut terms);
         // Deduplicate so exact terms that also match a regex don't double-count IDF.
         terms.sort_unstable();
         terms.dedup();

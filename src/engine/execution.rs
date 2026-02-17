@@ -407,7 +407,7 @@ impl ExtractorEngine {
         let num_segments = searcher.segment_readers().len();
 
         let weight: Arc<RustieConcatWeight> = Arc::new(
-            pattern_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?,
+            pattern_query.concrete_weight(&searcher, self.regex_cache.clone()).map_err(anyhow::Error::from)?,
         );
 
         let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
