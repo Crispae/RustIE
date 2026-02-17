@@ -11,7 +11,7 @@ use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalWeight,
 };
 use crate::tantivy_integration::named_capture_query::{
-    RustieNamedCaptureQuery, RustieNamedCaptureScorer,
+    RustieNamedCaptureQuery, RustieNamedCaptureWeight,
 };
 use crate::tantivy_integration::paging_collector::{
     PaginatedSearchResult, PagingCollector, ScoredDoc, SimpleCollector,
@@ -454,8 +454,10 @@ impl ExtractorEngine {
         Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
-    /// Execute named capture pattern matching queries using custom scorer.
-    /// Creates weight ONCE and caches scorers per segment (avoids O(N) weight+scorer creation).
+    /// Execute named capture pattern matching queries.
+    /// Uses parallel segment processing (like graph traversal / concat) with lazy
+    /// capture computation — captures are extracted from already-loaded document
+    /// data at result-collection time, avoiding redundant document-store reads.
     fn execute_named_capture_matching(
         &self,
         named_query: &RustieNamedCaptureQuery,
@@ -463,43 +465,69 @@ impl ExtractorEngine {
     ) -> Result<RustIeResult> {
 
         let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(named_query, &TopDocs::with_limit(limit))
-            .map_err(anyhow::Error::from)?;
+        let num_segments = searcher.segment_readers().len();
 
-        // Create concrete weight ONCE and cache scorers per segment
-        let weight = named_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?;
-        let mut scorer_cache: HashMap<u32, RustieNamedCaptureScorer> = HashMap::new();
+        // Create weight once; share across segments.
+        let weight: Arc<RustieNamedCaptureWeight> = Arc::new(
+            named_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?,
+        );
 
-        let mut sentence_results = Vec::new();
+        let capture_name = named_query.capture_name.clone();
+        let pattern = named_query.pattern.clone();
 
-        for (score, doc_address) in top_docs {
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
+        // Parallel segment processing
+        let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
+            .into_par_iter()
+            .filter_map(|segment_ord| {
+                let segment_reader = searcher.segment_reader(segment_ord as u32);
 
-                let segment_ord = doc_address.segment_ord;
+                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("named capture: segment {segment_ord} scorer creation failed: {e}");
+                        return None;
+                    }
+                };
 
-                // Get or create concrete scorer for this segment
-                let scorer = scorer_cache.entry(segment_ord).or_insert_with(|| {
-                    let segment_reader = searcher.segment_reader(segment_ord);
-                    weight.concrete_scorer(segment_reader, 1.0).expect("named capture scorer creation")
-                });
+                let field_name = searcher
+                    .schema()
+                    .get_field_name(weight.default_field())
+                    .to_string();
 
-                sentence_result.matches = scorer.take_current_doc_matches();
+                let mut segment_sentence_results = Vec::new();
 
-                sentence_results.push(sentence_result);
-            }
-        }
+                loop {
+                    let doc_id = scorer.advance();
+                    if doc_id == tantivy::TERMINATED {
+                        break;
+                    }
 
-        let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
-            .into_iter()
-            .map(|r| {
-                let score = r.score;
-                (r, score)
+                    let score = scorer.score();
+                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
+
+                    if let Ok(doc) = searcher.doc(doc_address) {
+                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
+                            // Lazy capture: compute from already-loaded doc data
+                            let tokens = self.extract_field_values(&doc, &field_name);
+                            sentence_result.matches = RustieNamedCaptureQuery::compute_captures(
+                                &capture_name,
+                                &pattern,
+                                &field_name,
+                                &tokens,
+                            );
+                            segment_sentence_results.push((sentence_result, score));
+                        }
+                    }
+                }
+
+                Some(segment_sentence_results)
             })
             .collect();
 
-        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
+        let all_results: Vec<(SentenceResult, Score)> =
+            segment_results.into_iter().flatten().collect();
+
+        Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
     /// Execute fallback for other pattern types (Assertion, Disjunctive, Repetition)
