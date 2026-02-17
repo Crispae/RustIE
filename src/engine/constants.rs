@@ -11,6 +11,10 @@ pub const FIELD_SENTENCE_ID: &str = "sentence_id";
 pub const FIELD_INCOMING_EDGES: &str = "incoming_edges";
 pub const FIELD_OUTGOING_EDGES: &str = "outgoing_edges";
 
+/// Tokenizer names for position-aware indexing
+pub const TOKENIZER_EDGE_POSITION: &str = "edge_position_tokenizer";
+pub const TOKENIZER_TOKEN_POSITION: &str = "token_position_tokenizer";
+
 /// Token fields that use position-aware encoding
 pub const TOKEN_FIELDS: [&str; 8] = [
     "word", "lemma", "pos", "tag", "chunk", "entity", "norm", "raw"

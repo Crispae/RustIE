@@ -3,7 +3,13 @@ use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet};
 use tantivy::schema::Field;
 use crate::query::ast::Pattern;
 
-/// Query that wraps an inner query and tags its matches with a capture name
+/// Query that wraps an inner query and tags its matches with a capture name.
+///
+/// Following the Odinson approach, captures are computed lazily at result-collection
+/// time rather than eagerly during scorer iteration.  The scorer is a thin
+/// pass-through to the inner scorer — it only finds matching documents and
+/// delegates scoring.  Capture extraction happens in the execution layer using
+/// already-loaded document data, eliminating redundant document-store reads.
 #[derive(Debug)]
 pub struct RustieNamedCaptureQuery {
     pub inner_query: Box<dyn Query>,
@@ -50,21 +56,45 @@ impl RustieNamedCaptureQuery {
         let inner_weight = self.inner_query.weight(scoring)?;
         Ok(RustieNamedCaptureWeight {
             inner_weight,
-            capture_name: self.capture_name.clone(),
-            pattern: self.pattern.clone(),
             default_field: self.default_field,
         })
+    }
+
+    /// Compute named captures for a document given its already-loaded token data.
+    /// This avoids redundant document-store reads since the execution layer already
+    /// loads the document for `extract_sentence_result`.
+    pub fn compute_captures(
+        capture_name: &str,
+        pattern: &Pattern,
+        field_name: &str,
+        tokens: &[String],
+    ) -> Vec<crate::types::SpanWithCaptures> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let match_positions = pattern.extract_matching_positions(field_name, tokens);
+
+        match_positions
+            .into_iter()
+            .map(|pos| {
+                let span = crate::types::Span { start: pos, end: pos + 1 };
+                let capture = crate::types::NamedCapture::new(
+                    capture_name.to_string(),
+                    span.clone(),
+                );
+                crate::types::SpanWithCaptures::with_captures(span, vec![capture])
+            })
+            .collect()
     }
 }
 
 impl Query for RustieNamedCaptureQuery {
     fn weight(&self, scoring: EnableScoring<'_>) -> TantivyResult<Box<dyn Weight>> {
         let inner_weight = self.inner_query.weight(scoring)?;
-        
+
         Ok(Box::new(RustieNamedCaptureWeight {
             inner_weight,
-            capture_name: self.capture_name.clone(),
-            pattern: self.pattern.clone(),
             default_field: self.default_field,
         }))
     }
@@ -74,13 +104,12 @@ impl Query for RustieNamedCaptureQuery {
 
 pub(crate) struct RustieNamedCaptureWeight {
     inner_weight: Box<dyn Weight>,
-    capture_name: String,
-    pattern: Pattern,
     default_field: Field,
 }
 
 impl RustieNamedCaptureWeight {
-    /// Build the concrete scorer for this segment. Used by execution to avoid boxing and enable take_current_doc_matches.
+    /// Build the concrete scorer for this segment.
+    /// The scorer is a thin pass-through — no document-store access, no eager match computation.
     pub(crate) fn concrete_scorer(
         &self,
         reader: &SegmentReader,
@@ -89,13 +118,11 @@ impl RustieNamedCaptureWeight {
         let inner_scorer = self.inner_weight.scorer(reader, boost)?;
         Ok(RustieNamedCaptureScorer {
             inner_scorer,
-            capture_name: self.capture_name.clone(),
-            pattern: self.pattern.clone(),
-            default_field: self.default_field,
-            reader: reader.clone(),
-            current_doc_matches: Vec::new(),
-            current_doc: None,
         })
+    }
+
+    pub fn default_field(&self) -> Field {
+        self.default_field
     }
 }
 
@@ -109,14 +136,12 @@ impl Weight for RustieNamedCaptureWeight {
     }
 }
 
+/// Thin pass-through scorer: delegates document iteration and scoring to the
+/// inner scorer.  No document-store access, no eager match computation.
+/// Captures are computed lazily in the execution layer via
+/// `RustieNamedCaptureQuery::compute_captures`.
 pub struct RustieNamedCaptureScorer {
     inner_scorer: Box<dyn Scorer>,
-    capture_name: String,
-    pattern: Pattern,
-    default_field: Field,
-    reader: SegmentReader,
-    current_doc_matches: Vec<crate::types::SpanWithCaptures>,
-    current_doc: Option<DocId>,
 }
 
 impl Scorer for RustieNamedCaptureScorer {
@@ -127,15 +152,7 @@ impl Scorer for RustieNamedCaptureScorer {
 
 impl DocSet for RustieNamedCaptureScorer {
     fn advance(&mut self) -> DocId {
-        let doc_id = self.inner_scorer.advance();
-        if doc_id != tantivy::TERMINATED {
-            self.current_doc = Some(doc_id);
-            // Pre-calculate matches for this document
-            self.calculate_matches(doc_id);
-        } else {
-            self.current_doc = None;
-        }
-        doc_id
+        self.inner_scorer.advance()
     }
 
     fn doc(&self) -> DocId {
@@ -144,72 +161,5 @@ impl DocSet for RustieNamedCaptureScorer {
 
     fn size_hint(&self) -> u32 {
         self.inner_scorer.size_hint()
-    }
-}
-
-impl RustieNamedCaptureScorer {
-    fn calculate_matches(&mut self, doc_id: DocId) {
-        self.current_doc_matches.clear();
-        
-        // Strategy:
-        // 1. If inner scorer is one of our custom scorers (concatenated, etc), 
-        //    we can extract its matches and wrap them.
-        // 2. If inner scorer is a basic primitive (term query), 
-        //    we scan the document for the pattern.
-        
-        // Try downcasting to known custom scorers 
-        // (This would require known types to be public/accessible)
-        // For now, simpler robust approach: SCAN DOCUMENT
-        // This ensures correct behavior regardless of inner query optimization
-        
-        // 1. Get tokens
-        let store_reader = match self.reader.get_store_reader(1) {
-            Ok(reader) => reader,
-            Err(_) => return,
-        };
-        let doc = match store_reader.get::<tantivy::schema::TantivyDocument>(doc_id) {
-            Ok(doc) => doc,
-            Err(_) => return,
-        };
-        
-        // 1. Get tokens for the default field
-        let field_name = self.reader.schema().get_field_name(self.default_field);
-        let tokens = crate::tantivy_integration::utils::extract_field_values(self.reader.schema(), &doc, field_name);
-
-        if tokens.is_empty() {
-             return;
-        }
-
-        // 2. Find matching positions
-        // We use a field cache for consistency, even if it's just one field for now
-        let mut field_cache = std::collections::HashMap::new();
-        field_cache.insert(field_name.to_string(), tokens.clone());
-
-        let match_positions = self.pattern.extract_matching_positions(field_name, &tokens);
-
-        // 3. Create named captures
-        for pos in match_positions {
-            let span = crate::types::Span { start: pos, end: pos + 1 };
-            
-            // Create the capture with OUR name
-            let capture = crate::types::NamedCapture::new(
-                self.capture_name.clone(), 
-                span.clone()
-            );
-            
-            self.current_doc_matches.push(crate::types::SpanWithCaptures::with_captures(
-                span, 
-                vec![capture]
-            ));
-        }
-    }
-
-    pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
-        &self.current_doc_matches
-    }
-
-    /// Take the current document's matches, leaving an empty vec. Avoids clone in hot path.
-    pub fn take_current_doc_matches(&mut self) -> Vec<crate::types::SpanWithCaptures> {
-        std::mem::take(&mut self.current_doc_matches)
     }
 }

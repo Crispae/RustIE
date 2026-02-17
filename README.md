@@ -49,17 +49,21 @@ cargo run --bin api_server -- --host 0.0.0.0 --port 8080 --index-path ./index
 
 ### Querying Documents
 
+All queries use cursor-based pagination. Use `POST /api/v1/search` with `page_size` and optional `after` cursor for subsequent pages.
+
 ```bash
 # Health check
 curl http://localhost:8080/api/v1/health
 
-# Query documents
-curl -X POST http://localhost:8080/api/v1/query \
+# Paginated search (first page)
+curl -X POST http://localhost:8080/api/v1/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "[word=John] >nsubj [pos=VBZ]", "limit": 10}'
+  -d '{"query": "[word=John] >nsubj [pos=VBZ]", "page_size": 15}'
 
-# Simple query
-curl "http://localhost:8080/api/v1/query/[word=John]%20%3Ensubj%20[pos=VBZ]"
+# Next page (use next_cursor from previous response)
+curl -X POST http://localhost:8080/api/v1/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "[word=John] >nsubj [pos=VBZ]", "page_size": 15, "after": {"segment_ord": 0, "doc_id": 42, "score": 1.5}}'
 ```
 
 For detailed API documentation, see [API_README.md](API_README.md).

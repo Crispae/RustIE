@@ -52,12 +52,12 @@ fn main() -> Result<()> {
     let mut total_hits = 0;
     
     for i in 0..args.iterations {
-        match engine.query(query) {
+        match engine.query_paginated(query, 100, None) {
             Ok(result) => {
                 total_hits += result.total_hits;
                 if i == 0 {
                     println!("First run: {} hits", result.total_hits);
-                    if let Some(max_score) = result.max_score {
+                    if let Some(max_score) = result.sentence_results.first().map(|r| r.score) {
                         println!("Max score: {:.4}", max_score);
                     }
                     println!("Sample results: {} sentences", result.sentence_results.len());

@@ -304,13 +304,13 @@ fields:
     // ==================== Execution tests ====================
 
     #[test]
-    fn test_execution_query_with_limit_basic() {
+    fn test_execution_query_paginated_basic() {
         let (mut engine, _tmp) = engine_with_temp_dir();
         let doc = minimal_document();
         engine.add_document(&doc).expect("add_document");
         engine.commit().expect("commit");
 
-        let result = engine.query_with_limit("[word=John]", 10).expect("query");
+        let result = engine.query_paginated("[word=John]", 10, None).expect("query");
         assert!(result.total_hits >= 1, "expected at least one hit");
         assert!(!result.sentence_results.is_empty());
     }
@@ -322,19 +322,19 @@ fields:
         engine.add_document(&doc).expect("add_document");
         engine.commit().expect("commit");
 
-        let result = engine.query("[word=nonexistentword]").expect("query");
+        let result = engine.query_paginated("[word=nonexistentword]", 10, None).expect("query");
         assert_eq!(result.total_hits, 0);
         assert!(result.sentence_results.is_empty());
     }
 
     #[test]
-    fn test_execution_query_with_limit_respected() {
+    fn test_execution_query_page_size_respected() {
         let (mut engine, _tmp) = engine_with_temp_dir();
         let doc = minimal_document();
         engine.add_document(&doc).expect("add_document");
         engine.commit().expect("commit");
 
-        let result = engine.query_with_limit("[word=John]", 1).expect("query");
-        assert!(result.sentence_results.len() <= 1, "limit 1 should return at most 1 result");
+        let result = engine.query_paginated("[word=John]", 1, None).expect("query");
+        assert!(result.sentence_results.len() <= 1, "page_size 1 should return at most 1 result");
     }
 }

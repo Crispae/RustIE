@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }"#;
 
     // Create schema (using the same schema as ExtractorEngine)
-    let (schema, _) = ExtractorEngine::create_schema_from_yaml("configs/schema.yaml")?;
+    let (schema, _) = rustie::engine::schema::create_schema_from_yaml("configs/schema.yaml")?;
     let mut parser = DocumentParser::new(schema);
 
     // Parse the JSON string

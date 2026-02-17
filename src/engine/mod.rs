@@ -19,7 +19,7 @@ pub mod schema;
 // Re-export main types for convenience
 pub use config::{FieldConfig, SchemaConfig};
 pub use constants::*;
-pub use core::ExtractorEngine;
+pub use core::{EngineConfig, ExtractorEngine};
 pub use execution::PaginatedResult;
 pub use schema::create_schema_from_yaml;
 
