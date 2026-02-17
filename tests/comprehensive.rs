@@ -8,10 +8,10 @@ mod common;
 
 use rstest::rstest;
 
-/// Helper: run a query, return the number of hits (panics on query error).
+/// Helper: run a paginated query, return the number of hits (panics on query error).
 fn query_hits(engine: &rustie::ExtractorEngine, query: &str) -> usize {
     engine
-        .query(query)
+        .query_paginated(query, 100, None)
         .unwrap_or_else(|e| panic!("Query '{}' failed: {}", query, e))
         .total_hits
 }
@@ -189,7 +189,7 @@ fn complex_pattern(#[case] query: &str, #[case] expected_min: usize) {
 #[test]
 fn detailed_results_include_words_and_matches() {
     let (engine, _tmp) = common::test_engine();
-    let result = engine.query("[word=TAZ]").expect("query should not fail");
+    let result = engine.query_paginated("[word=TAZ]", 100, None).expect("query should not fail");
     assert!(result.total_hits >= 1, "Should have at least 1 hit for [word=TAZ]");
 
     for sentence in &result.sentence_results {

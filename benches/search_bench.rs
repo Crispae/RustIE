@@ -1,7 +1,6 @@
 // benches/search_bench.rs
 //
-// Criterion benchmarks comparing the old query path (query_with_limit)
-// vs the new paginated path (query_paginated) for simple term queries.
+// Criterion benchmarks for paginated query path (query_paginated).
 //
 // Run with:
 //   cargo bench --bench search_bench
@@ -29,24 +28,11 @@ fn setup_engine() -> Arc<ExtractorEngine> {
 /// Simple entity query that should match documents in the test index.
 const SIMPLE_QUERY: &str = "([entity=/B-Gene/])";
 
-fn bench_old_vs_paginated(c: &mut Criterion) {
+fn bench_paginated_page1(c: &mut Criterion) {
     let engine = setup_engine();
 
     let mut group = c.benchmark_group("simple_entity_query");
     group.sample_size(30);
-
-    let _ = engine.query_with_limit(SIMPLE_QUERY, 10);
-
-    for limit in [10, 100, 1000, 6000] {
-        let engine = engine.clone();
-        group.bench_with_input(
-            BenchmarkId::new("query_with_limit", limit),
-            &limit,
-            |b, &limit| {
-                b.iter(|| black_box(engine.query_with_limit(SIMPLE_QUERY, limit).unwrap()))
-            },
-        );
-    }
 
     for page_size in [15, 50, 100] {
         let engine = engine.clone();
@@ -169,7 +155,7 @@ fn bench_references_field(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_old_vs_paginated,
+    bench_paginated_page1,
     bench_paginated_page2,
     bench_parse_and_compile,
     bench_references_field,

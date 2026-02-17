@@ -3,9 +3,8 @@
 use crate::engine::constants::*;
 use crate::engine::core::ExtractorEngine;
 use crate::engine::pagination_driver::{PaginationDriver, Paginatable};
-use crate::query::ast::Pattern;
 use crate::query::compiler::CompiledQuery;
-use crate::results::rustie_results::{RustIeResult, SentenceResult};
+use crate::results::rustie_results::SentenceResult;
 use crate::tantivy_integration::concat_query::{RustieConcatQuery, RustieConcatWeight};
 use crate::tantivy_integration::graph_traversal::{
     OptimizedGraphTraversalQuery, OptimizedGraphTraversalWeight,
@@ -21,13 +20,8 @@ use anyhow::Result;
 use log;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tantivy::{
-    collector::TopDocs,
-    query::{Query, Scorer},
-    DocAddress, DocSet, Score,
-};
+use tantivy::{query::{Query, Scorer}, DocAddress, DocSet, Score};
 
 /// Result of a paginated search: total hits, one page of sentence results, optional next cursor.
 pub struct PaginatedResult {
@@ -113,19 +107,6 @@ impl Paginatable for ScoredSentence {
 }
 
 impl ExtractorEngine {
-    
-    /// Execute a query string and return results
-    pub fn query(&self, query: &str) -> Result<RustIeResult> {
-        self.query_with_limit(query, self.num_docs())
-    }
-
-    /// Execute a query string with a limit on results
-    pub fn query_with_limit(&self, query: &str, limit: usize) -> Result<RustIeResult> {
-        let pattern = self.parser().parse_query(query)?;
-        let compiled = self.compiler().compile_pattern(&pattern)?;
-        self.execute_query(&compiled, limit, &pattern)
-    }
-
     /// Execute a query with Odinson-style cursor-based pagination.
     /// Supports all pattern types: basic constraints, graph traversal, concatenated, and named captures.
     pub fn query_paginated(
@@ -211,95 +192,6 @@ impl ExtractorEngine {
             sentence_results,
             next_cursor,
         })
-    }
-
-    /// Execute a compiled query. Each variant is dispatched to its specialised executor
-    /// with full type information — no runtime downcasting required.
-    pub fn execute_query(
-        &self,
-        compiled: &CompiledQuery,
-        limit: usize,
-        pattern: &Pattern,
-    ) -> Result<RustIeResult> {
-        match compiled {
-            CompiledQuery::Graph(gq) => self.execute_graph_traversal(gq, limit),
-            CompiledQuery::Concat(cq) => self.execute_optimized_pattern_matching(cq, limit),
-            CompiledQuery::NamedCapture(nq) => self.execute_named_capture_matching(nq, limit),
-            CompiledQuery::Basic(bq) => self.execute_fallback(bq.as_ref(), limit, pattern),
-        }
-    }
-
-    /// Execute graph traversal queries using dependency graph edges
-    /// OPTIMIZED: Parallel segment processing + Single-pass collection
-    fn execute_graph_traversal(
-        &self,
-        graph_query: &OptimizedGraphTraversalQuery,
-        limit: usize,
-    ) -> Result<RustIeResult> {
-
-        let searcher = self.reader.searcher();
-        let num_segments = searcher.segment_readers().len();
-
-        // Create weight once and share across segments. Use BM25 when searcher + terms available.
-        let score_field = self.default_field();
-        let weight: Arc<OptimizedGraphTraversalWeight> = Arc::new(
-            graph_query
-                .concrete_weight_with_bm25(&searcher, self.regex_cache.clone(), score_field)
-                .or_else(|_| graph_query.concrete_weight_with_cache(self.regex_cache.clone()))
-                .map_err(anyhow::Error::from)?,
-        );
-
-        // PARALLEL: Process all segments concurrently using Rayon
-        let segment_results: Vec<(Vec<(SentenceResult, Score)>, u32)> = (0..num_segments)
-            .into_par_iter()
-            .filter_map(|segment_ord| {
-                let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("graph traversal: segment {segment_ord} scorer creation failed: {e}");
-                        return None;
-                    }
-                };
-
-                let mut segment_sentence_results = Vec::new();
-
-                loop {
-                    let doc_id = scorer.doc();
-                    if doc_id == tantivy::TERMINATED {
-                        break;
-                    }
-
-                    let score = scorer.score();
-                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
-
-                    let matches = scorer.take_current_doc_matches();
-
-                    if let Ok(doc) = searcher.doc(doc_address) {
-                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
-                            sentence_result.matches = matches;
-                            segment_sentence_results.push((sentence_result, score));
-                        }
-                    }
-
-                    if scorer.advance() == tantivy::TERMINATED {
-                        break;
-                    }
-                }
-
-                Some((segment_sentence_results, segment_ord as u32))
-            })
-            .collect();
-
-        
-            // MERGE: Combine results from all segments
-        let all_results: Vec<(SentenceResult, Score)> = segment_results
-            .into_iter()
-            .flat_map(|(results, _)| results)
-            .collect();
-
-        Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
     /// Best-effort paginated execution for graph traversal queries.
@@ -394,65 +286,6 @@ impl ExtractorEngine {
         })
     }
 
-    /// Execute optimized pattern matching queries using custom scorer
-    /// OPTIMIZED: Parallel segment processing
-    fn execute_optimized_pattern_matching(
-        &self,
-        pattern_query: &RustieConcatQuery,
-        limit: usize,
-    ) -> Result<RustIeResult> {
-
-        let searcher = self.reader.searcher();
-        let num_segments = searcher.segment_readers().len();
-
-        let weight: Arc<RustieConcatWeight> = Arc::new(
-            pattern_query.concrete_weight(&searcher, self.regex_cache.clone()).map_err(anyhow::Error::from)?,
-        );
-
-        let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
-            .into_par_iter()
-            .filter_map(|segment_ord| {
-                let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("pattern matching: segment {segment_ord} scorer creation failed: {e}");
-                        return None;
-                    }
-                };
-
-                let mut segment_sentence_results = Vec::new();
-
-                loop {
-                    let doc_id = scorer.advance();
-                    if doc_id == tantivy::TERMINATED {
-                        break;
-                    }
-
-                    let score = scorer.score();
-                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
-
-                    let matches = scorer.take_current_doc_matches();
-
-                    if let Ok(doc) = searcher.doc(doc_address) {
-                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
-                            sentence_result.matches = matches;
-                            segment_sentence_results.push((sentence_result, score));
-                        }
-                    }
-                }
-
-                Some(segment_sentence_results)
-            })
-            .collect();
-
-        let all_results: Vec<(SentenceResult, Score)> =
-            segment_results.into_iter().flatten().collect();
-
-        Ok(Self::build_result_from_sentence_results(all_results, limit))
-    }
-
     /// Paginated execution for concatenated pattern queries.
     /// Same parallel-segment approach as the non-paginated variant, then sort + paginate.
     fn execute_concat_paginated(
@@ -533,82 +366,6 @@ impl ExtractorEngine {
             sentence_results,
             next_cursor: page.next_cursor,
         })
-    }
-
-    /// Execute named capture pattern matching queries.
-    /// Uses parallel segment processing (like graph traversal / concat) with lazy
-    /// capture computation — captures are extracted from already-loaded document
-    /// data at result-collection time, avoiding redundant document-store reads.
-    fn execute_named_capture_matching(
-        &self,
-        named_query: &RustieNamedCaptureQuery,
-        limit: usize,
-    ) -> Result<RustIeResult> {
-
-        let searcher = self.reader.searcher();
-        let num_segments = searcher.segment_readers().len();
-
-        // Create weight once; share across segments.
-        let weight: Arc<RustieNamedCaptureWeight> = Arc::new(
-            named_query.concrete_weight(&searcher).map_err(anyhow::Error::from)?,
-        );
-
-        let capture_name = named_query.capture_name.clone();
-        let pattern = named_query.pattern.clone();
-
-        // Parallel segment processing
-        let segment_results: Vec<Vec<(SentenceResult, Score)>> = (0..num_segments)
-            .into_par_iter()
-            .filter_map(|segment_ord| {
-                let segment_reader = searcher.segment_reader(segment_ord as u32);
-
-                let mut scorer = match weight.concrete_scorer(segment_reader, 1.0) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::warn!("named capture: segment {segment_ord} scorer creation failed: {e}");
-                        return None;
-                    }
-                };
-
-                let field_name = searcher
-                    .schema()
-                    .get_field_name(weight.default_field())
-                    .to_string();
-
-                let mut segment_sentence_results = Vec::new();
-
-                loop {
-                    let doc_id = scorer.advance();
-                    if doc_id == tantivy::TERMINATED {
-                        break;
-                    }
-
-                    let score = scorer.score();
-                    let doc_address = DocAddress::new(segment_ord as u32, doc_id);
-
-                    if let Ok(doc) = searcher.doc(doc_address) {
-                        if let Ok(mut sentence_result) = self.extract_sentence_result(&doc, score) {
-                            // Lazy capture: compute from already-loaded doc data
-                            let tokens = self.extract_field_values(&doc, &field_name);
-                            sentence_result.matches = RustieNamedCaptureQuery::compute_captures(
-                                &capture_name,
-                                &pattern,
-                                &field_name,
-                                &tokens,
-                            );
-                            segment_sentence_results.push((sentence_result, score));
-                        }
-                    }
-                }
-
-                Some(segment_sentence_results)
-            })
-            .collect();
-
-        let all_results: Vec<(SentenceResult, Score)> =
-            segment_results.into_iter().flatten().collect();
-
-        Ok(Self::build_result_from_sentence_results(all_results, limit))
     }
 
     /// Paginated execution for named capture queries.
@@ -704,99 +461,6 @@ impl ExtractorEngine {
             sentence_results,
             next_cursor: page.next_cursor,
         })
-    }
-
-    /// Execute fallback for other pattern types (Assertion, Disjunctive, Repetition)
-    fn execute_fallback(
-        &self,
-        query: &dyn Query,
-        limit: usize,
-        pattern: &crate::query::ast::Pattern,
-    ) -> Result<RustIeResult> {
-
-        let searcher = self.reader.searcher();
-        let top_docs = searcher
-            .search(query, &TopDocs::with_limit(limit))
-            .map_err(anyhow::Error::from)?;
-
-        let mut sentence_results = Vec::new();
-
-        for (score, doc_address) in top_docs {
-            if let Ok(doc) = self.doc(doc_address) {
-                let mut sentence_result = self.extract_sentence_result(&doc, score)?;
-                let tokens = self.extract_field_values(&doc, FIELD_WORD);
-
-                let match_positions = pattern.extract_matching_positions(FIELD_WORD, &tokens);
-
-                let mut fallback_matches = Vec::new();
-                for (i, &start) in match_positions.iter().enumerate() {
-                    let span = crate::types::Span {
-                        start,
-                        end: start + 1,
-                    };
-                    let capture = crate::types::NamedCapture::new(format!("c{}", i), span.clone());
-                    fallback_matches
-                        .push(crate::types::SpanWithCaptures::with_captures(span, vec![capture]));
-                }
-
-                sentence_result.matches = fallback_matches;
-                sentence_results.push(sentence_result);
-            }
-        }
-
-        let results_with_scores: Vec<(SentenceResult, Score)> = sentence_results
-            .into_iter()
-            .map(|r| {
-                let score = r.score;
-                (r, score)
-            })
-            .collect();
-
-        Ok(Self::build_result_from_sentence_results(results_with_scores, limit))
-    }
-
-    /// Build result from sentence results with deduplication and max score computation
-    fn build_result_from_sentence_results(
-        results: Vec<(SentenceResult, Score)>,
-        limit: usize,
-    ) -> RustIeResult {
-        let deduplicated = Self::deduplicate_results(results, limit);
-        let max_score = deduplicated.first().map(|r| r.score);
-
-        RustIeResult {
-            total_hits: deduplicated.len(),
-            score_docs: Vec::new(), // Always empty - sentence_results is the primary data structure
-            sentence_results: deduplicated,
-            max_score,
-        }
-    }
-
-    /// Deduplicate results based on (document_id, sentence_id), keeping highest score.
-    /// Uses tuple keys instead of format! to avoid heap allocation per result.
-    fn deduplicate_results(
-        results: Vec<(SentenceResult, Score)>,
-        limit: usize,
-    ) -> Vec<SentenceResult> {
-        let mut seen: HashMap<(Arc<str>, Arc<str>), SentenceResult> = HashMap::new();
-
-        for (result, score) in results {
-            let key = (result.document_id.clone(), result.sentence_id.clone());
-            match seen.get(&key) {
-                Some(existing) => {
-                    if score > existing.score {
-                        seen.insert(key, result);
-                    }
-                }
-                None => {
-                    seen.insert(key, result);
-                }
-            }
-        }
-
-        let mut deduplicated: Vec<SentenceResult> = seen.into_values().collect();
-        deduplicated.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        deduplicated.truncate(limit);
-        deduplicated
     }
 }
 
