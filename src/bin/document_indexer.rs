@@ -62,7 +62,6 @@ struct IndexStats {
     total_sentences: usize,
     total_tokens: usize,
     total_dependency_labels: usize,
-    current_file: Option<String>,
     start_time: std::time::Instant,
 }
 
@@ -75,7 +74,6 @@ impl Default for IndexStats {
             total_sentences: 0,
             total_tokens: 0,
             total_dependency_labels: 0,
-            current_file: None,
             start_time: std::time::Instant::now(),
         }
     }
@@ -316,7 +314,7 @@ impl DocumentIndexer {
     }
 
     /// Index a single document
-    fn index_document(&mut self, document: &Document, source_path: &Path) -> Result<()> {
+    fn index_document(&mut self, document: &Document, _source_path: &Path) -> Result<()> {
         // Update statistics
         self.stats.total_sentences += document.sentences.len();
         

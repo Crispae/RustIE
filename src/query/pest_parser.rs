@@ -41,7 +41,6 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
 
             // Collect all pattern links
             let mut patterns = vec![first];
-            let mut pending_traversal: Option<crate::query::ast::Traversal> = None;
 
             for link_pair in pairs {
                 match link_pair.as_rule() {
@@ -54,7 +53,7 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                                 let mut trav_inner = inner.into_inner();
                                 let traversal_op_pair = trav_inner.next().unwrap();
                                 let inner_traversal = traversal_op_pair.into_inner().next().unwrap();
-                                pending_traversal = Some(build_traversal_op(inner_traversal));
+                                let traversal = build_traversal_op(inner_traversal);
 
                                 // The destination pattern follows inside the traversal
                                 if let Some(dst_pair) = trav_inner.next() {
@@ -67,7 +66,7 @@ pub fn build_ast(pair: pest::iterators::Pair<Rule>) -> Pattern {
                                     };
                                     patterns = vec![Pattern::GraphTraversal {
                                         src: Box::new(src),
-                                        traversal: pending_traversal.take().unwrap(),
+                                        traversal,
                                         dst: Box::new(dst),
                                     }];
                                 }

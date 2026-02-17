@@ -9,6 +9,7 @@ use tantivy::{
     Term,
 };
 
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
 use crate::query::ast::{Pattern, Constraint, Matcher};
@@ -16,9 +17,13 @@ use super::types::CollapsedSpec;
 use super::weight::{OptimizedGraphTraversalWeight, RegexCache, RegexCacheInner};
 use super::pattern_utils::{flatten_graph_traversal_pattern, build_position_prefilter_plan};
 
+/// Maximum number of regex-expanded terms to feed into BM25 IDF.
+/// Prevents pathological patterns from expanding the entire term dictionary.
+const MAX_REGEX_TERMS_FOR_BM25: usize = 256;
+
 /// Collect Tantivy terms from a pattern for BM25 IDF. Only exact string constraints
 /// contribute a term; regex/wildcard are skipped.
-fn extract_terms_from_pattern(pattern: &Pattern, schema: &Schema, terms: &mut Vec<Term>) {
+pub(crate) fn extract_terms_from_pattern(pattern: &Pattern, schema: &Schema, terms: &mut Vec<Term>) {
     match pattern {
         Pattern::Constraint(c) => extract_terms_from_constraint(c, schema, terms),
         Pattern::NamedCapture { pattern: inner, .. } => extract_terms_from_pattern(inner, schema, terms),
@@ -57,6 +62,102 @@ fn extract_terms_from_constraint(c: &Constraint, schema: &Schema, terms: &mut Ve
         }
         Constraint::Negated(inner) => extract_terms_from_constraint(inner, schema, terms),
         Constraint::Wildcard | Constraint::Fuzzy { .. } => {}
+    }
+}
+
+/// Expand regex constraints to Term objects by searching the index term dictionary.
+///
+/// Called at weight-creation time (Searcher available) to give BM25 real IDF for
+/// regex patterns — the same way Odinson's `SpanMultiTermQueryWrapper` expands
+/// regex terms at query time before computing BM25 weights.
+///
+/// Iterates all segment readers, deduplicates across segments, and caps at
+/// `MAX_REGEX_TERMS_FOR_BM25` to bound the cost. **Caches results** per (pattern, field)
+/// to avoid redundant FST traversals across repeated queries.
+pub(crate) fn expand_regex_terms_from_pattern(
+    pattern: &Pattern,
+    schema: &Schema,
+    searcher: &tantivy::Searcher,
+    regex_cache: &super::weight::RegexCache,
+    terms: &mut Vec<Term>,
+) {
+    match pattern {
+        Pattern::Constraint(c) => expand_regex_terms_from_constraint(c, schema, searcher, regex_cache, terms),
+        Pattern::NamedCapture { pattern: inner, .. } =>
+            expand_regex_terms_from_pattern(inner, schema, searcher, regex_cache, terms),
+        Pattern::Repetition { pattern: inner, .. } =>
+            expand_regex_terms_from_pattern(inner, schema, searcher, regex_cache, terms),
+        Pattern::GraphTraversal { src, dst, .. } => {
+            expand_regex_terms_from_pattern(src, schema, searcher, regex_cache, terms);
+            expand_regex_terms_from_pattern(dst, schema, searcher, regex_cache, terms);
+        }
+        Pattern::Disjunctive(patterns) | Pattern::Concatenated(patterns) => {
+            for p in patterns {
+                expand_regex_terms_from_pattern(p, schema, searcher, regex_cache, terms);
+            }
+        }
+        Pattern::Assertion(_) | Pattern::Mention { .. } => {}
+    }
+}
+
+fn expand_regex_terms_from_constraint(
+    c: &Constraint,
+    schema: &Schema,
+    searcher: &tantivy::Searcher,
+    regex_cache: &super::weight::RegexCache,
+    terms: &mut Vec<Term>,
+) {
+    match c {
+        Constraint::Field { name, matcher: Matcher::Regex { pattern, .. } } => {
+            if let Ok(field) = schema.get_field(name) {
+                // Fast path: check cache
+                if let Ok(cache_guard) = regex_cache.read() {
+                    if let Some(cached_terms) = cache_guard.get_expanded_terms(pattern, field) {
+                        terms.extend(cached_terms);
+                        return;
+                    }
+                }
+
+                // Slow path: FST traversal across all segments
+                if let Ok(fst_regex) = tantivy_fst::Regex::new(pattern) {
+                    let mut seen: HashSet<Vec<u8>> = HashSet::new();
+                    for reader in searcher.segment_readers() {
+                        if let Ok(inv_idx) = reader.inverted_index(field) {
+                            let term_dict = inv_idx.terms();
+                            if let Ok(mut stream) = term_dict.search(&fst_regex).into_stream() {
+                                while stream.advance() {
+                                    if seen.len() >= MAX_REGEX_TERMS_FOR_BM25 {
+                                        break;
+                                    }
+                                    seen.insert(stream.key().to_vec());
+                                }
+                            }
+                        }
+                    }
+                    let expanded: Vec<Term> = seen.into_iter()
+                        .map(|bytes| {
+                            let term_str = String::from_utf8_lossy(&bytes);
+                            Term::from_field_text(field, &term_str)
+                        })
+                        .collect();
+
+                    // Cache the result
+                    if let Ok(mut cache_guard) = regex_cache.write() {
+                        cache_guard.insert_expanded_terms(pattern.to_string(), field, expanded.clone());
+                    }
+
+                    terms.extend(expanded);
+                }
+            }
+        }
+        Constraint::Conjunctive(cs) | Constraint::Disjunctive(cs) => {
+            for c in cs {
+                expand_regex_terms_from_constraint(c, schema, searcher, regex_cache, terms);
+            }
+        }
+        Constraint::Negated(inner) =>
+            expand_regex_terms_from_constraint(inner, schema, searcher, regex_cache, terms),
+        _ => {}
     }
 }
 
@@ -161,11 +262,41 @@ impl OptimizedGraphTraversalQuery {
         let mut terms = Vec::new();
         extract_terms_from_pattern(&self.src_pattern, schema, &mut terms);
         extract_terms_from_pattern(&self.dst_pattern, schema, &mut terms);
+        expand_regex_terms_from_pattern(&self.src_pattern, schema, searcher, &regex_cache, &mut terms);
+        expand_regex_terms_from_pattern(&self.dst_pattern, schema, searcher, &regex_cache, &mut terms);
+        // Deduplicate so exact terms that also match a regex don't double-count IDF.
+        terms.sort_unstable();
+        terms.dedup();
 
+        // BM25 requires all terms to belong to the same field.
+        // Prefer score_field (default token field, Odinson-style). When no score_field
+        // terms exist (e.g., query only constrains entity/tag), fall back to the
+        // single field with the most terms so we still get IDF-based ranking.
         let bm25_weight = if terms.is_empty() {
             None
         } else {
-            Some(Bm25Weight::for_terms(searcher, &terms)?)
+            let score_field_terms: Vec<Term> = terms.iter()
+                .filter(|t| t.field() == score_field)
+                .cloned()
+                .collect();
+
+            if !score_field_terms.is_empty() {
+                Some(Bm25Weight::for_terms(searcher, &score_field_terms)?)
+            } else {
+                // Group by field, pick the one with the most terms
+                let mut by_field: std::collections::HashMap<Field, Vec<Term>> = std::collections::HashMap::new();
+                for t in &terms {
+                    by_field.entry(t.field()).or_default().push(t.clone());
+                }
+                let best_group = by_field.into_values()
+                    .max_by_key(|v| v.len())
+                    .unwrap_or_default();
+                if best_group.is_empty() {
+                    None
+                } else {
+                    Some(Bm25Weight::for_terms(searcher, &best_group)?)
+                }
+            }
         };
 
         Ok(OptimizedGraphTraversalWeight::new(

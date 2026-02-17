@@ -1,11 +1,17 @@
-use tantivy::query::{Query, Weight, Scorer, EnableScoring};
+use tantivy::query::{Query, Weight, Scorer, EnableScoring, Bm25Weight};
 use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet, Term};
 use tantivy::schema::{Field, IndexRecordOption, Value};
+use tantivy::fieldnorm::FieldNormReader;
 use tantivy::postings::Postings;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tantivy_fst::Regex;
 use crate::query::ast::{Pattern, Constraint, Matcher};
+use crate::tantivy_integration::graph_traversal::query::{
+    extract_terms_from_pattern,
+    expand_regex_terms_from_pattern,
+};
+use crate::tantivy_integration::graph_traversal::weight::RegexCache;
 
 /// Execution plan for anchor-based verification
 #[derive(Debug, Clone)]
@@ -87,6 +93,7 @@ impl RustieConcatQuery {
     pub(crate) fn concrete_weight(
         &self,
         searcher: &tantivy::Searcher,
+        regex_cache: RegexCache,
     ) -> TantivyResult<RustieConcatWeight> {
         let scoring = EnableScoring::Enabled {
             searcher,
@@ -96,12 +103,26 @@ impl RustieConcatQuery {
             .iter()
             .map(|q| q.weight(scoring.clone()))
             .collect::<TantivyResult<Vec<_>>>()?;
+        let schema = searcher.schema();
+        let mut terms = Vec::new();
+        extract_terms_from_pattern(&self.pattern, schema, &mut terms);
+        expand_regex_terms_from_pattern(&self.pattern, schema, searcher, &regex_cache, &mut terms);
+        // Deduplicate so exact terms that also match a regex don't double-count IDF.
+        terms.sort_unstable();
+        terms.dedup();
+        let bm25_weight = if terms.is_empty() {
+            None
+        } else {
+            Some(Bm25Weight::for_terms(searcher, &terms)?)
+        };
         Ok(RustieConcatWeight {
             sub_weights,
             pattern: self.pattern.clone(),
             default_field: self.default_field,
             concat_plan: self.concat_plan.clone(),
             regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            bm25_weight,
+            score_field: self.default_field,
         })
     }
 }
@@ -119,6 +140,8 @@ impl Query for RustieConcatQuery {
             default_field: self.default_field,
             concat_plan: self.concat_plan.clone(),
             regex_automaton_cache: Arc::new(RwLock::new(HashMap::<String, Arc<Regex>>::new())),
+            bm25_weight: None,
+            score_field: self.default_field,
         }))
     }
 }
@@ -130,33 +153,12 @@ pub(crate) struct RustieConcatWeight {
     concat_plan: Option<ConcatPlan>,
     /// Cached compiled regex automata (shared across segments, thread-safe)
     regex_automaton_cache: Arc<RwLock<HashMap<String, Arc<Regex>>>>,
+    /// BM25 weight for scoring (IDF + field norms). None when no terms or scoring disabled.
+    bm25_weight: Option<Bm25Weight>,
+    /// Field used for field norms (typically the default/word field).
+    score_field: Field,
 }
 
-/// Helper to extract constraints from a Pattern
-fn extract_constraints_from_pattern(pattern: &Pattern) -> Vec<&Constraint> {
-    use crate::query::ast::Pattern;
-    let mut constraints = Vec::new();
-    
-    match pattern {
-        Pattern::Concatenated(patterns) => {
-            for pat in patterns {
-                if let Pattern::Constraint(c) = pat {
-                    constraints.push(c);
-                } else if let Pattern::NamedCapture { pattern: p, .. } = pat {
-                    if let Pattern::Constraint(c) = p.as_ref() {
-                        constraints.push(c);
-                    }
-                }
-            }
-        }
-        Pattern::Constraint(c) => {
-            constraints.push(c);
-        }
-        _ => {}
-    }
-    
-    constraints
-}
 
 /// Compile constraint sources from pattern for postings-based matching
 fn compile_constraint_sources(
@@ -262,10 +264,10 @@ fn expand_regex_terms_with_automaton(
     term_dict: &tantivy::termdict::TermDictionary,
     automaton: &Regex,
     field: Field,
-    inverted_index: &tantivy::InvertedIndexReader,
+    _inverted_index: &tantivy::InvertedIndexReader,
     regex_cache: &mut HashMap<String, Vec<Term>>,
     cache_key: &str,
-    pattern: &str,
+    _pattern: &str,
 ) -> TantivyResult<Vec<Term>> {
     let mut stream = term_dict.search(automaton).into_stream()
         .map_err(|e| tantivy::TantivyError::SchemaError(format!("Failed to search term dict: {:?}", e)))?;
@@ -469,6 +471,8 @@ impl RustieConcatWeight {
         let execution_plan = compute_execution_plan(&constraint_sources, reader);
         
         let concat_plan = self.concat_plan.clone();
+        let fieldnorm_reader = reader.get_fieldnorms_reader(self.score_field).ok();
+        let boosted_bm25 = self.bm25_weight.as_ref().map(|w| w.clone().boost_by(boost));
 
         Ok(RustieConcatScorer {
             sub_scorers,
@@ -486,6 +490,8 @@ impl RustieConcatWeight {
             concat_plan,
             position_buffers: Vec::new(),
             regex_tmp: Vec::with_capacity(16),
+            bm25_weight: boosted_bm25,
+            fieldnorm_reader,
         })
     }
 }
@@ -516,6 +522,10 @@ pub struct RustieConcatScorer {
     concat_plan: Option<ConcatPlan>,
     position_buffers: Vec<Vec<u32>>,  // Reusable buffers for position collection
     regex_tmp: Vec<u32>,  // Reusable buffer for regex position collection
+    /// BM25 weight for scoring (IDF + field norms, boost already applied).
+    bm25_weight: Option<Bm25Weight>,
+    /// Field norm reader for the score field.
+    fieldnorm_reader: Option<FieldNormReader>,
 }
 
 impl RustieConcatScorer {
@@ -527,14 +537,20 @@ impl RustieConcatScorer {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
+        let (bm25, fnr) = match (&self.bm25_weight, &self.fieldnorm_reader) {
+            (Some(b), Some(f)) => (b, f),
+            // No extractable terms (pure regex/wildcard pattern) – flat score.
+            _ => return 1.0,
+        };
         let mut acc_sloppy_freq: Score = 0.0;
         for span_match in &self.current_doc_matches {
             let span_width = span_match.span.end.saturating_sub(span_match.span.start);
             acc_sloppy_freq += Self::compute_slop_factor(span_width);
         }
-        let base_score = 1.0;
-        let final_score = base_score * acc_sloppy_freq * self.boost;
-        final_score.max(1.0)
+        let doc = self.current_doc.unwrap_or(0);
+        let fieldnorm_id = fnr.fieldnorm_id(doc);
+        let term_freq = acc_sloppy_freq.ceil().max(1.0) as u32;
+        bm25.score(fieldnorm_id, term_freq).max(0.01)
     }
 }
 
@@ -559,7 +575,7 @@ impl DocSet for RustieConcatScorer {
         if !self.started {
             self.started = true;
             // Always advance all scorers once to land on first match
-            for (i, scorer) in self.sub_scorers.iter_mut().enumerate() {
+            for (_i, scorer) in self.sub_scorers.iter_mut().enumerate() {
                 let doc = scorer.advance();
                 if doc == tantivy::TERMINATED {
                     self.current_doc = None;
@@ -581,7 +597,7 @@ impl DocSet for RustieConcatScorer {
             let mut all_match = true;
             let mut next_target = candidate;
 
-            for (scorer_idx, scorer) in self.sub_scorers.iter_mut().skip(1).enumerate() {
+            for (_scorer_idx, scorer) in self.sub_scorers.iter_mut().skip(1).enumerate() {
                 let mut s_doc = scorer.doc();
 
                 while s_doc < candidate {
@@ -674,7 +690,7 @@ impl RustieConcatScorer {
                         return false;
                     }
                 }
-                Err(e) => {
+                Err(_) => {
                     // Fall through to return false
                 }
             }
@@ -833,11 +849,6 @@ impl RustieConcatScorer {
         }
         
         Err(tantivy::TantivyError::SchemaError("Cannot determine doc length".to_string()))
-    }
-
-    fn extract_tokens_from_field(&self, _doc: &tantivy::schema::TantivyDocument, _field_name: &str) -> Vec<String> {
-        // Deprecated: field extraction now happens in check_pattern_matching using the cache
-        vec![]
     }
 
     pub fn get_current_doc_matches(&self) -> &[crate::types::SpanWithCaptures] {
@@ -1496,7 +1507,6 @@ fn find_spans_scan<'a>(
     results
 }
 
-/// Original stored-field based matching (fallback)
 /// Maximum number of backtracking iterations to prevent exponential blowup
 const MAX_BACKTRACK_ITERATIONS: usize = 10_000;
 
@@ -1504,28 +1514,6 @@ const MAX_BACKTRACK_ITERATIONS: usize = 10_000;
 /// Prevents explosion when patterns have many valid matches
 const MAX_GENERATED_MATCHES: usize = 10_000;
 
-/// Try to match exactly `count` repetitions of a pattern starting at `pos`
-fn try_repetition_count(
-    pattern: &crate::query::ast::Pattern,
-    count: usize,
-    field_cache: &std::collections::HashMap<String, Vec<String>>,
-    mut pos: usize,
-    len: usize,
-    mut captures: Vec<crate::types::NamedCapture>,
-) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
-    for _ in 0..count {
-        if pos >= len {
-            return None;
-        }
-        if let Some(m) = matches_pattern_at_position(pattern, field_cache, pos) {
-            pos = m.span.end;
-            captures.extend(m.captures);
-        } else {
-            return None;
-        }
-    }
-    Some((pos, captures))
-}
 
 /// Try to match exactly `count` repetitions of a pattern starting at `pos`
 /// Returns (end_position, captures, sub_matches) if successful
@@ -1536,8 +1524,6 @@ fn try_repetition_count_with_metadata(
     start_pos: usize,
     len: usize,
 ) -> Option<(usize, Vec<crate::types::NamedCapture>, Vec<crate::types::MatchWithMetadata>)> {
-    use crate::types::MatchWithMetadata;
-    
     let mut current_pos = start_pos;
     let mut sub_matches = Vec::with_capacity(count);
     let mut all_captures = Vec::new();
@@ -1677,113 +1663,6 @@ pub fn generate_all_repetition_matches(
     matches
 }
 
-/// Recursive backtracking matcher for pattern sequences
-/// Returns Some((end_pos, captures)) if sequence matches, None otherwise
-fn match_sequence_recursive(
-    patterns: &[crate::query::ast::Pattern],
-    pattern_idx: usize,
-    field_cache: &std::collections::HashMap<String, Vec<String>>,
-    pos: usize,
-    len: usize,
-    captures: Vec<crate::types::NamedCapture>,
-    iteration_count: &mut usize,
-) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
-    use crate::query::ast::{Pattern, QuantifierKind};
-    
-    // Check iteration limit to prevent exponential blowup
-    *iteration_count += 1;
-    if *iteration_count > MAX_BACKTRACK_ITERATIONS {
-        return None;
-    }
-    
-    // Base case: all patterns matched successfully
-    if pattern_idx >= patterns.len() {
-        return Some((pos, captures));
-    }
-    
-    // Don't match beyond document length
-    if pos > len {
-        return None;
-    }
-    
-    let pat = &patterns[pattern_idx];
-    
-    // Special handling for Repetition patterns - these need backtracking
-    if let Pattern::Repetition { pattern: inner, min, max, kind } = pat {
-        // Calculate reasonable upper bound for repetitions
-        let max_possible = len.saturating_sub(pos);
-        let max_count = max.map(|m| m.min(max_possible)).unwrap_or(max_possible);
-        
-        if *kind == QuantifierKind::Lazy {
-            // Lazy: try shortest first (min, min+1, min+2, ..., max)
-            for count in *min..=max_count {
-                if let Some((end_pos, new_captures)) = try_repetition_count(
-                    inner, count, field_cache, pos, len, captures.clone()
-                ) {
-                    // Try to match remaining patterns with this repetition count
-                    if let Some(result) = match_sequence_recursive(
-                        patterns, pattern_idx + 1, field_cache, end_pos, len, new_captures, iteration_count
-                    ) {
-                        return Some(result);
-                    }
-                }
-                // If remaining patterns don't match, try next count
-            }
-            return None;
-        } else {
-            // Greedy: try longest first (max, max-1, max-2, ..., min)
-            for count in (*min..=max_count).rev() {
-                if let Some((end_pos, new_captures)) = try_repetition_count(
-                    inner, count, field_cache, pos, len, captures.clone()
-                ) {
-                    // Try to match remaining patterns with this repetition count
-                    if let Some(result) = match_sequence_recursive(
-                        patterns, pattern_idx + 1, field_cache, end_pos, len, new_captures, iteration_count
-                    ) {
-                        return Some(result);
-                    }
-                }
-                // If remaining patterns don't match, try shorter count
-            }
-            return None;
-        }
-    }
-    
-    // Non-repetition patterns: match normally and continue
-    if pos < len {
-        if let Some(m) = matches_pattern_at_position(pat, field_cache, pos) {
-            let mut new_captures = captures;
-            new_captures.extend(m.captures);
-            return match_sequence_recursive(
-                patterns, pattern_idx + 1, field_cache, m.span.end, len, new_captures, iteration_count
-            );
-        }
-    }
-    
-    // Special case: zero-width assertions can match at end of document
-    if let Pattern::Assertion(_) = pat {
-        if let Some(m) = matches_pattern_at_position(pat, field_cache, pos) {
-            let mut new_captures = captures;
-            new_captures.extend(m.captures);
-            return match_sequence_recursive(
-                patterns, pattern_idx + 1, field_cache, m.span.end, len, new_captures, iteration_count
-            );
-        }
-    }
-    
-    None
-}
-
-/// Entry point for backtracking sequence matcher
-fn match_sequence_with_backtracking(
-    patterns: &[crate::query::ast::Pattern],
-    field_cache: &std::collections::HashMap<String, Vec<String>>,
-    start_pos: usize,
-    len: usize,
-) -> Option<(usize, Vec<crate::types::NamedCapture>)> {
-    let mut iteration_count = 0;
-    match_sequence_recursive(patterns, 0, field_cache, start_pos, len, Vec::new(), &mut iteration_count)
-}
 
 /// Generate all valid sequence matches starting at a given position
 /// Returns all matches with metadata for selection algorithm
@@ -1793,8 +1672,8 @@ fn generate_all_sequence_matches_recursive(
     field_cache: &std::collections::HashMap<String, Vec<String>>,
     pos: usize,
     len: usize,
-    mut sub_matches: Vec<crate::types::MatchWithMetadata>,
-    mut captures: Vec<crate::types::NamedCapture>,
+    sub_matches: Vec<crate::types::MatchWithMetadata>,
+    captures: Vec<crate::types::NamedCapture>,
     iteration_count: &mut usize,
 ) -> Vec<crate::types::MatchWithMetadata> {
     use crate::query::ast::{Pattern, QuantifierKind};
@@ -2059,10 +1938,9 @@ pub fn generate_all_matches_at_position(
                 }
             }
         }
-        Pattern::Concatenated(nested_patterns) => {
-            // For concatenated patterns, we'll handle this at a higher level
+        Pattern::Concatenated(_) => {
+            // For concatenated patterns, handled at a higher level
             // in generate_all_sequence_matches
-            // For now, return empty - this will be handled by sequence generation
             Vec::new()
         }
         Pattern::GraphTraversal { .. } => {
@@ -2073,137 +1951,6 @@ pub fn generate_all_matches_at_position(
             // Mentions are handled separately
             Vec::new()
         }
-    }
-}
-
-fn matches_pattern_at_position(
-    pattern: &crate::query::ast::Pattern,
-    field_cache: &std::collections::HashMap<String, Vec<String>>,
-    pos: usize
-) -> Option<crate::types::SpanWithCaptures> {
-    use crate::query::ast::Pattern;
-    
-    match pattern {
-        Pattern::Constraint(constraint) => {
-            if matches_constraint_at_position(constraint, field_cache, pos) {
-                let span = crate::types::Span { start: pos, end: pos + 1 };
-                let capture = crate::types::NamedCapture::new(format!("c{}", pos), span.clone());
-                Some(crate::types::SpanWithCaptures::with_captures(span, vec![capture]))
-            } else {
-                None
-            }
-        }
-        Pattern::NamedCapture { name, pattern } => {
-            if let Some(mut m) = matches_pattern_at_position(pattern, field_cache, pos) {
-                // Add the named capture
-                let capture = crate::types::NamedCapture::new(name.clone(), m.span.clone());
-                m.captures.push(capture);
-                Some(m)
-            } else {
-                None
-            }
-        }
-        Pattern::Disjunctive(patterns) => {
-            for pat in patterns {
-                if let Some(m) = matches_pattern_at_position(pat, field_cache, pos) {
-                    return Some(m);
-                }
-            }
-            None
-        }
-        Pattern::Repetition { pattern, min, max, kind } => {
-            use crate::query::ast::QuantifierKind;
-            
-            let mut current_pos = pos;
-            let mut count = 0;
-            let mut total_captures = Vec::new();
-            
-            if *kind == QuantifierKind::Lazy {
-                // Lazy semantics: match minimum required and stop
-                while count < *min {
-                    if let Some(m) = matches_pattern_at_position(pattern, field_cache, current_pos) {
-                        current_pos = m.span.end;
-                        total_captures.extend(m.captures);
-                        count += 1;
-                    } else {
-                        // Can't match minimum required
-                        return None;
-                    }
-                }
-                
-                // Check max bound
-                if let Some(max_val) = max {
-                    if count > *max_val {
-                        return None;
-                    }
-                }
-            } else {
-                // Greedy semantics: match as many as possible
-                while let Some(m) = matches_pattern_at_position(pattern, field_cache, current_pos) {
-                    current_pos = m.span.end;
-                    total_captures.extend(m.captures);
-                    count += 1;
-                    if let Some(max_val) = max {
-                        if count >= *max_val { break; }
-                    }
-                }
-            }
-            
-            if count >= *min {
-                let span = crate::types::Span { start: pos, end: current_pos };
-                Some(crate::types::SpanWithCaptures::with_captures(span, total_captures))
-            } else {
-                None
-            }
-        }
-        Pattern::Assertion(assertion) => {
-            use crate::query::ast::Assertion;
-            match assertion {
-                Assertion::PositiveLookahead(child) => {
-                    if matches_pattern_at_position(child, field_cache, pos).is_some() {
-                        Some(crate::types::SpanWithCaptures::new(crate::types::Span { start: pos, end: pos }))
-                    } else {
-                        None
-                    }
-                }
-                Assertion::NegativeLookahead(child) => {
-                    if matches_pattern_at_position(child, field_cache, pos).is_none() {
-                        Some(crate::types::SpanWithCaptures::new(crate::types::Span { start: pos, end: pos }))
-                    } else {
-                        None
-                    }
-                }
-                Assertion::PositiveLookbehind(child) => {
-                    if pos > 0 && matches_pattern_at_position(child, field_cache, pos - 1).is_some() {
-                        Some(crate::types::SpanWithCaptures::new(crate::types::Span { start: pos, end: pos }))
-                    } else {
-                        None
-                    }
-                }
-                Assertion::NegativeLookbehind(child) => {
-                    if pos == 0 || matches_pattern_at_position(child, field_cache, pos - 1).is_none() {
-                        Some(crate::types::SpanWithCaptures::new(crate::types::Span { start: pos, end: pos }))
-                    } else {
-                        None
-                    }
-                }
-            }
-        }
-        Pattern::Concatenated(nested_patterns) => {
-            // Support nested concatenations
-            let mut current_pos = pos;
-            let mut all_captures = Vec::new();
-            for pat in nested_patterns {
-                if let Some(m) = matches_pattern_at_position(pat, field_cache, current_pos) {
-                    current_pos = m.span.end;
-                    all_captures.extend(m.captures);
-                } else {
-                    return None;
-                }
-            }
-            Some(crate::types::SpanWithCaptures::with_captures(crate::types::Span { start: pos, end: current_pos }, all_captures))
-        }
-        _ => None,
     }
 }
 

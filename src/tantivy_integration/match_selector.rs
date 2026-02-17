@@ -29,7 +29,7 @@ impl MatchSelector {
         let mut result = Vec::new();
 
         // Process each group of matches at the same starting position
-        for (start_pos, mut group) in grouped {
+        for (_start_pos, mut group) in grouped {
             if group.len() == 1 {
                 // No disambiguation needed
                 result.push(group.pop().unwrap());

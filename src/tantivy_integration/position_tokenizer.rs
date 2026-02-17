@@ -16,7 +16,7 @@
 //! - Position 3: "dobj", "prep" (same position)
 //! - Position 4: (no edge, skip)
 
-use tantivy::tokenizer::{Token, TokenStream, Tokenizer, BoxTokenStream};
+use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 /// A token stream that emits edge labels at specific positions
 /// matching token indices in the sentence.

@@ -10,8 +10,7 @@ use tantivy::fieldnorm::FieldNormReader;
 use tantivy::{
     query::{Scorer, Bm25Weight},
     DocId, Score,
-    DocSet, SegmentReader,
-    store::StoreReader,
+    DocSet,
     postings::{SegmentPostings, Postings},
     columnar::{BytesColumn, StrColumn},
 };
@@ -78,9 +77,6 @@ impl TokenView {
         Some(&self.source[start..end])
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &str> + '_ {
-        (0..self.len()).map(move |i| self.get(i).unwrap())
-    }
 }
 
 /// Optimized scorer for graph traversal queries
@@ -92,12 +88,9 @@ pub struct OptimizedGraphTraversalScorer {
     /// Phase 1: Document alignment via skip-list optimized intersection
     /// Phase 2: Graph traversal verification (check_graph_traversal)
     pub(crate) intersection: TwoPhaseIntersection,
-    pub(crate) reader: SegmentReader,
     /// Fast field column for O(1) access to dependency graph bytes (columnar storage)
     /// This avoids document store decompression overhead for graph access
     pub(crate) dependencies_fast_field: Option<BytesColumn>,
-    /// Store reader for constraint token extraction (still needed for lazy token loading)
-    pub(crate) store_reader: StoreReader,
     pub(crate) current_doc: Option<DocId>,
     pub(crate) current_matches: Vec<(DocId, Score)>,
     pub(crate) match_index: usize,
@@ -150,9 +143,7 @@ impl OptimizedGraphTraversalScorer {
     pub fn new(
         src_driver: Box<dyn CandidateDriver>,
         dst_driver: Box<dyn CandidateDriver>,
-        reader: SegmentReader,
         dependencies_fast_field: Option<BytesColumn>,
-        store_reader: StoreReader,
         boost: Score,
         flat_steps: Vec<FlatPatternStep>,
         constraint_field_names: Vec<String>,
@@ -271,9 +262,7 @@ impl OptimizedGraphTraversalScorer {
 
         Self {
             intersection,
-            reader,
             dependencies_fast_field,
-            store_reader,
             current_doc: None,
             current_matches: Vec::new(),
             match_index: 0,
@@ -305,7 +294,7 @@ impl OptimizedGraphTraversalScorer {
 /// Uses StrColumn for text fields with dictionary encoding.
 fn extract_constraint_tokens_from_fast_field(
     constraint_idx: usize,
-    field_name: &str,
+    _field_name: &str,
     fast_field_columns: &[Option<StrColumn>],
     doc_id: DocId,
 ) -> TokenView {
@@ -330,7 +319,6 @@ fn extract_constraint_tokens_from_fast_field(
 /// the fast field is read and split only once, and all constraints share the result.
 pub(crate) struct LazyConstraintTokens<'a> {
     constraint_field_names: &'a [String],
-    schema: &'a tantivy::schema::Schema,
     /// Per-constraint cache. Each entry is Some(TokenView) once loaded.
     cache: Vec<Option<TokenView>>,
     /// Fast field columns for O(1) columnar access to constraint tokens
@@ -402,30 +390,11 @@ impl TokenAccessor for EmptyTokenAccessor {
 }
 
 impl<'a> LazyConstraintTokens<'a> {
-    /// Create a new lazy token loader with fast field support
-    pub fn new(
-        constraint_field_names: &'a [String],
-        schema: &'a tantivy::schema::Schema,
-        fast_field_columns: &'a [Option<StrColumn>],
-        doc_id: DocId,
-    ) -> Self {
-        let cache = vec![None; constraint_field_names.len()];
-        Self {
-            constraint_field_names,
-            schema,
-            cache,
-            fast_field_columns,
-            doc_id,
-            field_loaded_at: std::collections::HashMap::new(),
-        }
-    }
-
     /// Create a lazy token loader with a pre-populated cache.
     /// Used to share tokens already extracted in Phase B with the Phase C traversal,
     /// avoiding redundant fast-field reads.
     pub fn new_with_cache(
         constraint_field_names: &'a [String],
-        schema: &'a tantivy::schema::Schema,
         fast_field_columns: &'a [Option<StrColumn>],
         doc_id: DocId,
         preloaded: Vec<Option<TokenView>>,
@@ -440,7 +409,6 @@ impl<'a> LazyConstraintTokens<'a> {
         }
         Self {
             constraint_field_names,
-            schema,
             cache: preloaded,
             fast_field_columns,
             doc_id,
@@ -482,12 +450,6 @@ impl<'a> LazyConstraintTokens<'a> {
         self.cache[constraint_idx]
             .as_ref()
             .and_then(|view| view.get(position).map(String::from))
-    }
-
-    /// Get all tokens for a constraint (returns reference after ensuring loaded)
-    pub fn get_all_tokens(&mut self, constraint_idx: usize) -> Option<&TokenView> {
-        self.ensure_loaded(constraint_idx);
-        self.cache[constraint_idx].as_ref()
     }
 
     /// Extract tokens from a field using fast fields (O(1) columnar access)
@@ -555,34 +517,6 @@ fn build_dst_inverted_index(
 
 /// Process a single start position and return all matching paths as spans
 /// This is used for parallel processing where each thread processes one start position
-/// graph_bytes: The raw bytes of the graph (zero-copy, can be shared across threads)
-/// dst_set: Pre-computed destination positions for O(1) endpoint validation (Odinson-style)
-/// dst_index: Optional pre-built destination inverted index for O(1) span lookup
-pub(crate) fn process_single_start_position<T: TokenAccessor>(
-    graph_bytes: &[u8],
-    flat_steps: &[FlatPatternStep],
-    start_pos: usize,
-    constraint_field_names: &[String],
-    token_accessor: &T,
-    allowed_positions: &[Option<AllowedPositions>],
-    constraint_exact_flags: &[bool],
-    dst_set: &HashSet<u32>,
-    total_constraints: usize,
-) -> Vec<crate::types::SpanWithCaptures> {
-    process_single_start_position_with_index(
-        graph_bytes,
-        flat_steps,
-        start_pos,
-        constraint_field_names,
-        token_accessor,
-        allowed_positions,
-        constraint_exact_flags,
-        dst_set,
-        None,
-        total_constraints,
-    )
-}
-
 /// Internal function that accepts optional destination inverted index
 fn process_single_start_position_with_index<T: TokenAccessor>(
     graph_bytes: &[u8],
@@ -740,14 +674,6 @@ pub(crate) fn is_exact_skippable(constraint: &Constraint) -> bool {
 }
 
 impl OptimizedGraphTraversalScorer {
-    /// Compute sloppy frequency factor based on span width (Odinson-style).
-    /// Uses the formula: 1.0 / (1.0 + distance) where distance = span width.
-    /// Shorter spans get higher scores. Kept for backward compatibility (e.g. concat_query).
-    #[inline(always)]
-    fn compute_slop_factor(span_width: usize) -> Score {
-        1.0 / (1.0 + span_width as f32)
-    }
-
     /// Accumulate sloppy frequency from matches (single pass, inlined slop).
     /// Used by score_from_matches and by the formula-identity test.
     #[inline(always)]
@@ -786,25 +712,25 @@ impl OptimizedGraphTraversalScorer {
 
     /// Compute Odinson-style score for the current document.
     ///
-    /// When BM25 is available (Option A): score = bm25.score(fieldnorm_id, match_count) * avg_slop.
-    /// Otherwise (Option B): score_from_matches (tf × avg_slop × boost). Range [0.01, ∞).
+    /// Mirrors Odinson: feeds `⌈Σ 1/(1+width)⌉` (accumulated sloppy frequency) directly as the
+    /// BM25 term frequency, so BM25's TF-saturation curve weights tighter matches higher.
+    ///
+    /// Returns `1.0` when no BM25 weight is available (pure regex/wildcard patterns with no
+    /// extractable terms – flat score, no ranking signal).
     #[inline]
     fn compute_odinson_score(&self) -> Score {
         if self.current_doc_matches.is_empty() {
             return 0.0;
         }
+        let (bm25, fnr) = match (&self.bm25_weight, &self.fieldnorm_reader) {
+            (Some(b), Some(f)) => (b, f),
+            _ => return 1.0,
+        };
         let sloppy_freq = Self::accumulate_sloppy_freq(&self.current_doc_matches);
-        let match_count = self.current_doc_matches.len();
-
-        if let (Some(ref bm25), Some(ref fnr)) = (&self.bm25_weight, &self.fieldnorm_reader) {
-            let doc = self.doc();
-            let fieldnorm_id: u8 = fnr.fieldnorm_id(doc);
-            let bm25_score: Score = bm25.score(fieldnorm_id, match_count as u32);
-            let avg_slop = sloppy_freq / match_count as f32;
-            (bm25_score * avg_slop).max(0.01)
-        } else {
-            Self::score_from_matches(&self.current_doc_matches, self.boost)
-        }
+        let doc = self.doc();
+        let fieldnorm_id: u8 = fnr.fieldnorm_id(doc);
+        let term_freq = sloppy_freq.ceil().max(1.0) as u32;
+        bm25.score(fieldnorm_id, term_freq).max(0.01)
     }
 
     /// Log final statistics when iteration completes
@@ -1162,8 +1088,8 @@ impl OptimizedGraphTraversalScorer {
         self.dst_positions_buf = dst_buf_owned;
 
         for ap in &allowed_positions {
-            if let Some(ref positions) = ap {
-                prof_inc!(PREFILTER_ALLOWED_POS_SUM, positions.len());
+            if let Some(ref _positions) = ap {
+                prof_inc!(PREFILTER_ALLOWED_POS_SUM, _positions.len());
                 prof_inc!(PREFILTER_ALLOWED_POS_COUNT);
             }
         }
@@ -1424,7 +1350,6 @@ impl OptimizedGraphTraversalScorer {
                         // new_with_cache avoids re-reading fast fields that were already parsed.
                         let mut lazy_tokens = LazyConstraintTokens::new_with_cache(
                             &self.constraint_field_names,
-                            self.reader.schema(),
                             &self.constraint_fast_fields,
                             doc_id,
                             std::mem::take(&mut phase_b_token_cache),
@@ -1468,14 +1393,12 @@ impl OptimizedGraphTraversalScorer {
 
                     // Create token getter closure - returns None when all constraints covered
                     // OPTIMIZATION: Reuse tokens already extracted in Phase B (field-level cache).
-                    let schema = self.reader.schema();
                     let field_names = &self.constraint_field_names;
                     let mut lazy_tokens_opt: Option<LazyConstraintTokens> = if all_constraints_covered {
                         None
                     } else {
                         Some(LazyConstraintTokens::new_with_cache(
                             field_names,
-                            schema,
                             &self.constraint_fast_fields,
                             doc_id,
                             std::mem::take(&mut phase_b_token_cache),
@@ -1524,7 +1447,7 @@ impl OptimizedGraphTraversalScorer {
                     // Use pre-computed total_constraints (constant per segment)
                     let dst_constraint_idx = total_constraints.saturating_sub(1);
                     
-                    for (src_pos, dst_pos, path) in &reachable_pairs {
+                    for (_src_pos, dst_pos, path) in &reachable_pairs {
                         if path.is_empty() {
                             continue;
                         }
@@ -1715,12 +1638,12 @@ impl DocSet for OptimizedGraphTraversalScorer {
             // Statistics tracking
             prof_inc!(DRIVER_ALIGNMENT_DOCS);
 
-            if let Some(src_pos) = self.intersection.src_driver().matching_positions() {
-                prof_inc!(DRIVER_INTERSECTION_SUM, src_pos.len());
+            if let Some(_src_pos) = self.intersection.src_driver().matching_positions() {
+                prof_inc!(DRIVER_INTERSECTION_SUM, _src_pos.len());
                 prof_inc!(DRIVER_INTERSECTION_COUNT);
             }
-            if let Some(dst_pos) = self.intersection.dst_driver().matching_positions() {
-                prof_inc!(DRIVER_INTERSECTION_SUM, dst_pos.len());
+            if let Some(_dst_pos) = self.intersection.dst_driver().matching_positions() {
+                prof_inc!(DRIVER_INTERSECTION_SUM, _dst_pos.len());
                 prof_inc!(DRIVER_INTERSECTION_COUNT);
             }
 

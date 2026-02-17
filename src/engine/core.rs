@@ -48,7 +48,7 @@ impl ExtractorEngine {
         let fields = Self::extract_required_fields(&schema)?;
 
         let query_compiler = QueryCompiler::new(schema.clone());
-        let query_parser = QueryParser::new(FIELD_WORD.to_string());
+        let query_parser = QueryParser::new();
         let regex_cache: RegexCache = Arc::new(RwLock::new(RegexCacheInner::new(512)));
 
         Ok(Self {

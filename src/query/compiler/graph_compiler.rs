@@ -1,7 +1,4 @@
-use tantivy::{
-    query::Query,
-    schema::{Field, Schema},
-};
+use tantivy::schema::{Field, Schema};
 use crate::query::ast::{Pattern, Constraint, Matcher, Traversal, FlatPatternStep};
 use anyhow::{Result, anyhow};
 use crate::engine::constants::get_required_field;
@@ -22,10 +19,12 @@ impl GraphCompiler {
         Self { schema }
     }
 
-    pub fn compile_pattern(&self, pattern: &Pattern) -> Result<Box<dyn Query>> {
+    /// Compile a `GraphTraversal` pattern into a concrete `OptimizedGraphTraversalQuery`.
+    /// Returns an error for any other pattern variant.
+    pub fn compile_graph_traversal(&self, pattern: &Pattern) -> Result<OptimizedGraphTraversalQuery> {
         match pattern {
             Pattern::GraphTraversal { src, traversal, dst } => {
-                self.compile_graph_traversal(src, traversal, dst)
+                self.build_traversal_query(src, traversal, dst)
             }
             _ => {
                 Err(anyhow!("GraphCompiler only handles GraphTraversal patterns"))
@@ -227,7 +226,7 @@ impl GraphCompiler {
     ///
     /// If collapse specs cannot be built (e.g., regex constraints, wildcard edges),
     /// the query uses EmptyDriver and returns no results for that segment.
-    fn compile_graph_traversal(&self, src: &Pattern, traversal: &Traversal, dst: &Pattern) -> Result<Box<dyn Query>> {
+    fn build_traversal_query(&self, src: &Pattern, traversal: &Traversal, dst: &Pattern) -> Result<OptimizedGraphTraversalQuery> {
         // Build the full pattern
         let full_pattern = Pattern::GraphTraversal {
             src: Box::new(src.clone()),
@@ -268,7 +267,7 @@ impl GraphCompiler {
         let default_field = get_required_field(&self.schema, "word")?;
 
         // Create the query with collapse specs only - no BooleanQuery
-        Ok(Box::new(OptimizedGraphTraversalQuery::collapsed_only(
+        Ok(OptimizedGraphTraversalQuery::collapsed_only(
             default_field,
             dependencies_binary_field,
             incoming_edges_field,
@@ -278,6 +277,6 @@ impl GraphCompiler {
             dst.clone(),
             src_collapse,
             dst_collapse,
-        )))
+        ))
     }
 } 

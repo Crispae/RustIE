@@ -1,6 +1,5 @@
 use tantivy::query::{Query, Weight, Scorer, EnableScoring};
 use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet};
-use tantivy::schema::{Field, Value};
 use crate::query::ast::Pattern;
 
 /// Lookahead assertion type
@@ -17,7 +16,6 @@ pub enum LookaheadType {
 pub struct LookaheadQuery {
     lookahead_type: LookaheadType,
     assertion_pattern: Pattern,
-    default_field: Field,
 }
 
 impl Clone for LookaheadQuery {
@@ -25,41 +23,36 @@ impl Clone for LookaheadQuery {
         LookaheadQuery {
             lookahead_type: self.lookahead_type.clone(),
             assertion_pattern: self.assertion_pattern.clone(),
-            default_field: self.default_field,
         }
     }
 }
 
 impl LookaheadQuery {
-    pub fn positive_lookahead(pattern: Pattern, default_field: Field) -> Self {
+    pub fn positive_lookahead(pattern: Pattern) -> Self {
         Self {
             lookahead_type: LookaheadType::PositiveLookahead,
             assertion_pattern: pattern,
-            default_field,
         }
     }
-    
-    pub fn negative_lookahead(pattern: Pattern, default_field: Field) -> Self {
+
+    pub fn negative_lookahead(pattern: Pattern) -> Self {
         Self {
             lookahead_type: LookaheadType::NegativeLookahead,
             assertion_pattern: pattern,
-            default_field,
         }
     }
-    
-    pub fn positive_lookbehind(pattern: Pattern, default_field: Field) -> Self {
+
+    pub fn positive_lookbehind(pattern: Pattern) -> Self {
         Self {
             lookahead_type: LookaheadType::PositiveLookbehind,
             assertion_pattern: pattern,
-            default_field,
         }
     }
-    
-    pub fn negative_lookbehind(pattern: Pattern, default_field: Field) -> Self {
+
+    pub fn negative_lookbehind(pattern: Pattern) -> Self {
         Self {
             lookahead_type: LookaheadType::NegativeLookbehind,
             assertion_pattern: pattern,
-            default_field,
         }
     }
 }
@@ -69,7 +62,6 @@ impl Query for LookaheadQuery {
         Ok(Box::new(LookaheadWeight {
             lookahead_type: self.lookahead_type.clone(),
             assertion_pattern: self.assertion_pattern.clone(),
-            default_field: self.default_field,
         }))
     }
 }
@@ -79,7 +71,6 @@ impl Query for LookaheadQuery {
 struct LookaheadWeight {
     lookahead_type: LookaheadType,
     assertion_pattern: Pattern,
-    default_field: Field,
 }
 
 impl Weight for LookaheadWeight {
@@ -87,7 +78,6 @@ impl Weight for LookaheadWeight {
         let mut scorer = LookaheadScorer {
             lookahead_type: self.lookahead_type.clone(),
             assertion_pattern: self.assertion_pattern.clone(),
-            default_field: self.default_field,
             reader: reader.clone(),
             current_doc: None,
             all_docs: reader.max_doc(),
@@ -105,7 +95,6 @@ impl Weight for LookaheadWeight {
 pub struct LookaheadScorer {
     lookahead_type: LookaheadType,
     assertion_pattern: Pattern,
-    default_field: Field,
     reader: SegmentReader,
     current_doc: Option<DocId>,
     all_docs: DocId,
@@ -190,14 +179,8 @@ impl LookaheadScorer {
         }
     }
     
-    fn extract_tokens_from_field(&self, _doc: &tantivy::schema::TantivyDocument) -> Vec<String> {
-        // Deprecated: field extraction now happens in check_assertion using the cache
-        vec![]
-    }
-    
     fn find_positions_matching_pattern(&self, field_cache: &std::collections::HashMap<String, Vec<String>>, pattern: &Pattern) -> Vec<usize> {
-        use crate::query::ast::{Constraint, Matcher};
-        
+
         let mut positions = Vec::new();
         
         // Use 'word' field to determine length

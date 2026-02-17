@@ -30,9 +30,14 @@ use super::candidate_driver::{
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
 use super::scorer::OptimizedGraphTraversalScorer;
 
-/// Bounded container for compiled regex automata. Evicts all entries when full to cap memory.
+/// Bounded container for compiled regex automata and expanded BM25 terms.
+/// Evicts all entries when full to cap memory.
 pub(crate) struct RegexCacheInner {
+    /// Compiled FST regex automata (pattern → automaton)
     map: HashMap<String, Arc<Regex>>,
+    /// Expanded terms for BM25 scoring ((pattern, field) → terms)
+    /// Cached to avoid redundant FST traversals across repeated queries.
+    expanded_terms: HashMap<(String, Field), Vec<Term>>,
     max_entries: usize,
 }
 
@@ -40,6 +45,7 @@ impl RegexCacheInner {
     pub fn new(max_entries: usize) -> Self {
         Self {
             map: HashMap::with_capacity(max_entries.min(256)),
+            expanded_terms: HashMap::with_capacity(max_entries.min(256)),
             max_entries,
         }
     }
@@ -53,6 +59,19 @@ impl RegexCacheInner {
             self.map.clear();
         }
         self.map.insert(pattern, regex);
+    }
+
+    /// Get cached expanded terms for a (pattern, field) combination.
+    pub fn get_expanded_terms(&self, pattern: &str, field: Field) -> Option<Vec<Term>> {
+        self.expanded_terms.get(&(pattern.to_string(), field)).cloned()
+    }
+
+    /// Cache expanded terms for a (pattern, field) combination.
+    pub fn insert_expanded_terms(&mut self, pattern: String, field: Field, terms: Vec<Term>) {
+        if self.expanded_terms.len() >= self.max_entries {
+            self.expanded_terms.clear();
+        }
+        self.expanded_terms.insert((pattern, field), terms);
     }
 }
 
@@ -256,9 +275,6 @@ impl OptimizedGraphTraversalWeight {
             .ok()
             .flatten();
 
-        // Cache the store reader (still needed for constraint token extraction)
-        let store_reader = reader.get_store_reader(1)?;
-
         // Pre-extract constraint field names from flat_steps (computed once, not per document)
         fn unwrap_pattern_for_field_name(pat: &crate::query::ast::Pattern) -> String {
             use crate::query::ast::Pattern;
@@ -355,9 +371,7 @@ impl OptimizedGraphTraversalWeight {
         let mut scorer = OptimizedGraphTraversalScorer::new(
             src_driver,
             dst_driver,
-            reader.clone(),
             dependencies_fast_field,
-            store_reader,
             boost,
             self.flat_steps.clone(),
             constraint_field_names,

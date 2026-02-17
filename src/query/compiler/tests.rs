@@ -2,13 +2,12 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::query::compiler::{basic_compiler::BasicCompiler, graph_compiler::GraphCompiler, QueryCompiler};
+    use crate::query::compiler::{basic_compiler::BasicCompiler, graph_compiler::GraphCompiler, QueryCompiler, CompiledQuery};
     use crate::query::ast::{
         Assertion, Constraint, Matcher, Pattern, QuantifierKind, Traversal,
     };
     use crate::tantivy_integration::{
-        OptimizedGraphTraversalQuery, LookaheadQuery, RustieConcatQuery,
-        RustieNamedCaptureQuery, RustieOrQuery,
+        OptimizedGraphTraversalQuery, LookaheadQuery, RustieOrQuery,
     };
     use tantivy::query::{BooleanQuery, TermQuery};
     use tantivy::schema::{Schema, SchemaBuilder, TEXT, STORED};
@@ -71,7 +70,9 @@ mod tests {
         });
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Field+String should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Constraint");
+        };
         assert!(
             query.as_any().downcast_ref::<TermQuery>().is_some(),
             "Expected TermQuery for exact field match"
@@ -101,7 +102,9 @@ mod tests {
         let pattern = Pattern::Constraint(Constraint::Negated(Box::new(inner)));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Negated should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Negated constraint");
+        };
         assert!(
             query.as_any().downcast_ref::<BooleanQuery>().is_some(),
             "Expected BooleanQuery for negated constraint"
@@ -124,7 +127,9 @@ mod tests {
         ]));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Conjunctive should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Conjunctive constraint");
+        };
         assert!(
             query.as_any().downcast_ref::<BooleanQuery>().is_some(),
             "Expected BooleanQuery for conjunctive constraint"
@@ -147,7 +152,9 @@ mod tests {
         ]));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Disjunctive constraint should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Disjunctive constraint");
+        };
         assert!(
             query.as_any().downcast_ref::<BooleanQuery>().is_some(),
             "Expected BooleanQuery for disjunctive constraint"
@@ -165,7 +172,9 @@ mod tests {
         let pattern = Pattern::Assertion(Assertion::PositiveLookahead(Box::new(inner)));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "PositiveLookahead should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Assertion");
+        };
         assert!(
             query.as_any().downcast_ref::<LookaheadQuery>().is_some(),
             "Expected LookaheadQuery"
@@ -180,7 +189,9 @@ mod tests {
         let pattern = Pattern::Assertion(Assertion::NegativeLookahead(Box::new(inner)));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "NegativeLookahead should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Assertion");
+        };
         assert!(
             query.as_any().downcast_ref::<LookaheadQuery>().is_some(),
             "Expected LookaheadQuery"
@@ -198,7 +209,9 @@ mod tests {
         let pattern = Pattern::Assertion(Assertion::PositiveLookbehind(Box::new(inner)));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "PositiveLookbehind should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Assertion");
+        };
         assert!(
             query.as_any().downcast_ref::<LookaheadQuery>().is_some(),
             "Expected LookaheadQuery"
@@ -213,7 +226,9 @@ mod tests {
         let pattern = Pattern::Assertion(Assertion::NegativeLookbehind(Box::new(inner)));
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "NegativeLookbehind should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Assertion");
+        };
         assert!(
             query.as_any().downcast_ref::<LookaheadQuery>().is_some(),
             "Expected LookaheadQuery"
@@ -236,7 +251,9 @@ mod tests {
         ]);
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Disjunctive pattern should compile: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Disjunctive pattern");
+        };
         assert!(
             query.as_any().downcast_ref::<RustieOrQuery>().is_some(),
             "Expected RustieOrQuery"
@@ -259,10 +276,9 @@ mod tests {
         ]);
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Concatenated pattern should compile: {:?}", result.err());
-        let query = result.unwrap();
         assert!(
-            query.as_any().downcast_ref::<RustieConcatQuery>().is_some(),
-            "Expected RustieConcatQuery"
+            matches!(result.unwrap(), CompiledQuery::Concat(_)),
+            "Expected CompiledQuery::Concat for Concatenated pattern"
         );
     }
 
@@ -280,10 +296,9 @@ mod tests {
         };
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "NamedCapture should compile: {:?}", result.err());
-        let query = result.unwrap();
         assert!(
-            query.as_any().downcast_ref::<RustieNamedCaptureQuery>().is_some(),
-            "Expected RustieNamedCaptureQuery"
+            matches!(result.unwrap(), CompiledQuery::NamedCapture(_)),
+            "Expected CompiledQuery::NamedCapture for NamedCapture pattern"
         );
     }
 
@@ -302,8 +317,10 @@ mod tests {
         };
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "Repetition should compile: {:?}", result.err());
-        // Can be RustieOrQuery (multiple alternatives) or single query when only one length
-        let query = result.unwrap();
+        // Can be RustieOrQuery (multiple alternatives) or single TermQuery when only one length
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Repetition");
+        };
         assert!(
             query.as_any().downcast_ref::<RustieOrQuery>().is_some()
                 || query.as_any().downcast_ref::<TermQuery>().is_some(),
@@ -373,7 +390,7 @@ mod tests {
         let schema = schema_graph();
         let compiler = GraphCompiler::new(schema);
         let pattern = Pattern::Constraint(Constraint::Wildcard);
-        let result = compiler.compile_pattern(&pattern);
+        let result = compiler.compile_graph_traversal(&pattern);
         assert!(result.is_err(), "GraphCompiler should reject non-GraphTraversal");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -395,13 +412,10 @@ mod tests {
             traversal: Traversal::Outgoing(Matcher::String("nsubj".to_string())),
             dst: Box::new(Pattern::Constraint(Constraint::Wildcard)),
         };
-        let result = compiler.compile_pattern(&pattern);
+        let result = compiler.compile_graph_traversal(&pattern);
         assert!(result.is_ok(), "GraphTraversal should compile: {:?}", result.err());
-        let query = result.unwrap();
-        assert!(
-            query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>().is_some(),
-            "Expected OptimizedGraphTraversalQuery"
-        );
+        // compile_graph_traversal returns OptimizedGraphTraversalQuery directly — no downcast needed
+        let _gq: OptimizedGraphTraversalQuery = result.unwrap();
     }
 
     #[test]
@@ -419,13 +433,9 @@ mod tests {
                 matcher: Matcher::String("John".to_string()),
             })),
         };
-        let result = compiler.compile_pattern(&pattern);
+        let result = compiler.compile_graph_traversal(&pattern);
         assert!(result.is_ok(), "GraphTraversal with first/last constraints should compile: {:?}", result.err());
-        let query = result.unwrap();
-        assert!(
-            query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>().is_some(),
-            "Expected OptimizedGraphTraversalQuery"
-        );
+        let _gq: OptimizedGraphTraversalQuery = result.unwrap();
     }
 
     #[test]
@@ -440,7 +450,7 @@ mod tests {
             traversal: Traversal::Outgoing(Matcher::String("nsubj".to_string())),
             dst: Box::new(Pattern::Constraint(Constraint::Wildcard)),
         };
-        let result = compiler.compile_pattern(&pattern);
+        let result = compiler.compile_graph_traversal(&pattern);
         assert!(result.is_err(), "Missing incoming_edges should fail: {:?}", result.ok());
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -458,10 +468,12 @@ mod tests {
         let compiler = QueryCompiler::new(schema);
         let result = compiler.compile("[word=test]");
         assert!(result.is_ok(), "compile([word=test]) should succeed: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for basic pattern");
+        };
         assert!(
             query.as_any().downcast_ref::<TermQuery>().is_some(),
-            "Basic pattern should produce TermQuery (or similar), not graph query"
+            "Basic pattern should produce TermQuery"
         );
     }
 
@@ -471,10 +483,9 @@ mod tests {
         let compiler = QueryCompiler::new(schema);
         let result = compiler.compile("[word=eats] >nsubj [word=John]");
         assert!(result.is_ok(), "compile(graph query) should succeed: {:?}", result.err());
-        let query = result.unwrap();
         assert!(
-            query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>().is_some(),
-            "Graph query should produce OptimizedGraphTraversalQuery"
+            matches!(result.unwrap(), CompiledQuery::Graph(_)),
+            "Graph query should produce CompiledQuery::Graph"
         );
     }
 
@@ -488,7 +499,9 @@ mod tests {
         });
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "compile_pattern(Constraint) should succeed: {:?}", result.err());
-        let query = result.unwrap();
+        let CompiledQuery::Basic(query) = result.unwrap() else {
+            panic!("Expected CompiledQuery::Basic for Constraint");
+        };
         assert!(
             query.as_any().downcast_ref::<TermQuery>().is_some(),
             "Constraint should be compiled by BasicCompiler (TermQuery)"
@@ -509,10 +522,9 @@ mod tests {
         };
         let result = compiler.compile_pattern(&pattern);
         assert!(result.is_ok(), "compile_pattern(GraphTraversal) should succeed: {:?}", result.err());
-        let query = result.unwrap();
         assert!(
-            query.as_any().downcast_ref::<OptimizedGraphTraversalQuery>().is_some(),
-            "GraphTraversal should be compiled by GraphCompiler"
+            matches!(result.unwrap(), CompiledQuery::Graph(_)),
+            "GraphTraversal should produce CompiledQuery::Graph"
         );
     }
 }

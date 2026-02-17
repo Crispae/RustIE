@@ -1,6 +1,6 @@
 use tantivy::query::{Query, Weight, Scorer, EnableScoring};
 use tantivy::{DocId, Score, SegmentReader, Result as TantivyResult, DocSet};
-use tantivy::schema::{Field, Value};
+use tantivy::schema::Field;
 use crate::query::ast::Pattern;
 
 /// Query that wraps an inner query and tags its matches with a capture name
