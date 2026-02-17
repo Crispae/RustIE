@@ -249,10 +249,35 @@ impl OptimizedGraphTraversalQuery {
         terms.sort_unstable();
         terms.dedup();
 
+        // BM25 requires all terms to belong to the same field.
+        // Prefer score_field (default token field, Odinson-style). When no score_field
+        // terms exist (e.g., query only constrains entity/tag), fall back to the
+        // single field with the most terms so we still get IDF-based ranking.
         let bm25_weight = if terms.is_empty() {
             None
         } else {
-            Some(Bm25Weight::for_terms(searcher, &terms)?)
+            let score_field_terms: Vec<Term> = terms.iter()
+                .filter(|t| t.field() == score_field)
+                .cloned()
+                .collect();
+
+            if !score_field_terms.is_empty() {
+                Some(Bm25Weight::for_terms(searcher, &score_field_terms)?)
+            } else {
+                // Group by field, pick the one with the most terms
+                let mut by_field: std::collections::HashMap<Field, Vec<Term>> = std::collections::HashMap::new();
+                for t in &terms {
+                    by_field.entry(t.field()).or_default().push(t.clone());
+                }
+                let best_group = by_field.into_values()
+                    .max_by_key(|v| v.len())
+                    .unwrap_or_default();
+                if best_group.is_empty() {
+                    None
+                } else {
+                    Some(Bm25Weight::for_terms(searcher, &best_group)?)
+                }
+            }
         };
 
         Ok(OptimizedGraphTraversalWeight::new(
