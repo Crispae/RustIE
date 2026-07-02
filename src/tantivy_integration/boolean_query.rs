@@ -34,9 +34,24 @@ impl Weight for RustieOrWeight {
             .iter()
             .map(|w| w.scorer(reader, boost))
             .collect::<TantivyResult<Vec<_>>>()?;
+        // Tantivy collectors use doc()-first iteration: sub-scorers start on their
+        // first match, so seed current_doc from the minimum sub-scorer doc.
+        let mut current_doc = tantivy::TERMINATED;
+        for scorer in &sub_scorers {
+            let doc = scorer.doc();
+            if doc != tantivy::TERMINATED
+                && (current_doc == tantivy::TERMINATED || doc < current_doc)
+            {
+                current_doc = doc;
+            }
+        }
         Ok(Box::new(RustieOrScorer {
             sub_scorers,
-            current_doc: None,
+            current_doc: if current_doc == tantivy::TERMINATED {
+                None
+            } else {
+                Some(current_doc)
+            },
         }))
     }
 
@@ -63,25 +78,31 @@ impl Scorer for RustieOrScorer {
 
 impl DocSet for RustieOrScorer {
     fn advance(&mut self) -> DocId {
-        let mut min_doc = tantivy::TERMINATED;
-        // Find the minimum doc id among all sub-scorers
+        let current = self.current_doc.unwrap_or(tantivy::TERMINATED);
+        if current == tantivy::TERMINATED {
+            return tantivy::TERMINATED;
+        }
+
+        // Move past the current doc on every sub-scorer that still points at it.
         for scorer in &mut self.sub_scorers {
+            if scorer.doc() == current {
+                scorer.advance();
+            }
+        }
+
+        let mut min_doc = tantivy::TERMINATED;
+        for scorer in &self.sub_scorers {
             let doc = scorer.doc();
             if doc != tantivy::TERMINATED && (min_doc == tantivy::TERMINATED || doc < min_doc) {
                 min_doc = doc;
             }
         }
+
         if min_doc == tantivy::TERMINATED {
             self.current_doc = None;
-            return tantivy::TERMINATED;
+        } else {
+            self.current_doc = Some(min_doc);
         }
-        // Advance all scorers that are at this doc
-        for scorer in &mut self.sub_scorers {
-            if scorer.doc() == min_doc {
-                scorer.advance();
-            }
-        }
-        self.current_doc = Some(min_doc);
         min_doc
     }
 

@@ -23,12 +23,32 @@ use super::types::{
 #[allow(unused_imports)]
 use super::types::{REGEX_EXPANSION_COUNT, REGEX_EXPANSION_TERMS};
 use super::candidate_driver::{
-    CandidateDriver, EmptyDriver, CombinedPositionDriver,
+    CandidateDriver, EmptyDriver, PermissiveDriver, CombinedPositionDriver,
     UnionPositionsIterator, UnionAndIntersectDriver,
     expand_matcher, get_or_compile_regex,
 };
 use super::pattern_utils::{build_constraint_requirements, unwrap_constraint_pattern_static};
 use super::scorer::OptimizedGraphTraversalScorer;
+
+fn last_constraint_is_wildcard(flat_steps: &[FlatPatternStep]) -> bool {
+    for step in flat_steps.iter().rev() {
+        if let FlatPatternStep::Constraint(pat) = step {
+            let inner = unwrap_constraint_pattern_static(pat);
+            return matches!(inner, Pattern::Constraint(Constraint::Wildcard));
+        }
+    }
+    false
+}
+
+fn first_constraint_is_wildcard(flat_steps: &[FlatPatternStep]) -> bool {
+    for step in flat_steps.iter() {
+        if let FlatPatternStep::Constraint(pat) = step {
+            let inner = unwrap_constraint_pattern_static(pat);
+            return matches!(inner, Pattern::Constraint(Constraint::Wildcard));
+        }
+    }
+    false
+}
 
 /// Bounded container for compiled regex automata and expanded BM25 terms.
 /// Evicts all entries when full to cap memory.
@@ -251,6 +271,8 @@ impl OptimizedGraphTraversalWeight {
             } else {
                 Box::new(EmptyDriver)
             }
+        } else if first_constraint_is_wildcard(&self.flat_steps) {
+            Box::new(PermissiveDriver)
         } else {
             Box::new(EmptyDriver)
         };
@@ -261,6 +283,8 @@ impl OptimizedGraphTraversalWeight {
             } else {
                 Box::new(EmptyDriver)
             }
+        } else if last_constraint_is_wildcard(&self.flat_steps) {
+            Box::new(PermissiveDriver)
         } else {
             Box::new(EmptyDriver)
         };

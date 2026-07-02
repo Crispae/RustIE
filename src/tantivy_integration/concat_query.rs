@@ -571,33 +571,29 @@ impl DocSet for RustieConcatScorer {
             return tantivy::TERMINATED;
         }
 
-        // Phase 1: Ensure scorers are positioned correctly
-        if !self.started {
-            self.started = true;
-            // Always advance all scorers once to land on first match
-            for (_i, scorer) in self.sub_scorers.iter_mut().enumerate() {
-                let doc = scorer.advance();
-                if doc == tantivy::TERMINATED {
-                    self.current_doc = None;
-                    return tantivy::TERMINATED;
-                }
+        // Tantivy segment scorers are already positioned on their first hit.
+        // Only advance the leader on subsequent calls; never pre-advance on startup.
+        if self.started {
+            if self.sub_scorers[0].advance() == tantivy::TERMINATED {
+                self.current_doc = None;
+                return tantivy::TERMINATED;
             }
         } else {
-            // Subsequent calls: Advance the LEADER (scorer 0)
-            if self.sub_scorers[0].advance() == tantivy::TERMINATED {
+            self.started = true;
+            if self.sub_scorers[0].doc() == tantivy::TERMINATED {
                 self.current_doc = None;
                 return tantivy::TERMINATED;
             }
         }
 
-        // Phase 2: Zig-Zag Intersection
+        // Zig-zag intersection across sub-scorers
         loop {
             let candidate = self.sub_scorers[0].doc();
-            
+
             let mut all_match = true;
             let mut next_target = candidate;
 
-            for (_scorer_idx, scorer) in self.sub_scorers.iter_mut().skip(1).enumerate() {
+            for scorer in self.sub_scorers.iter_mut().skip(1) {
                 let mut s_doc = scorer.doc();
 
                 while s_doc < candidate {
@@ -624,7 +620,7 @@ impl DocSet for RustieConcatScorer {
                     self.match_index = self.current_matches.len() - 1;
                     return candidate;
                 }
-                
+
                 if self.sub_scorers[0].advance() == tantivy::TERMINATED {
                     self.current_doc = None;
                     return tantivy::TERMINATED;
@@ -635,8 +631,8 @@ impl DocSet for RustieConcatScorer {
                     s0 = self.sub_scorers[0].advance();
                 }
                 if s0 == tantivy::TERMINATED {
-                     self.current_doc = None;
-                     return tantivy::TERMINATED;
+                    self.current_doc = None;
+                    return tantivy::TERMINATED;
                 }
             }
         }
@@ -653,51 +649,64 @@ impl DocSet for RustieConcatScorer {
 
 impl RustieConcatScorer {
     fn check_pattern_matching(&mut self, doc_id: DocId) -> bool {
-        
         self.current_doc_matches.clear();
-        
+
         // Try postings-based path first if constraint sources are available
         if !self.constraint_sources.is_empty() {
-            
-            // Get doc length and execution plan before mutable borrow
             let doc_len = match self.get_doc_length(doc_id, self.default_field) {
                 Ok(len) => Some(len),
-                Err(_e) => {
-                    None
-                }
+                Err(_e) => None,
             };
             let execution_plan = self.execution_plan.clone();
             let concat_plan = self.concat_plan.clone();
-            
-            match self.get_constraint_positions(doc_id) {
-                Ok(positions_per_constraint) => {
-                    
-                    // Use position-based matching
-                    let all_spans = find_constraint_spans_from_positions(
-                        &positions_per_constraint,
-                        &execution_plan,
-                        &concat_plan,
-                        doc_len,
-                    );
-                    
-                    self.current_doc_matches = all_spans;
-                    
-                    if !self.current_doc_matches.is_empty() {
-                        return true;
-                    } else {
-                        // Trust the postings path result - if it found 0 matches, return false
-                        // Don't fall back to stored-field path which is slower
-                        return false;
-                    }
-                }
-                Err(_) => {
-                    // Fall through to return false
+
+            if let Ok(positions_per_constraint) = self.get_constraint_positions(doc_id) {
+                self.current_doc_matches = find_constraint_spans_from_positions(
+                    &positions_per_constraint,
+                    &execution_plan,
+                    &concat_plan,
+                    doc_len,
+                );
+                if !self.current_doc_matches.is_empty() {
+                    return true;
                 }
             }
         }
-        
-        // Postings path unavailable (constraint_sources empty or get_constraint_positions failed)
-        return false;
+
+        // Fall back to stored-field matching when postings are unavailable or empty.
+        match self.check_pattern_matching_stored(doc_id) {
+            Ok(matches) if !matches.is_empty() => {
+                self.current_doc_matches = matches;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Match using stored token fields (slower but handles cases the postings path misses).
+    fn check_pattern_matching_stored(
+        &self,
+        doc_id: DocId,
+    ) -> TantivyResult<Vec<crate::types::SpanWithCaptures>> {
+        let store_reader = self.reader.get_store_reader(1)?;
+        let doc = store_reader.get(doc_id)?;
+        let schema = self.reader.schema();
+        let field_names = ["word", "lemma", "pos", "tag", "chunk", "entity", "norm"];
+        let mut field_cache = HashMap::new();
+        for name in field_names {
+            let tokens =
+                crate::tantivy_integration::utils::extract_field_values(schema, &doc, name);
+            if !tokens.is_empty() {
+                field_cache.insert(name.to_string(), tokens);
+            }
+        }
+        if field_cache.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(find_constraint_spans_in_sequence(
+            &self.pattern,
+            &field_cache,
+        ))
     }
     
     /// Fill positions for exact term constraint

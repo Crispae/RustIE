@@ -272,6 +272,11 @@ impl TwoPhaseIntersection {
 
             let dst_current = self.dst_driver.doc();
 
+            // Permissive drivers (wildcard endpoints) align with any src candidate.
+            if self.dst_driver.accepts_any_doc() {
+                return candidate;
+            }
+
             // Align dst_driver to candidate using adaptive strategy
             let dst_doc = if dst_current < candidate {
                 let gap = candidate - dst_current;
