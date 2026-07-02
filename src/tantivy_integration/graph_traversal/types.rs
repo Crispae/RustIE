@@ -132,6 +132,8 @@ pub enum CollapsedMatcher {
     Exact(String),
     /// Tantivy/Lucene-style regex pattern (matches whole term, anchored)
     RegexPattern(String),
+    /// Match every term in the field dictionary (wildcard edge labels)
+    Any,
 }
 
 impl CollapsedMatcher {
@@ -140,6 +142,7 @@ impl CollapsedMatcher {
         match self {
             CollapsedMatcher::Exact(s) => format!("'{}'", s),
             CollapsedMatcher::RegexPattern(p) => format!("/{}/", p),
+            CollapsedMatcher::Any => "*".to_string(),
         }
     }
 }

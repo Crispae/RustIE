@@ -45,9 +45,39 @@ pub(crate) trait CandidateDriver: Send {
     fn matching_positions_iter(&self) -> Option<PositionIterator<'_>> {
         self.matching_positions().map(|positions| PositionIterator::new(positions))
     }
+
+    /// If true, this driver imposes no document filter during Phase-1 alignment.
+    fn accepts_any_doc(&self) -> bool {
+        false
+    }
 }
 
-/// EmptyDriver: Immediately returns TERMINATED.
+/// Used when a collapse spec cannot be built for one endpoint (e.g. wildcard `[]` dst).
+/// Aligns with any document the other driver selects; Phase 2 verifies the graph path.
+pub(crate) struct PermissiveDriver;
+
+impl CandidateDriver for PermissiveDriver {
+    fn doc(&self) -> DocId {
+        tantivy::TERMINATED
+    }
+
+    fn advance(&mut self) -> DocId {
+        tantivy::TERMINATED
+    }
+
+    fn seek(&mut self, _target: DocId) -> DocId {
+        tantivy::TERMINATED
+    }
+
+    fn matching_positions(&self) -> Option<&[u32]> {
+        None
+    }
+
+    fn accepts_any_doc(&self) -> bool {
+        true
+    }
+}
+
 /// Used when CombinedPositionDriver cannot be built (required term missing from segment)
 /// or when CollapsedSpec exists but postings are unavailable.
 /// This skips entire segments when required terms are missing, avoiding wasted computation.
@@ -370,6 +400,24 @@ pub(crate) fn expand_matcher(
 
             // Expand terms using the cached automaton
             expand_with_automaton(&term_dict, automaton.as_ref(), field, &inverted_index, max_expansions)
+        }
+        CollapsedMatcher::Any => {
+            let term_dict = inverted_index.terms();
+            let mut stream = term_dict.stream().ok()?;
+            let mut postings_list = Vec::new();
+            while stream.advance() {
+                let term = Term::from_field_bytes(field, stream.key());
+                if let Ok(Some(postings)) = inverted_index
+                    .read_postings(&term, IndexRecordOption::WithFreqsAndPositions)
+                {
+                    postings_list.push(postings);
+                }
+            }
+            if postings_list.is_empty() {
+                None
+            } else {
+                Some(postings_list)
+            }
         }
     }
 }

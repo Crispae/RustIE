@@ -103,8 +103,13 @@ impl GraphCompiler {
         let traversal_step = flat_steps.get(traversal_step_idx)?;
         let (edge_field, edge_matcher) = match traversal_step {
             FlatPatternStep::Traversal(Traversal::Incoming(matcher)) => {
-                // Incoming edge: constraint node must have incoming edge (works for both first and last)
-                (incoming_edges_field, CollapsedMatcher::from(matcher))
+                if is_first {
+                    // First node is the dependent: it receives the incoming edge.
+                    (incoming_edges_field, CollapsedMatcher::from(matcher))
+                } else {
+                    // Last node is the governor: it emits the outgoing edge.
+                    (outgoing_edges_field, CollapsedMatcher::from(matcher))
+                }
             }
             FlatPatternStep::Traversal(Traversal::Outgoing(matcher)) => {
                 if is_first {
@@ -203,7 +208,21 @@ impl GraphCompiler {
                 // Kleene star: can't collapse (variable length)
                 return None;
             }
-            _ => return None, // Can't collapse wildcards/other complex traversals
+            FlatPatternStep::Traversal(Traversal::OutgoingWildcard) => {
+                if is_first {
+                    (outgoing_edges_field, CollapsedMatcher::Any)
+                } else {
+                    (incoming_edges_field, CollapsedMatcher::Any)
+                }
+            }
+            FlatPatternStep::Traversal(Traversal::IncomingWildcard) => {
+                if is_first {
+                    (incoming_edges_field, CollapsedMatcher::Any)
+                } else {
+                    (outgoing_edges_field, CollapsedMatcher::Any)
+                }
+            }
+            _ => return None, // Can't collapse other complex traversals
         };
         
         // Get constraint field

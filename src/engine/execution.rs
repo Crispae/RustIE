@@ -407,7 +407,7 @@ impl ExtractorEngine {
                 let mut segment_scored = Vec::new();
 
                 loop {
-                    let doc_id = scorer.advance();
+                    let doc_id = scorer.doc();
                     if doc_id == tantivy::TERMINATED {
                         break;
                     }
@@ -432,6 +432,10 @@ impl ExtractorEngine {
                                 sentence_result,
                             ));
                         }
+                    }
+
+                    if scorer.advance() == tantivy::TERMINATED {
+                        break;
                     }
                 }
 
